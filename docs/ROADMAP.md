@@ -45,10 +45,18 @@
 - [ ] PPO baseline
 - [ ] Walk-forward validation
 
+## Phase 5.5: OMS / Ledger / Paper Broker
+
+- [x] Order state tracking
+- [x] Append-only JSONL journal
+- [x] Trade ledger
+- [x] Paper broker execution path
+- [x] Guardrails -> OMS -> Execution -> Portfolio -> Ledger flow
+
 ## Phase 6: Production
 
-- [ ] OMS persistence
 - [ ] MT5 broker adapter
+- [ ] Broker reconciliation
 - [ ] Monitoring
 - [ ] Alerts
 - [ ] Kill switch
