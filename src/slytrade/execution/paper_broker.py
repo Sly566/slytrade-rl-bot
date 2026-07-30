@@ -42,9 +42,13 @@ class PaperBroker:
         self.ledger = ledger or TradeLedger()
         self.last_marks: dict[str, float] = {}
 
-    def submit_order(self, intent: OrderIntent, quote: Quote) -> PaperBrokerResult:
+    def update_quote(self, quote: Quote) -> float:
+        """Update latest mark price and return current equity."""
         self.last_marks[quote.symbol] = quote.mid
-        equity = self.portfolio.mark_to_market(self.last_marks)
+        return self.portfolio.mark_to_market(self.last_marks)
+
+    def submit_order(self, intent: OrderIntent, quote: Quote) -> PaperBrokerResult:
+        equity = self.update_quote(quote)
         decision = self.guardrails.approve_order(
             intent,
             equity=equity,

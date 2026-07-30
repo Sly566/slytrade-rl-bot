@@ -6,9 +6,18 @@ This phase introduces a minimal but production-oriented backtesting core.
 
 ```text
 BarBacktestEngine
+PaperBroker
+OrderManagementSystem
+TradeLedger
 TickExecutionSimulator
 PortfolioState
 PerformanceMetrics
+```
+
+Backtests now use the same safe paper execution path that future paper trading will use:
+
+```text
+Strategy -> OrderIntent -> PaperBroker -> Guardrails -> OMS -> Execution -> Portfolio -> Ledger
 ```
 
 ## Current execution model

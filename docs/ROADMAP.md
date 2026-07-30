@@ -34,6 +34,9 @@
 - [x] Quote-based execution simulator
 - [x] Spread and slippage model
 - [x] Basic metrics report
+- [x] Backtest uses paper broker path
+- [x] Backtest captures OMS order states
+- [x] Backtest captures trade ledger records
 - [ ] Tick-driven backtest loop
 - [ ] Stop-loss / take-profit simulation
 - [ ] Trade ledger persistence
