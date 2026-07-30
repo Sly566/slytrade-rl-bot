@@ -11,6 +11,8 @@
 
 ## Phase 2: Tick and Bar Data Layer
 
+- [x] Synthetic sample bar generator
+- [x] Synthetic sample tick generator
 - [ ] MT5 tick collector
 - [ ] MT5 bar collector
 - [ ] Tick schema validation

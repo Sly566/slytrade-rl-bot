@@ -246,6 +246,56 @@ def compare_baselines(
 
 
 @app.command()
+def generate_sample_bars(
+    output_file: str = typer.Option(..., help="Output .csv or .parquet file"),
+    symbol: str = typer.Option("XAUUSD", help="Sample symbol"),
+    timeframe: str = typer.Option("M1", help="Sample timeframe"),
+    start: str = typer.Option("2026-01-01", help="UTC start date/datetime"),
+    periods: int = typer.Option(500, help="Number of bars to generate"),
+    seed: int = typer.Option(42, help="Deterministic random seed"),
+    start_price: float = typer.Option(2400.0, help="Starting price"),
+) -> None:
+    """Generate deterministic sample bars for demos and tests."""
+    from slytrade.data.sample_generator import generate_sample_bars as generate_bars
+    from slytrade.data.sample_generator import write_sample_frame
+
+    frame = generate_bars(
+        symbol=symbol,
+        timeframe=timeframe,
+        start=parse_utc_datetime(start),
+        periods=periods,
+        seed=seed,
+        start_price=start_price,
+    )
+    path = write_sample_frame(frame, output_file)
+    console.print(f"Generated {len(frame)} sample bars at {path}")
+
+
+@app.command()
+def generate_sample_ticks(
+    output_file: str = typer.Option(..., help="Output .csv or .parquet file"),
+    symbol: str = typer.Option("XAUUSD", help="Sample symbol"),
+    start: str = typer.Option("2026-01-01", help="UTC start date/datetime"),
+    periods: int = typer.Option(2_000, help="Number of ticks to generate"),
+    seed: int = typer.Option(42, help="Deterministic random seed"),
+    start_price: float = typer.Option(2400.0, help="Starting mid price"),
+) -> None:
+    """Generate deterministic sample ticks for demos and tests."""
+    from slytrade.data.sample_generator import generate_sample_ticks as generate_ticks
+    from slytrade.data.sample_generator import write_sample_frame
+
+    frame = generate_ticks(
+        symbol=symbol,
+        start=parse_utc_datetime(start),
+        periods=periods,
+        seed=seed,
+        start_price=start_price,
+    )
+    path = write_sample_frame(frame, output_file)
+    console.print(f"Generated {len(frame)} sample ticks at {path}")
+
+
+@app.command()
 def live() -> None:
     """Live trading placeholder."""
     console.print("[bold red]Live trading is disabled at bootstrap stage.[/bold red]")
