@@ -9,6 +9,7 @@ from rich.console import Console
 from rich.table import Table
 
 from slytrade.backtest.engine import BacktestConfig, BacktestResult, BarBacktestEngine, BarStrategy
+from slytrade.backtest.tick_engine import TickBacktestEngine
 from slytrade.features.ict import FEATURE_COLUMNS, compute_ict_features
 from slytrade.strategies.baselines import (
     BuyAndHoldStrategy,
@@ -44,6 +45,18 @@ def load_bars_file(path: str | Path) -> pd.DataFrame:
     if path.suffix.lower() == ".csv":
         return pd.read_csv(path)
     raise ValueError(f"Unsupported bars file format: {path.suffix}. Use .csv or .parquet")
+
+
+def load_ticks_file(path: str | Path) -> pd.DataFrame:
+    """Load a canonical tick file from CSV or Parquet."""
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(path)
+    if path.suffix.lower() == ".parquet":
+        return pd.read_parquet(path)
+    if path.suffix.lower() == ".csv":
+        return pd.read_csv(path)
+    raise ValueError(f"Unsupported ticks file format: {path.suffix}. Use .csv or .parquet")
 
 
 def infer_symbol(bars: pd.DataFrame, symbol: str | None = None) -> str:
@@ -110,6 +123,30 @@ def run_backtest_from_bars(
     )
     engine = BarBacktestEngine(config)
     return engine.run(prepared_bars, strategy)
+
+
+def run_tick_backtest_from_frames(
+    bars: pd.DataFrame,
+    ticks: pd.DataFrame,
+    *,
+    strategy_name: str,
+    symbol: str | None = None,
+    volume: float = 0.1,
+    fast_window: int = 5,
+    slow_window: int = 20,
+    config: BacktestConfig | None = None,
+) -> BacktestResult:
+    resolved_symbol = infer_symbol(bars, symbol)
+    prepared_bars = ensure_ict_features(bars) if strategy_name == "ict-bias" else bars.copy()
+    strategy = build_strategy(
+        strategy_name,
+        symbol=resolved_symbol,
+        volume=volume,
+        fast_window=fast_window,
+        slow_window=slow_window,
+    )
+    engine = TickBacktestEngine(config)
+    return engine.run(prepared_bars, ticks, strategy)
 
 
 def metrics_as_dict(result: BacktestResult) -> dict[str, float | int]:

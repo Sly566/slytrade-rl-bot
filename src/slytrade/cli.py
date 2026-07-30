@@ -296,6 +296,56 @@ def generate_sample_ticks(
 
 
 @app.command()
+def run_tick_backtest(
+    bars_file: str = typer.Option(..., help="Canonical bars file (.csv or .parquet)"),
+    ticks_file: str = typer.Option(..., help="Canonical ticks file (.csv or .parquet)"),
+    strategy: str = typer.Option("no-trade", help="no-trade, buy-and-hold, ma-cross, or ict-bias"),
+    symbol: str | None = typer.Option(None, help="Symbol override if the bars file contains multiple symbols"),
+    volume: float = typer.Option(0.1, help="Order volume used by baseline strategies"),
+    initial_balance: float = typer.Option(100_000.0, help="Initial account balance"),
+    point_size: float = typer.Option(0.01, help="Instrument point size"),
+    point_value: float = typer.Option(1.0, help="PnL value per price unit and volume"),
+    default_spread_points: float = typer.Option(20.0, help="Fallback spread in points when no tick quote exists"),
+    slippage_points: float = typer.Option(0.0, help="Adverse slippage in points"),
+    commission_per_volume: float = typer.Option(0.0, help="Commission per traded volume unit"),
+    fast_window: int = typer.Option(5, help="Fast MA window for ma-cross"),
+    slow_window: int = typer.Option(20, help="Slow MA window for ma-cross"),
+) -> None:
+    """Run a baseline backtest where bar signals execute on tick bid/ask quotes."""
+    from slytrade.backtest.engine import BacktestConfig
+    from slytrade.backtest.reporting import (
+        VALID_STRATEGIES,
+        load_bars_file,
+        load_ticks_file,
+        render_backtest_report,
+        run_tick_backtest_from_frames,
+    )
+
+    if strategy not in VALID_STRATEGIES:
+        raise typer.BadParameter(f"strategy must be one of: {', '.join(VALID_STRATEGIES)}")
+    bars = load_bars_file(Path(bars_file))
+    ticks = load_ticks_file(Path(ticks_file))
+    result = run_tick_backtest_from_frames(
+        bars,
+        ticks,
+        strategy_name=strategy,
+        symbol=symbol,
+        volume=volume,
+        fast_window=fast_window,
+        slow_window=slow_window,
+        config=BacktestConfig(
+            initial_balance=initial_balance,
+            default_spread_points=default_spread_points,
+            point_size=point_size,
+            point_value=point_value,
+            slippage_points=slippage_points,
+            commission_per_volume=commission_per_volume,
+        ),
+    )
+    render_backtest_report(result, strategy_name=f"tick-{strategy}", console=console)
+
+
+@app.command()
 def live() -> None:
     """Live trading placeholder."""
     console.print("[bold red]Live trading is disabled at bootstrap stage.[/bold red]")

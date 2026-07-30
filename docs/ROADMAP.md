@@ -39,7 +39,8 @@
 - [x] Backtest uses paper broker path
 - [x] Backtest captures OMS order states
 - [x] Backtest captures trade ledger records
-- [ ] Tick-driven backtest loop
+- [x] Tick-aware backtest engine
+- [x] Tick quote execution CLI
 - [ ] Stop-loss / take-profit simulation
 - [ ] Trade ledger persistence
 
