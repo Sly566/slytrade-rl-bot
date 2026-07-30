@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -19,6 +19,19 @@ from slytrade.strategies.baselines import (
 
 StrategyName = Literal["no-trade", "buy-and-hold", "ma-cross", "ict-bias"]
 VALID_STRATEGIES: tuple[str, ...] = ("no-trade", "buy-and-hold", "ma-cross", "ict-bias")
+
+
+@dataclass(frozen=True)
+class BaselineComparisonRow:
+    strategy: str
+    start_equity: float
+    final_equity: float
+    total_return: float
+    max_drawdown: float
+    sharpe_like: float
+    trades: int
+    orders: int
+    ledger_records: int
 
 
 def load_bars_file(path: str | Path) -> pd.DataFrame:
@@ -103,6 +116,50 @@ def metrics_as_dict(result: BacktestResult) -> dict[str, float | int]:
     return asdict(result.metrics)
 
 
+def comparison_row(strategy_name: str, result: BacktestResult) -> BaselineComparisonRow:
+    metrics = result.metrics
+    return BaselineComparisonRow(
+        strategy=strategy_name,
+        start_equity=metrics.start_equity,
+        final_equity=metrics.final_equity,
+        total_return=metrics.total_return,
+        max_drawdown=metrics.max_drawdown,
+        sharpe_like=metrics.sharpe_like,
+        trades=metrics.trades,
+        orders=len(result.orders),
+        ledger_records=len(result.trades),
+    )
+
+
+def compare_baselines_from_bars(
+    bars: pd.DataFrame,
+    *,
+    symbol: str | None = None,
+    volume: float = 0.1,
+    fast_window: int = 5,
+    slow_window: int = 20,
+    config: BacktestConfig | None = None,
+    strategies: tuple[str, ...] = VALID_STRATEGIES,
+) -> list[BaselineComparisonRow]:
+    rows: list[BaselineComparisonRow] = []
+    for strategy_name in strategies:
+        result = run_backtest_from_bars(
+            bars,
+            strategy_name=strategy_name,
+            symbol=symbol,
+            volume=volume,
+            fast_window=fast_window,
+            slow_window=slow_window,
+            config=config,
+        )
+        rows.append(comparison_row(strategy_name, result))
+    return sorted(rows, key=lambda row: row.final_equity, reverse=True)
+
+
+def comparison_as_frame(rows: list[BaselineComparisonRow]) -> pd.DataFrame:
+    return pd.DataFrame([asdict(row) for row in rows])
+
+
 def render_backtest_report(
     result: BacktestResult,
     *,
@@ -124,4 +181,30 @@ def render_backtest_report(
     table.add_row("Trades", str(metrics.trades))
     table.add_row("Orders", str(len(result.orders)))
     table.add_row("Ledger Records", str(len(result.trades)))
+    target.print(table)
+
+
+def render_baseline_comparison(rows: list[BaselineComparisonRow], *, console: Console | None = None) -> None:
+    target = console or Console()
+    table = Table(title="Baseline Comparison")
+    table.add_column("Rank", justify="right")
+    table.add_column("Strategy")
+    table.add_column("Final Equity", justify="right")
+    table.add_column("Return", justify="right")
+    table.add_column("Max DD", justify="right")
+    table.add_column("Sharpe-like", justify="right")
+    table.add_column("Trades", justify="right")
+    table.add_column("Orders", justify="right")
+
+    for rank, row in enumerate(rows, start=1):
+        table.add_row(
+            str(rank),
+            row.strategy,
+            f"{row.final_equity:,.2f}",
+            f"{row.total_return:.2%}",
+            f"{row.max_drawdown:.2%}",
+            f"{row.sharpe_like:.4f}",
+            str(row.trades),
+            str(row.orders),
+        )
     target.print(table)

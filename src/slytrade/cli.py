@@ -198,6 +198,54 @@ def run_backtest(
 
 
 @app.command()
+def compare_baselines(
+    bars_file: str = typer.Option(..., help="Canonical bars file (.csv or .parquet)"),
+    symbol: str | None = typer.Option(None, help="Symbol override if the file contains multiple symbols"),
+    volume: float = typer.Option(0.1, help="Order volume used by baseline strategies"),
+    initial_balance: float = typer.Option(100_000.0, help="Initial account balance"),
+    point_size: float = typer.Option(0.01, help="Instrument point size"),
+    point_value: float = typer.Option(1.0, help="PnL value per price unit and volume"),
+    default_spread_points: float = typer.Option(20.0, help="Fallback spread in points when bars have no spread"),
+    slippage_points: float = typer.Option(0.0, help="Adverse slippage in points"),
+    commission_per_volume: float = typer.Option(0.0, help="Commission per traded volume unit"),
+    fast_window: int = typer.Option(5, help="Fast MA window for ma-cross"),
+    slow_window: int = typer.Option(20, help="Slow MA window for ma-cross"),
+    output_csv: str | None = typer.Option(None, help="Optional path to save comparison as CSV"),
+) -> None:
+    """Run all baseline strategies and print a comparison table."""
+    from slytrade.backtest.engine import BacktestConfig
+    from slytrade.backtest.reporting import (
+        compare_baselines_from_bars,
+        comparison_as_frame,
+        load_bars_file,
+        render_baseline_comparison,
+    )
+
+    bars = load_bars_file(Path(bars_file))
+    rows = compare_baselines_from_bars(
+        bars,
+        symbol=symbol,
+        volume=volume,
+        fast_window=fast_window,
+        slow_window=slow_window,
+        config=BacktestConfig(
+            initial_balance=initial_balance,
+            default_spread_points=default_spread_points,
+            point_size=point_size,
+            point_value=point_value,
+            slippage_points=slippage_points,
+            commission_per_volume=commission_per_volume,
+        ),
+    )
+    render_baseline_comparison(rows, console=console)
+    if output_csv is not None:
+        output_path = Path(output_csv)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        comparison_as_frame(rows).to_csv(output_path, index=False)
+        console.print(f"Saved comparison CSV to {output_path}")
+
+
+@app.command()
 def live() -> None:
     """Live trading placeholder."""
     console.print("[bold red]Live trading is disabled at bootstrap stage.[/bold red]")

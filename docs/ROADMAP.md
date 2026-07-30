@@ -48,7 +48,7 @@
 - [x] MovingAverageCross baseline
 - [x] ICTBias baseline
 - [x] Backtest reporting CLI
-- [ ] Baseline comparison report
+- [x] Baseline comparison report
 - [ ] Gymnasium environment
 - [ ] PPO baseline
 - [ ] Walk-forward validation
