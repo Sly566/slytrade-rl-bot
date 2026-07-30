@@ -41,10 +41,13 @@
 - [ ] Stop-loss / take-profit simulation
 - [ ] Trade ledger persistence
 
-## Phase 5: RL
+## Phase 5: Strategy Baselines and RL
 
+- [x] NoTrade baseline
+- [x] BuyAndHold baseline
+- [x] MovingAverageCross baseline
+- [x] ICTBias baseline
 - [ ] Gymnasium environment
-- [ ] Baseline strategy
 - [ ] PPO baseline
 - [ ] Walk-forward validation
 
