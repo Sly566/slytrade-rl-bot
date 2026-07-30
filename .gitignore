@@ -37,3 +37,7 @@ dist/
 
 # Temporary patch files
 *.patch
+
+# Generated local/demo data
+data/samples/
+reports/
