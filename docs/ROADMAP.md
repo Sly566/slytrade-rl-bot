@@ -19,14 +19,14 @@
 
 ## Phase 3: Causal ICT/SMC Features
 
-- [ ] ATR
-- [ ] Confirmed pivots
-- [ ] BOS / CHOCH
-- [ ] FVG
-- [ ] Order blocks
-- [ ] Liquidity sweeps
-- [ ] Session features
-- [ ] Premium/discount
+- [x] ATR
+- [x] Confirmed pivots
+- [x] BOS / CHOCH
+- [x] FVG
+- [x] Order blocks
+- [x] Liquidity sweeps
+- [x] Session features
+- [x] Premium/discount
 
 ## Phase 4: Backtesting
 
