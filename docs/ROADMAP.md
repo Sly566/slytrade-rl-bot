@@ -30,10 +30,13 @@
 
 ## Phase 4: Backtesting
 
-- [ ] Paper broker
-- [ ] Tick-based execution simulator
-- [ ] Spread and slippage model
-- [ ] Metrics report
+- [x] Portfolio state
+- [x] Quote-based execution simulator
+- [x] Spread and slippage model
+- [x] Basic metrics report
+- [ ] Tick-driven backtest loop
+- [ ] Stop-loss / take-profit simulation
+- [ ] Trade ledger persistence
 
 ## Phase 5: RL
 
