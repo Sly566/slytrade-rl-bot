@@ -34,3 +34,6 @@ dist/
 # IDE
 .vscode/settings.json
 .DS_Store
+
+# Temporary patch files
+*.patch
