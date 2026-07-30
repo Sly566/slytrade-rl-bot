@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Data and artifacts
+data/raw/
+data/processed/
+data/features/
+data/models/
+data/journal/
+logs/
+*.parquet
+*.npy
+*.npz
+*.pt
+*.zip
+*.csv.gz
+
+# Secrets
+.env
+*.key
+*.pem
+
+# Build
+build/
+dist/
+*.egg-info/
+
+# IDE
+.vscode/settings.json
+.DS_Store

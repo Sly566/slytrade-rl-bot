@@ -1,0 +1,25 @@
+tick_data:
+  enabled: true
+  storage_format: parquet
+  chunk_size: day
+  include_bid_ask: true
+  include_spread: true
+  include_mid: true
+
+bar_data:
+  enabled: true
+  storage_format: parquet
+  timeframes:
+    - M1
+    - M5
+    - M15
+    - H1
+    - H4
+    - D1
+    - W1
+
+validation:
+  reject_negative_prices: true
+  reject_crossed_spread: true
+  max_gap_seconds_warning: 300
+  duplicate_policy: drop

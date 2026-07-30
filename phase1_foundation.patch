@@ -1,0 +1,1007 @@
+diff --git a/.dockerignore b/.dockerignore
+new file mode 100644
+index 0000000..a3fe3ad
+--- /dev/null
++++ b/.dockerignore
+@@ -0,0 +1,19 @@
++.git
++.venv
++venv
++__pycache__
++.pytest_cache
++.mypy_cache
++.ruff_cache
++data/raw
++data/processed
++data/features
++data/models
++data/journal
++logs
++.env
++*.parquet
++*.npy
++*.npz
++*.pt
++*.zip
+diff --git a/.env.example b/.env.example
+new file mode 100644
+index 0000000..3ee8980
+--- /dev/null
++++ b/.env.example
+@@ -0,0 +1,6 @@
++# Never commit real credentials.
++SLYTRADE_ENV=development
++SLYTRADE_ALLOW_LIVE=0
++SLYTRADE_METRICS_PORT=9108
++SLYTRADE_USE_CPP_FEATURES=0
++SLYTRADE_ENABLE_SYNTHETIC_L2=0
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+new file mode 100644
+index 0000000..9e7beb1
+--- /dev/null
++++ b/.github/workflows/ci.yml
+@@ -0,0 +1,32 @@
++name: CI
++
++on:
++  push:
++    branches: [main]
++  pull_request:
++    branches: [main]
++
++jobs:
++  test:
++    runs-on: ubuntu-latest
++
++    steps:
++      - uses: actions/checkout@v4
++
++      - uses: actions/setup-python@v5
++        with:
++          python-version: "3.11"
++
++      - name: Install dependencies
++        run: |
++          python -m pip install --upgrade pip
++          pip install -e ".[dev,data]"
++
++      - name: Lint
++        run: ruff check .
++
++      - name: Type check
++        run: mypy src
++
++      - name: Test
++        run: pytest
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..2f986bf
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,36 @@
++# Python
++__pycache__/
++*.py[cod]
++.pytest_cache/
++.mypy_cache/
++.ruff_cache/
++.venv/
++venv/
++
++# Data and artifacts
++data/raw/
++data/processed/
++data/features/
++data/models/
++data/journal/
++logs/
++*.parquet
++*.npy
++*.npz
++*.pt
++*.zip
++*.csv.gz
++
++# Secrets
++.env
++*.key
++*.pem
++
++# Build
++build/
++dist/
++*.egg-info/
++
++# IDE
++.vscode/settings.json
++.DS_Store
+diff --git a/Dockerfile b/Dockerfile
+new file mode 100644
+index 0000000..6ea8815
+--- /dev/null
++++ b/Dockerfile
+@@ -0,0 +1,19 @@
++FROM python:3.11-slim
++
++ENV PYTHONDONTWRITEBYTECODE=1
++ENV PYTHONUNBUFFERED=1
++
++WORKDIR /app
++
++RUN apt-get update && apt-get install -y --no-install-recommends \
++    build-essential curl git \
++    && rm -rf /var/lib/apt/lists/*
++
++COPY pyproject.toml README.md /app/
++COPY src /app/src
++COPY configs /app/configs
++COPY tests /app/tests
++
++RUN pip install --upgrade pip && pip install -e ".[dev,data]"
++
++CMD ["python", "-m", "slytrade.cli", "doctor"]
+diff --git a/Makefile b/Makefile
+new file mode 100644
+index 0000000..bdd3630
+--- /dev/null
++++ b/Makefile
+@@ -0,0 +1,23 @@
++.PHONY: install install-dev test lint typecheck doctor clean
++
++install:
++	python -m pip install -e .
++
++install-dev:
++	python -m pip install -e ".[dev,data]"
++
++test:
++	pytest
++
++lint:
++	ruff check .
++
++typecheck:
++	mypy src
++
++doctor:
++	python -m slytrade.cli doctor
++
++clean:
++	find . -type d -name "__pycache__" -prune -exec rm -rf {} +
++	find . -type d -name ".pytest_cache" -prune -exec rm -rf {} +
+diff --git a/README.md b/README.md
+index 52e6a28..e063d8f 100644
+--- a/README.md
++++ b/README.md
+@@ -1 +1,102 @@
+-# slytrade-rl-bot
+\ No newline at end of file
++# SlyTrade RL Bot
++
++Production-grade MT5 **tick-and-bar** based ICT/SMC reinforcement-learning trading system.
++
++## Mission
++
++Build a safe, testable, broker-neutral trading bot for day trading and scalping using:
++
++- MT5 historical **tick data** for execution realism
++- multi-timeframe **bar data** for market structure and context
++- ICT / Smart Money Concepts feature engineering
++- causal no-lookahead research methodology
++- realistic tick-based backtesting
++- paper trading before live trading
++- risk guardrails and kill switches
++- reinforcement learning only after the simulator is trustworthy
++
++## Core Principles
++
++1. No live trading by default.
++2. No hardcoded broker-specific symbol assumptions.
++3. Use both tick data and bar data.
++4. No lookahead bias.
++5. Paper trading before live trading.
++6. Every order passes through risk guardrails.
++7. Every order is tracked by an Order Management System.
++8. Every model must be reproducible before deployment.
++9. Monitoring and audit logs are mandatory.
++10. Profit claims require walk-forward validation and paper trading evidence.
++
++## Why Ticks and Bars?
++
++Ticks provide execution realism:
++
++- bid/ask spread
++- mid price
++- tick velocity
++- spread expansion/contraction
++- slippage modelling
++- scalping-level precision
++
++Bars provide market structure:
++
++- M1 execution structure
++- M5 target structure
++- M15 intraday bias
++- H1/H4 trend context
++- D1/W1 liquidity context
++- ICT/SMC levels
++
++## Target Architecture
++
++```text
++MT5 Terminal
++   ↓
++Tick + Bar Data Collector
++   ↓
++Data Validator
++   ↓
++Tick/Bar Data Store
++   ↓
++Causal ICT/SMC Feature Engine
++   ↓
++Backtesting Engine
++   ↓
++Paper Trading Engine
++   ↓
++Strategy / RL Policy
++   ↓
++Risk Guardrails
++   ↓
++Order Management System
++   ↓
++Broker Adapter
++   ↓
++Execution Reports
++   ↓
++Portfolio State
++   ↓
++Monitoring + Audit Logs
++```
++
++## Safe Start
++
++```bash
++python -m pip install -e ".[dev,data]"
++python -m slytrade.cli doctor
++pytest
++ruff check .
++mypy src
++```
++
++## Safety Notice
++
++This project is for research and engineering. It must not be used with real capital until:
++
++- tick and bar data validation passes,
++- feature generation is causal,
++- backtesting is realistic,
++- paper trading is stable,
++- risk guardrails are enforced,
++- live execution is explicitly approved.
+diff --git a/configs/assets.yaml b/configs/assets.yaml
+new file mode 100644
+index 0000000..c897238
+--- /dev/null
++++ b/configs/assets.yaml
+@@ -0,0 +1,31 @@
++execution_timeframe: M1
++target_timeframe: M5
++intraday_timeframe: M15
++
++observe_timeframes:
++  - M1
++  - M5
++  - M15
++  - H1
++  - H4
++  - D1
++  - W1
++
++primary:
++  - XAUUSD
++
++secondary:
++  - BTCUSD
++
++asset_classes:
++  metals: [XAUUSD, XAGUSD]
++  crypto: [BTCUSD, ETHUSD]
++  forex: [EURUSD, GBPUSD, USDJPY]
++  indices: [US500, US30, NAS100, DE30]
++  commodities: [USOIL]
++
++data_sources:
++  use_ticks: true
++  use_bars: true
++  tick_source: MT5
++  bar_source: MT5
+diff --git a/configs/broker.yaml b/configs/broker.yaml
+new file mode 100644
+index 0000000..bb75df2
+--- /dev/null
++++ b/configs/broker.yaml
+@@ -0,0 +1,13 @@
++mt5:
++  terminal_path: "C:\\Program Files\\MetaTrader 5\\terminal64.exe"
++  wine_prefix: "~/.wine_mt5"
++  login_timeout: 30
++  reconnect_attempts: 5
++  headless: true
++
++execution:
++  max_ping_ms: 150
++  max_execution_delay_ms: 500
++  max_slippage_points: 20
++  max_spread_points: 50
++  default_order_type: MARKET
+diff --git a/configs/data.yaml b/configs/data.yaml
+new file mode 100644
+index 0000000..e281171
+--- /dev/null
++++ b/configs/data.yaml
+@@ -0,0 +1,25 @@
++tick_data:
++  enabled: true
++  storage_format: parquet
++  chunk_size: day
++  include_bid_ask: true
++  include_spread: true
++  include_mid: true
++
++bar_data:
++  enabled: true
++  storage_format: parquet
++  timeframes:
++    - M1
++    - M5
++    - M15
++    - H1
++    - H4
++    - D1
++    - W1
++
++validation:
++  reject_negative_prices: true
++  reject_crossed_spread: true
++  max_gap_seconds_warning: 300
++  duplicate_policy: drop
+diff --git a/configs/risk.yaml b/configs/risk.yaml
+new file mode 100644
+index 0000000..be9e8c1
+--- /dev/null
++++ b/configs/risk.yaml
+@@ -0,0 +1,12 @@
++risk_per_trade: 0.005
++max_daily_drawdown: 0.03
++max_total_drawdown: 0.08
++max_position_volume: 1.0
++max_open_positions: 1
++max_consecutive_losses: 3
++
++ict:
++  sl_atr_mult: 1.0
++  trailing_atr_mult: 2.0
++  min_trail_distance_points: 50
++  partial_tp_enabled: false
+diff --git a/configs/training.yaml b/configs/training.yaml
+new file mode 100644
+index 0000000..0dceecd
+--- /dev/null
++++ b/configs/training.yaml
+@@ -0,0 +1,21 @@
++environment:
++  initial_balance: 100000
++  episode_length_bars: 1000
++
++data:
++  symbols: ["XAUUSD"]
++  train_start: "2024-01-01"
++  train_end: "2025-12-31"
++  validation_start: "2026-01-01"
++  validation_end: "2026-06-30"
++
++walk_forward:
++  enabled: true
++  train_window_bars: 200000
++  validation_window_bars: 50000
++  embargo_bars: 500
++
++training:
++  algorithm: PPO
++  total_timesteps: 100000
++  seed: 42
+diff --git a/docker-compose.yml b/docker-compose.yml
+new file mode 100644
+index 0000000..77d6cfc
+--- /dev/null
++++ b/docker-compose.yml
+@@ -0,0 +1,11 @@
++services:
++  slytrade:
++    build: .
++    command: python -m slytrade.cli doctor
++    volumes:
++      - ./configs:/app/configs:ro
++      - ./data:/app/data
++      - ./logs:/app/logs
++    environment:
++      - SLYTRADE_ALLOW_LIVE=0
++    restart: "no"
+diff --git a/docs/ARCHITECTURE.md b/docs/ARCHITECTURE.md
+new file mode 100644
+index 0000000..2e19a5e
+--- /dev/null
++++ b/docs/ARCHITECTURE.md
+@@ -0,0 +1,35 @@
++# Architecture
++
++SlyTrade RL Bot is designed as a layered trading system.
++
++## Data Intelligence
++
++The bot uses both:
++
++1. Tick data
++2. Bar data
++
++Ticks provide execution realism. Bars provide structure.
++
++## Layers
++
++1. Data ingestion
++2. Data validation
++3. Tick/bar storage
++4. Feature engineering
++5. Backtesting
++6. Strategy / RL policy
++7. Risk guardrails
++8. Order management
++9. Broker adapters
++10. Monitoring and audit logs
++
++## Hard Rule
++
++The strategy layer may suggest trades, but it may not directly execute trades.
++
++All trades must pass through:
++
++```text
++OrderIntent -> RiskGuardrails -> OMS -> BrokerAdapter -> ExecutionReport
++```
+diff --git a/docs/ROADMAP.md b/docs/ROADMAP.md
+new file mode 100644
+index 0000000..9a08c1a
+--- /dev/null
++++ b/docs/ROADMAP.md
+@@ -0,0 +1,51 @@
++# Roadmap
++
++## Phase 1: Foundation
++
++- [x] Clean repository
++- [x] Python package structure
++- [x] Basic config
++- [x] Tick and bar data contracts
++- [x] Guardrail tests
++- [x] CI workflow
++
++## Phase 2: Tick and Bar Data Layer
++
++- [ ] MT5 tick collector
++- [ ] MT5 bar collector
++- [ ] Tick schema validation
++- [ ] Bar schema validation
++- [ ] Parquet storage
++
++## Phase 3: Causal ICT/SMC Features
++
++- [ ] ATR
++- [ ] Confirmed pivots
++- [ ] BOS / CHOCH
++- [ ] FVG
++- [ ] Order blocks
++- [ ] Liquidity sweeps
++- [ ] Session features
++- [ ] Premium/discount
++
++## Phase 4: Backtesting
++
++- [ ] Paper broker
++- [ ] Tick-based execution simulator
++- [ ] Spread and slippage model
++- [ ] Metrics report
++
++## Phase 5: RL
++
++- [ ] Gymnasium environment
++- [ ] Baseline strategy
++- [ ] PPO baseline
++- [ ] Walk-forward validation
++
++## Phase 6: Production
++
++- [ ] OMS persistence
++- [ ] MT5 broker adapter
++- [ ] Monitoring
++- [ ] Alerts
++- [ ] Kill switch
+diff --git a/pyproject.toml b/pyproject.toml
+new file mode 100644
+index 0000000..d4cc276
+--- /dev/null
++++ b/pyproject.toml
+@@ -0,0 +1,74 @@
++[build-system]
++requires = ["setuptools>=68", "wheel"]
++build-backend = "setuptools.build_meta"
++
++[project]
++name = "slytrade-rl-bot"
++version = "0.1.0"
++description = "Production-grade MT5 tick-and-bar based ICT/SMC RL trading bot"
++requires-python = ">=3.11,<3.12"
++dependencies = [
++  "numpy>=1.26",
++  "pandas>=2.2",
++  "pyyaml>=6.0",
++  "pydantic>=2.7",
++  "pydantic-settings>=2.3",
++  "python-dotenv>=1.0",
++  "typer>=0.12",
++  "rich>=13.7",
++  "prometheus-client>=0.20"
++]
++
++[project.optional-dependencies]
++data = [
++  "pyarrow>=15.0",
++  "polars>=0.20"
++]
++
++dev = [
++  "pytest>=8.2",
++  "pytest-cov>=5.0",
++  "ruff>=0.5",
++  "mypy>=1.10"
++]
++
++rl = [
++  "gymnasium>=0.29",
++  "stable-baselines3>=2.3",
++  "torch>=2.2",
++  "optuna>=3.6",
++  "mlflow>=2.14"
++]
++
++explain = [
++  "shap>=0.45",
++  "transformers>=4.42"
++]
++
++mt5 = [
++  "mt5linux>=0.1"
++]
++
++[project.scripts]
++slytrade = "slytrade.cli:app"
++
++[tool.setuptools.packages.find]
++where = ["src"]
++
++[tool.pytest.ini_options]
++testpaths = ["tests"]
++pythonpath = ["src"]
++addopts = "-q"
++
++[tool.ruff]
++line-length = 120
++target-version = "py311"
++
++[tool.ruff.lint]
++select = ["E", "F", "I", "B", "UP"]
++ignore = ["E501"]
++
++[tool.mypy]
++python_version = "3.11"
++ignore_missing_imports = true
++strict = false
+diff --git a/src/slytrade/__init__.py b/src/slytrade/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/src/slytrade/backtest/__init__.py b/src/slytrade/backtest/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/src/slytrade/brokers/__init__.py b/src/slytrade/brokers/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/src/slytrade/cli.py b/src/slytrade/cli.py
+new file mode 100644
+index 0000000..35a4ff7
+--- /dev/null
++++ b/src/slytrade/cli.py
+@@ -0,0 +1,71 @@
++from __future__ import annotations
++
++import importlib.util
++from pathlib import Path
++
++import typer
++from rich.console import Console
++from rich.table import Table
++
++app = typer.Typer(help="SlyTrade RL Bot CLI")
++console = Console()
++
++
++def module_available(name: str) -> bool:
++    return importlib.util.find_spec(name) is not None
++
++
++@app.command()
++def doctor() -> None:
++    """Check project health and dependencies."""
++    table = Table(title="SlyTrade RL Bot Doctor")
++    table.add_column("Check")
++    table.add_column("Status")
++
++    required = ["numpy", "pandas", "yaml", "pydantic", "typer", "rich"]
++    optional = [
++        "pyarrow",
++        "polars",
++        "torch",
++        "gymnasium",
++        "stable_baselines3",
++        "optuna",
++        "mlflow",
++        "mt5linux",
++    ]
++
++    for mod in required:
++        table.add_row(f"required:{mod}", "OK" if module_available(mod) else "MISSING")
++
++    for mod in optional:
++        table.add_row(f"optional:{mod}", "OK" if module_available(mod) else "MISSING")
++
++    for path in [
++        "configs/assets.yaml",
++        "configs/broker.yaml",
++        "configs/data.yaml",
++        "configs/risk.yaml",
++        "configs/training.yaml",
++    ]:
++        table.add_row(f"file:{path}", "OK" if Path(path).exists() else "MISSING")
++
++    console.print(table)
++
++
++@app.command()
++def info() -> None:
++    """Print project information."""
++    console.print("[bold green]SlyTrade RL Bot[/bold green]")
++    console.print("Production-grade MT5 tick-and-bar based ICT/SMC RL trading system.")
++    console.print("Live trading is disabled by default.")
++
++
++@app.command()
++def live() -> None:
++    """Live trading placeholder."""
++    console.print("[bold red]Live trading is disabled at bootstrap stage.[/bold red]")
++    raise typer.Exit(code=1)
++
++
++if __name__ == "__main__":
++    app()
+diff --git a/src/slytrade/core/__init__.py b/src/slytrade/core/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/src/slytrade/core/config.py b/src/slytrade/core/config.py
+new file mode 100644
+index 0000000..cf15a22
+--- /dev/null
++++ b/src/slytrade/core/config.py
+@@ -0,0 +1,36 @@
++from __future__ import annotations
++
++from pathlib import Path
++from typing import Any
++
++import yaml
++from pydantic import BaseModel
++
++
++class ProjectConfig(BaseModel):
++    assets: dict[str, Any]
++    broker: dict[str, Any]
++    data: dict[str, Any]
++    risk: dict[str, Any]
++    training: dict[str, Any]
++
++
++def load_yaml(path: str | Path) -> dict[str, Any]:
++    path = Path(path)
++    if not path.exists():
++        raise FileNotFoundError(path)
++
++    with path.open("r", encoding="utf-8") as file:
++        return yaml.safe_load(file) or {}
++
++
++def load_config(config_dir: str | Path = "configs") -> ProjectConfig:
++    config_dir = Path(config_dir)
++
++    return ProjectConfig(
++        assets=load_yaml(config_dir / "assets.yaml"),
++        broker=load_yaml(config_dir / "broker.yaml"),
++        data=load_yaml(config_dir / "data.yaml"),
++        risk=load_yaml(config_dir / "risk.yaml"),
++        training=load_yaml(config_dir / "training.yaml"),
++    )
+diff --git a/src/slytrade/data/__init__.py b/src/slytrade/data/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/src/slytrade/data/models.py b/src/slytrade/data/models.py
+new file mode 100644
+index 0000000..8cc5e44
+--- /dev/null
++++ b/src/slytrade/data/models.py
+@@ -0,0 +1,35 @@
++from __future__ import annotations
++
++from dataclasses import dataclass
++from datetime import datetime
++
++
++@dataclass(frozen=True)
++class Tick:
++    symbol: str
++    time: datetime
++    bid: float
++    ask: float
++    last: float = 0.0
++    volume: float = 0.0
++
++    @property
++    def spread(self) -> float:
++        return self.ask - self.bid
++
++    @property
++    def mid(self) -> float:
++        return (self.bid + self.ask) / 2.0
++
++
++@dataclass(frozen=True)
++class Bar:
++    symbol: str
++    timeframe: str
++    time: datetime
++    open: float
++    high: float
++    low: float
++    close: float
++    tick_volume: float = 0.0
++    spread: float = 0.0
+diff --git a/src/slytrade/execution/__init__.py b/src/slytrade/execution/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/src/slytrade/execution/models.py b/src/slytrade/execution/models.py
+new file mode 100644
+index 0000000..10f239e
+--- /dev/null
++++ b/src/slytrade/execution/models.py
+@@ -0,0 +1,51 @@
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from datetime import UTC, datetime
++from enum import StrEnum
++from uuid import uuid4
++
++
++class Side(StrEnum):
++    BUY = "buy"
++    SELL = "sell"
++
++
++class OrderKind(StrEnum):
++    MARKET = "market"
++    LIMIT = "limit"
++
++
++class OrderStatus(StrEnum):
++    CREATED = "created"
++    ACCEPTED = "accepted"
++    REJECTED = "rejected"
++    PARTIALLY_FILLED = "partially_filled"
++    FILLED = "filled"
++    CANCELLED = "cancelled"
++    UNKNOWN = "unknown"
++
++
++@dataclass(frozen=True)
++class OrderIntent:
++    symbol: str
++    side: Side
++    volume: float
++    kind: OrderKind = OrderKind.MARKET
++    limit_price: float | None = None
++    stop_loss: float | None = None
++    take_profit: float | None = None
++    reason: str = "strategy"
++    client_order_id: str = field(default_factory=lambda: str(uuid4()))
++    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
++
++
++@dataclass(frozen=True)
++class ExecutionReport:
++    client_order_id: str
++    status: OrderStatus
++    filled_volume: float = 0.0
++    avg_fill_price: float | None = None
++    broker_order_id: str | None = None
++    message: str = ""
++    event_time: datetime = field(default_factory=lambda: datetime.now(UTC))
+diff --git a/src/slytrade/features/__init__.py b/src/slytrade/features/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/src/slytrade/monitoring/__init__.py b/src/slytrade/monitoring/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/src/slytrade/research/__init__.py b/src/slytrade/research/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/src/slytrade/risk/__init__.py b/src/slytrade/risk/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/src/slytrade/risk/guardrails.py b/src/slytrade/risk/guardrails.py
+new file mode 100644
+index 0000000..c1b803e
+--- /dev/null
++++ b/src/slytrade/risk/guardrails.py
+@@ -0,0 +1,60 @@
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++from slytrade.execution.models import OrderIntent
++
++
++@dataclass(frozen=True)
++class GuardrailConfig:
++    allow_live_trading: bool = False
++    max_daily_drawdown: float = 0.03
++    max_total_drawdown: float = 0.08
++    max_position_volume: float = 1.0
++    max_spread_points: float = 50.0
++
++
++@dataclass(frozen=True)
++class GuardrailDecision:
++    approved: bool
++    reason: str = "OK"
++
++
++class TradingGuardrails:
++    def __init__(self, config: GuardrailConfig, initial_equity: float):
++        self.config = config
++        self.initial_equity = float(initial_equity)
++        self.peak_equity = float(initial_equity)
++        self.kill_switch = False
++
++    def approve_order(
++        self,
++        intent: OrderIntent,
++        *,
++        equity: float,
++        spread_points: float | None = None,
++        live: bool = False,
++    ) -> GuardrailDecision:
++        if self.kill_switch:
++            return GuardrailDecision(False, "kill switch active")
++
++        if live and not self.config.allow_live_trading:
++            return GuardrailDecision(False, "live trading disabled")
++
++        if intent.volume <= 0:
++            return GuardrailDecision(False, "volume must be positive")
++
++        if intent.volume > self.config.max_position_volume:
++            return GuardrailDecision(False, "position volume too large")
++
++        if spread_points is not None and spread_points > self.config.max_spread_points:
++            return GuardrailDecision(False, "spread too high")
++
++        self.peak_equity = max(self.peak_equity, equity)
++        total_dd = (self.peak_equity - equity) / max(self.peak_equity, 1e-9)
++
++        if total_dd >= self.config.max_total_drawdown:
++            self.kill_switch = True
++            return GuardrailDecision(False, "max total drawdown breached")
++
++        return GuardrailDecision(True)
+diff --git a/src/slytrade/rl/__init__.py b/src/slytrade/rl/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/unit/test_config.py b/tests/unit/test_config.py
+new file mode 100644
+index 0000000..2405d31
+--- /dev/null
++++ b/tests/unit/test_config.py
+@@ -0,0 +1,11 @@
++from slytrade.core.config import load_config
++
++
++def test_load_config():
++    cfg = load_config()
++
++    assert cfg.assets["execution_timeframe"] == "M1"
++    assert "XAUUSD" in cfg.assets["primary"]
++    assert cfg.data["tick_data"]["enabled"] is True
++    assert cfg.data["bar_data"]["enabled"] is True
++    assert cfg.risk["risk_per_trade"] > 0
+diff --git a/tests/unit/test_data_models.py b/tests/unit/test_data_models.py
+new file mode 100644
+index 0000000..01f5eb5
+--- /dev/null
++++ b/tests/unit/test_data_models.py
+@@ -0,0 +1,24 @@
++from datetime import UTC, datetime
++
++from slytrade.data.models import Bar, Tick
++
++
++def test_tick_spread_and_mid():
++    tick = Tick(symbol="XAUUSD", time=datetime.now(UTC), bid=2400.0, ask=2400.2)
++
++    assert round(tick.spread, 2) == 0.2
++    assert round(tick.mid, 2) == 2400.1
++
++
++def test_bar_model():
++    bar = Bar(
++        symbol="XAUUSD",
++        timeframe="M1",
++        time=datetime.now(UTC),
++        open=2400.0,
++        high=2401.0,
++        low=2399.5,
++        close=2400.5,
++    )
++
++    assert bar.high >= bar.low
+diff --git a/tests/unit/test_guardrails.py b/tests/unit/test_guardrails.py
+new file mode 100644
+index 0000000..abc0d76
+--- /dev/null
++++ b/tests/unit/test_guardrails.py
+@@ -0,0 +1,31 @@
++from slytrade.execution.models import OrderIntent, Side
++from slytrade.risk.guardrails import GuardrailConfig, TradingGuardrails
++
++
++def test_live_trading_blocked_by_default():
++    guards = TradingGuardrails(GuardrailConfig(), initial_equity=100_000)
++    intent = OrderIntent(symbol="XAUUSD", side=Side.BUY, volume=0.01)
++
++    decision = guards.approve_order(intent, equity=100_000, live=True)
++
++    assert not decision.approved
++    assert "live trading disabled" in decision.reason
++
++
++def test_order_approved_in_paper_mode():
++    guards = TradingGuardrails(GuardrailConfig(), initial_equity=100_000)
++    intent = OrderIntent(symbol="XAUUSD", side=Side.BUY, volume=0.01)
++
++    decision = guards.approve_order(intent, equity=100_000, live=False)
++
++    assert decision.approved
++
++
++def test_spread_guard_blocks_bad_trade():
++    guards = TradingGuardrails(GuardrailConfig(max_spread_points=10), initial_equity=100_000)
++    intent = OrderIntent(symbol="XAUUSD", side=Side.BUY, volume=0.01)
++
++    decision = guards.approve_order(intent, equity=100_000, spread_points=20)
++
++    assert not decision.approved
++    assert "spread too high" in decision.reason

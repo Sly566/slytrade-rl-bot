@@ -1,0 +1,75 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slytrade-rl-bot"
+version = "0.1.0"
+description = "Production-grade MT5 tick-and-bar based ICT/SMC RL trading bot"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "numpy>=1.26",
+  "pandas>=2.2",
+  "pyyaml>=6.0",
+  "pydantic>=2.7",
+  "pydantic-settings>=2.3",
+  "python-dotenv>=1.0",
+  "typer>=0.12",
+  "rich>=13.7",
+  "prometheus-client>=0.20"
+]
+
+[project.optional-dependencies]
+data = [
+  "pyarrow>=15.0",
+  "polars>=0.20"
+]
+
+dev = [
+  "pytest>=8.2",
+  "pytest-cov>=5.0",
+  "ruff>=0.5",
+  "mypy>=1.10",
+  "types-PyYAML>=6.0.12.20250516"
+]
+
+rl = [
+  "gymnasium>=0.29",
+  "stable-baselines3>=2.3",
+  "torch>=2.2",
+  "optuna>=3.6",
+  "mlflow>=2.14"
+]
+
+explain = [
+  "shap>=0.45",
+  "transformers>=4.42"
+]
+
+mt5 = [
+  "mt5linux>=0.1"
+]
+
+[project.scripts]
+slytrade = "slytrade.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+strict = false

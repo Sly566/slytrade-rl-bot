@@ -1,0 +1,13 @@
+mt5:
+  terminal_path: "C:\\Program Files\\MetaTrader 5\\terminal64.exe"
+  wine_prefix: "~/.wine_mt5"
+  login_timeout: 30
+  reconnect_attempts: 5
+  headless: true
+
+execution:
+  max_ping_ms: 150
+  max_execution_delay_ms: 500
+  max_slippage_points: 20
+  max_spread_points: 50
+  default_order_type: MARKET

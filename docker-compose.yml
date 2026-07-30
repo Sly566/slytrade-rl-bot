@@ -1,0 +1,11 @@
+services:
+  slytrade:
+    build: .
+    command: python -m slytrade.cli doctor
+    volumes:
+      - ./configs:/app/configs:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+    environment:
+      - SLYTRADE_ALLOW_LIVE=0
+    restart: "no"

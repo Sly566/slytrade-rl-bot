@@ -1,0 +1,12 @@
+risk_per_trade: 0.005
+max_daily_drawdown: 0.03
+max_total_drawdown: 0.08
+max_position_volume: 1.0
+max_open_positions: 1
+max_consecutive_losses: 3
+
+ict:
+  sl_atr_mult: 1.0
+  trailing_atr_mult: 2.0
+  min_trail_distance_points: 50
+  partial_tp_enabled: false

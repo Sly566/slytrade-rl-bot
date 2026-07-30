@@ -1,0 +1,31 @@
+execution_timeframe: M1
+target_timeframe: M5
+intraday_timeframe: M15
+
+observe_timeframes:
+  - M1
+  - M5
+  - M15
+  - H1
+  - H4
+  - D1
+  - W1
+
+primary:
+  - XAUUSD
+
+secondary:
+  - BTCUSD
+
+asset_classes:
+  metals: [XAUUSD, XAGUSD]
+  crypto: [BTCUSD, ETHUSD]
+  forex: [EURUSD, GBPUSD, USDJPY]
+  indices: [US500, US30, NAS100, DE30]
+  commodities: [USOIL]
+
+data_sources:
+  use_ticks: true
+  use_bars: true
+  tick_source: MT5
+  bar_source: MT5

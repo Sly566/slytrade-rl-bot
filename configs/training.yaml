@@ -1,0 +1,21 @@
+environment:
+  initial_balance: 100000
+  episode_length_bars: 1000
+
+data:
+  symbols: ["XAUUSD"]
+  train_start: "2024-01-01"
+  train_end: "2025-12-31"
+  validation_start: "2026-01-01"
+  validation_end: "2026-06-30"
+
+walk_forward:
+  enabled: true
+  train_window_bars: 200000
+  validation_window_bars: 50000
+  embargo_bars: 500
+
+training:
+  algorithm: PPO
+  total_timesteps: 100000
+  seed: 42
