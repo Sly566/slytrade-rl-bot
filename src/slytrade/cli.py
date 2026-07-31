@@ -460,6 +460,10 @@ def align_dataset(
     bar_source: str = typer.Option("mt5_bars", help="Bar source label"),
     tick_source: str = typer.Option("exness_ticks", help="Tick source label"),
     max_quote_age_seconds: float = typer.Option(5.0, help="Fresh tick coverage threshold"),
+    min_fresh_coverage: float = typer.Option(0.95, help="Minimum expected fresh tick coverage ratio"),
+    include_ict_features: bool = typer.Option(True, "--features/--no-features", help="Compute causal ICT/SMC features"),
+    include_tick_features: bool = typer.Option(True, "--tick-features/--no-tick-features", help="Compute per-bar tick microstructure features"),
+    copy_ticks: bool = typer.Option(False, "--copy-ticks/--no-copy-ticks", help="Copy full tick file into processed dataset"),
 ) -> None:
     """Align bars and ticks into a canonical dataset with a manifest."""
     from slytrade.backtest.reporting import load_bars_file, load_ticks_file
@@ -475,8 +479,17 @@ def align_dataset(
         bar_source=bar_source,
         tick_source=tick_source,
         max_quote_age_seconds=max_quote_age_seconds,
+        min_fresh_coverage=min_fresh_coverage,
+        include_ict_features=include_ict_features,
+        include_tick_features=include_tick_features,
     )
-    manifest = save_aligned_dataset(dataset, output_dir)
+    manifest = save_aligned_dataset(
+        dataset,
+        output_dir,
+        source_bars_file=bars_file,
+        source_ticks_file=ticks_file,
+        copy_ticks=copy_ticks,
+    )
     render_manifest(manifest, console=console)
 
 

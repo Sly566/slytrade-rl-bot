@@ -25,6 +25,10 @@
 - [x] Symbol alias normalization for research datasets
 - [x] Precomputed decision quotes in aligned bars
 - [x] Fast aligned backtest path
+- [x] Per-bar tick microstructure features
+- [x] Causal ICT features embedded in aligned datasets
+- [x] Dataset quality status / issues in manifest
+- [x] Market data scope documented (historical L1 vs L2)
 - [ ] Tick schema validation
 - [ ] Bar schema validation
 - [ ] Parquet storage
