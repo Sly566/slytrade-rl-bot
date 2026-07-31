@@ -451,6 +451,36 @@ def generate_sample_ticks(
 
 
 @app.command()
+def align_dataset(
+    bars_file: str = typer.Option(..., help="Canonical bars file (.csv or .parquet)"),
+    ticks_file: str = typer.Option(..., help="Canonical ticks file (.csv or .parquet)"),
+    output_dir: str = typer.Option(..., help="Directory for aligned bars/ticks/manifest"),
+    timeframe: str = typer.Option("M1", help="Bar timeframe, e.g. M1"),
+    canonical_symbol: str | None = typer.Option(None, help="Canonical research symbol, e.g. XAUUSD"),
+    bar_source: str = typer.Option("mt5_bars", help="Bar source label"),
+    tick_source: str = typer.Option("exness_ticks", help="Tick source label"),
+    max_quote_age_seconds: float = typer.Option(5.0, help="Fresh tick coverage threshold"),
+) -> None:
+    """Align bars and ticks into a canonical dataset with a manifest."""
+    from slytrade.backtest.reporting import load_bars_file, load_ticks_file
+    from slytrade.data.alignment import align_market_data, render_manifest, save_aligned_dataset
+
+    bars = load_bars_file(Path(bars_file))
+    ticks = load_ticks_file(Path(ticks_file))
+    dataset = align_market_data(
+        bars,
+        ticks,
+        timeframe=timeframe,
+        canonical_symbol=canonical_symbol,
+        bar_source=bar_source,
+        tick_source=tick_source,
+        max_quote_age_seconds=max_quote_age_seconds,
+    )
+    manifest = save_aligned_dataset(dataset, output_dir)
+    render_manifest(manifest, console=console)
+
+
+@app.command()
 def run_tick_backtest(
     bars_file: str = typer.Option(..., help="Canonical bars file (.csv or .parquet)"),
     ticks_file: str = typer.Option(..., help="Canonical ticks file (.csv or .parquet)"),

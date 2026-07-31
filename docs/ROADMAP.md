@@ -20,6 +20,9 @@
 - [x] Empty chunk coverage feedback
 - [x] Exness archive tick downloader
 - [x] Source-separated MT5 vs Exness tick storage
+- [x] Dataset alignment layer
+- [x] Source manifest for aligned bars/ticks
+- [x] Symbol alias normalization for research datasets
 - [ ] Tick schema validation
 - [ ] Bar schema validation
 - [ ] Parquet storage
