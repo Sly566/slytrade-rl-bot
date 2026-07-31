@@ -96,3 +96,23 @@ def test_align_dataset_cli(tmp_path):
     assert "Aligned Dataset Manifest" in result.stdout
     manifest = json.loads((out_dir / "manifest.json").read_text())
     assert manifest["canonical_symbol"] == "XAUUSD"
+
+
+def test_align_market_data_can_drop_stale_bars():
+    bars = make_bars()
+    ticks = make_ticks().iloc[:1].copy()
+
+    dataset = align_market_data(
+        bars,
+        ticks,
+        timeframe="M1",
+        require_fresh_quotes=True,
+        min_fresh_coverage=0.95,
+    )
+
+    assert len(dataset.bars) == 1
+    assert dataset.manifest.source_bars_rows == 3
+    assert dataset.manifest.aligned_bars_rows == 1
+    assert dataset.manifest.dropped_stale_bars == 2
+    assert dataset.manifest.require_fresh_quotes is True
+    assert dataset.manifest.quality_status == "WARN"

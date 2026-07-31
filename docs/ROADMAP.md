@@ -32,6 +32,8 @@
 - [x] Tick schema validation
 - [x] Bar schema validation
 - [x] Parquet storage
+- [x] Fresh-quote filtering for aligned datasets
+- [x] Broker symbol specs for realistic point value
 
 ## Phase 3: Causal ICT/SMC Features
 

@@ -59,6 +59,43 @@ def shutdown_mt5(mt5: Any) -> None:
         mt5.shutdown()
 
 
+def build_backtest_config_from_cli(
+    *,
+    initial_balance: float,
+    point_size: float,
+    point_value: float,
+    default_spread_points: float = 20.0,
+    slippage_points: float = 0.0,
+    commission_per_volume: float = 0.0,
+    max_quote_age_seconds: float = 5.0,
+    allow_bar_quote_fallback: bool = True,
+    symbol_spec_file: str | None = None,
+):
+    from slytrade.backtest.engine import BacktestConfig
+
+    if symbol_spec_file is not None:
+        from slytrade.brokers.specs import load_symbol_spec, spec_to_backtest_pricing
+
+        spec = load_symbol_spec(symbol_spec_file)
+        pricing = spec_to_backtest_pricing(spec)
+        point_size = pricing.point_size
+        point_value = pricing.point_value
+        console.print(
+            f"Using symbol spec {spec.name}: point_size={point_size}, "
+            f"point_value={point_value:.6f}, volume_step={pricing.volume_step}"
+        )
+    return BacktestConfig(
+        initial_balance=initial_balance,
+        default_spread_points=default_spread_points,
+        point_size=point_size,
+        point_value=point_value,
+        slippage_points=slippage_points,
+        commission_per_volume=commission_per_volume,
+        max_quote_age_seconds=max_quote_age_seconds,
+        allow_bar_quote_fallback=allow_bar_quote_fallback,
+    )
+
+
 def print_collection_result(result: Any, original_symbol: str) -> None:
     if result.symbol != original_symbol:
         console.print(f"Resolved symbol: {original_symbol} -> {result.symbol}")
@@ -307,6 +344,39 @@ def collect_recent_exness_ticks(
 
 
 @app.command()
+def collect_symbol_spec(
+    symbol: str = typer.Option(..., help="Base or resolved MT5 symbol, e.g. XAUUSD"),
+    output_file: str | None = typer.Option(None, help="Output JSON file. Defaults under data/raw/symbol_specs."),
+    resolve: bool = typer.Option(True, "--resolve/--no-resolve", help="Resolve base symbol to broker-specific MT5 symbol"),
+) -> None:
+    """Collect broker symbol specs from MT5 for realistic PnL and sizing."""
+    from slytrade.brokers.specs import save_symbol_spec, symbol_spec_from_mt5_info
+    from slytrade.brokers.symbols import resolve_symbol
+
+    mt5 = load_mt5()
+    initialize_mt5(mt5)
+    try:
+        actual_symbol = resolve_symbol(mt5, symbol).resolved if resolve else symbol
+        info = mt5.symbol_info(actual_symbol)
+        spec = symbol_spec_from_mt5_info(info)
+        path = (
+            Path(output_file)
+            if output_file is not None
+            else Path("data/raw/symbol_specs") / f"{spec.name}.json"
+        )
+        save_symbol_spec(spec, path)
+        if actual_symbol != symbol:
+            console.print(f"Resolved symbol: {symbol} -> {actual_symbol}")
+        console.print(f"Saved symbol spec to {path}")
+        console.print(
+            f"point_size={spec.trade_tick_size}, point_value={spec.point_value_per_price_unit:.6f}, "
+            f"volume_min={spec.volume_min}, volume_step={spec.volume_step}"
+        )
+    finally:
+        shutdown_mt5(mt5)
+
+
+@app.command()
 def run_backtest(
     bars_file: str = typer.Option(..., help="Canonical bars file (.csv or .parquet)"),
     strategy: str = typer.Option("no-trade", help="no-trade, buy-and-hold, ma-cross, or ict-bias"),
@@ -315,6 +385,7 @@ def run_backtest(
     initial_balance: float = typer.Option(100_000.0, help="Initial account balance"),
     point_size: float = typer.Option(0.01, help="Instrument point size"),
     point_value: float = typer.Option(1.0, help="PnL value per price unit and volume"),
+    symbol_spec_file: str | None = typer.Option(None, help="Optional symbol spec JSON to set point size/value"),
     default_spread_points: float = typer.Option(20.0, help="Fallback spread in points when bars have no spread"),
     slippage_points: float = typer.Option(0.0, help="Adverse slippage in points"),
     commission_per_volume: float = typer.Option(0.0, help="Commission per traded volume unit"),
@@ -322,7 +393,6 @@ def run_backtest(
     slow_window: int = typer.Option(20, help="Slow MA window for ma-cross"),
 ) -> None:
     """Run a baseline backtest from a canonical bars file."""
-    from slytrade.backtest.engine import BacktestConfig
     from slytrade.backtest.reporting import (
         VALID_STRATEGIES,
         load_bars_file,
@@ -340,13 +410,14 @@ def run_backtest(
         volume=volume,
         fast_window=fast_window,
         slow_window=slow_window,
-        config=BacktestConfig(
+        config=build_backtest_config_from_cli(
             initial_balance=initial_balance,
             default_spread_points=default_spread_points,
             point_size=point_size,
             point_value=point_value,
             slippage_points=slippage_points,
             commission_per_volume=commission_per_volume,
+            symbol_spec_file=symbol_spec_file,
         ),
     )
     render_backtest_report(result, strategy_name=strategy, console=console)
@@ -360,6 +431,7 @@ def compare_baselines(
     initial_balance: float = typer.Option(100_000.0, help="Initial account balance"),
     point_size: float = typer.Option(0.01, help="Instrument point size"),
     point_value: float = typer.Option(1.0, help="PnL value per price unit and volume"),
+    symbol_spec_file: str | None = typer.Option(None, help="Optional symbol spec JSON to set point size/value"),
     default_spread_points: float = typer.Option(20.0, help="Fallback spread in points when bars have no spread"),
     slippage_points: float = typer.Option(0.0, help="Adverse slippage in points"),
     commission_per_volume: float = typer.Option(0.0, help="Commission per traded volume unit"),
@@ -368,7 +440,6 @@ def compare_baselines(
     output_csv: str | None = typer.Option(None, help="Optional path to save comparison as CSV"),
 ) -> None:
     """Run all baseline strategies and print a comparison table."""
-    from slytrade.backtest.engine import BacktestConfig
     from slytrade.backtest.reporting import (
         compare_baselines_from_bars,
         comparison_as_frame,
@@ -383,13 +454,14 @@ def compare_baselines(
         volume=volume,
         fast_window=fast_window,
         slow_window=slow_window,
-        config=BacktestConfig(
+        config=build_backtest_config_from_cli(
             initial_balance=initial_balance,
             default_spread_points=default_spread_points,
             point_size=point_size,
             point_value=point_value,
             slippage_points=slippage_points,
             commission_per_volume=commission_per_volume,
+            symbol_spec_file=symbol_spec_file,
         ),
     )
     render_baseline_comparison(rows, console=console)
@@ -463,6 +535,7 @@ def align_dataset(
     min_fresh_coverage: float = typer.Option(0.95, help="Minimum expected fresh tick coverage ratio"),
     include_ict_features: bool = typer.Option(True, "--features/--no-features", help="Compute causal ICT/SMC features"),
     include_tick_features: bool = typer.Option(True, "--tick-features/--no-tick-features", help="Compute per-bar tick microstructure features"),
+    require_fresh_quotes: bool = typer.Option(True, "--fresh-only/--keep-stale", help="Drop bars without fresh decision quotes"),
     copy_ticks: bool = typer.Option(False, "--copy-ticks/--no-copy-ticks", help="Copy full tick file into processed dataset"),
 ) -> None:
     """Align bars and ticks into a canonical dataset with a manifest."""
@@ -482,6 +555,7 @@ def align_dataset(
         min_fresh_coverage=min_fresh_coverage,
         include_ict_features=include_ict_features,
         include_tick_features=include_tick_features,
+        require_fresh_quotes=require_fresh_quotes,
     )
     manifest = save_aligned_dataset(
         dataset,
@@ -502,13 +576,13 @@ def run_aligned_backtest(
     initial_balance: float = typer.Option(100_000.0, help="Initial account balance"),
     point_size: float = typer.Option(0.01, help="Instrument point size"),
     point_value: float = typer.Option(1.0, help="PnL value per price unit and volume"),
+    symbol_spec_file: str | None = typer.Option(None, help="Optional symbol spec JSON to set point size/value"),
     slippage_points: float = typer.Option(0.0, help="Adverse slippage in points"),
     commission_per_volume: float = typer.Option(0.0, help="Commission per traded volume unit"),
     fast_window: int = typer.Option(5, help="Fast MA window for ma-cross"),
     slow_window: int = typer.Option(20, help="Slow MA window for ma-cross"),
 ) -> None:
     """Run a fast backtest from an aligned bars file with precomputed quotes."""
-    from slytrade.backtest.engine import BacktestConfig
     from slytrade.backtest.reporting import (
         VALID_STRATEGIES,
         load_bars_file,
@@ -526,12 +600,13 @@ def run_aligned_backtest(
         volume=volume,
         fast_window=fast_window,
         slow_window=slow_window,
-        config=BacktestConfig(
+        config=build_backtest_config_from_cli(
             initial_balance=initial_balance,
             point_size=point_size,
             point_value=point_value,
             slippage_points=slippage_points,
             commission_per_volume=commission_per_volume,
+            symbol_spec_file=symbol_spec_file,
         ),
     )
     render_backtest_report(result, strategy_name=f"aligned-{strategy}", console=console)
@@ -547,6 +622,7 @@ def run_tick_backtest(
     initial_balance: float = typer.Option(100_000.0, help="Initial account balance"),
     point_size: float = typer.Option(0.01, help="Instrument point size"),
     point_value: float = typer.Option(1.0, help="PnL value per price unit and volume"),
+    symbol_spec_file: str | None = typer.Option(None, help="Optional symbol spec JSON to set point size/value"),
     default_spread_points: float = typer.Option(20.0, help="Fallback spread in points when no tick quote exists"),
     slippage_points: float = typer.Option(0.0, help="Adverse slippage in points"),
     commission_per_volume: float = typer.Option(0.0, help="Commission per traded volume unit"),
@@ -560,7 +636,6 @@ def run_tick_backtest(
     slow_window: int = typer.Option(20, help="Slow MA window for ma-cross"),
 ) -> None:
     """Run a baseline backtest where bar signals execute on tick bid/ask quotes."""
-    from slytrade.backtest.engine import BacktestConfig
     from slytrade.backtest.reporting import (
         VALID_STRATEGIES,
         load_bars_file,
@@ -581,7 +656,7 @@ def run_tick_backtest(
         volume=volume,
         fast_window=fast_window,
         slow_window=slow_window,
-        config=BacktestConfig(
+        config=build_backtest_config_from_cli(
             initial_balance=initial_balance,
             default_spread_points=default_spread_points,
             point_size=point_size,
@@ -590,6 +665,7 @@ def run_tick_backtest(
             commission_per_volume=commission_per_volume,
             max_quote_age_seconds=max_quote_age_seconds,
             allow_bar_quote_fallback=allow_bar_quote_fallback,
+            symbol_spec_file=symbol_spec_file,
         ),
     )
     render_backtest_report(result, strategy_name=f"tick-{strategy}", console=console)

@@ -31,3 +31,10 @@ Historical Exness archive ticks are Level 1 bid/ask ticks, not historical L2 ord
 ## Next layers may assume
 
 After this gate, backtesting and RL can use aligned bars as the main research table. Full tick files remain available for validation and advanced execution modelling, but repeated baseline/RL runs should use the precomputed aligned bars path for speed.
+
+## Final hardening additions
+
+- Alignment can drop stale bars with `--fresh-only` (default) so downstream backtests/RL do not execute on stale quotes.
+- The manifest records original source bar rows, final aligned rows, dropped stale bars and quality status.
+- Broker symbol specifications can be saved from MT5 and used for realistic point size / point value in backtests.
+- Full historical L2 is explicitly out of scope because Exness archive ticks provide Level 1 bid/ask data, not order-book depth.

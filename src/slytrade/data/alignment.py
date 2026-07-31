@@ -59,6 +59,10 @@ class DatasetManifest:
     fresh_coverage_ratio: float = 0.0
     quality_status: str = "UNKNOWN"
     quality_issues: list[str] = field(default_factory=list)
+    source_bars_rows: int = 0
+    aligned_bars_rows: int = 0
+    dropped_stale_bars: int = 0
+    require_fresh_quotes: bool = False
     quote_columns: list[str] = field(default_factory=lambda: QUOTE_COLUMNS.copy())
     tick_feature_columns: list[str] = field(default_factory=lambda: TICK_BAR_FEATURE_COLUMNS.copy())
     ict_feature_columns: list[str] = field(default_factory=lambda: FEATURE_COLUMNS.copy())
@@ -257,6 +261,7 @@ def align_market_data(
     min_fresh_coverage: float = 0.95,
     include_ict_features: bool = True,
     include_tick_features: bool = True,
+    require_fresh_quotes: bool = False,
 ) -> AlignedDataset:
     """Align bar and tick frames into one canonical dataset.
 
@@ -303,6 +308,13 @@ def align_market_data(
     )
     fresh_ratio = compute_fresh_coverage_ratio(coverage)
     quality_status, quality_issues = dataset_quality_status(coverage, min_fresh_coverage=min_fresh_coverage)
+    source_bars_rows = len(aligned_bars)
+    if require_fresh_quotes:
+        aligned_bars = aligned_bars[aligned_bars["quote_is_fresh"]].reset_index(drop=True)
+    aligned_bars_rows = len(aligned_bars)
+    dropped_stale_bars = source_bars_rows - aligned_bars_rows
+    if aligned_bars.empty:
+        raise ValueError("aligned dataset has no bars after fresh-quote filtering")
 
     manifest = DatasetManifest(
         canonical_symbol=resolved_canonical,
@@ -323,6 +335,10 @@ def align_market_data(
         fresh_coverage_ratio=fresh_ratio,
         quality_status=quality_status,
         quality_issues=quality_issues,
+        source_bars_rows=source_bars_rows,
+        aligned_bars_rows=aligned_bars_rows,
+        dropped_stale_bars=dropped_stale_bars,
+        require_fresh_quotes=require_fresh_quotes,
     )
     return AlignedDataset(bars=aligned_bars, ticks=aligned_ticks, manifest=manifest)
 
