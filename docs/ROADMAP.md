@@ -18,6 +18,8 @@
 - [x] Relative lookback bar collection
 - [x] Relative lookback tick collection
 - [x] Empty chunk coverage feedback
+- [x] Exness archive tick downloader
+- [x] Source-separated MT5 vs Exness tick storage
 - [ ] Tick schema validation
 - [ ] Bar schema validation
 - [ ] Parquet storage

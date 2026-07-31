@@ -240,6 +240,72 @@ def collect_recent_ticks(
         shutdown_mt5(mt5)
 
 
+def print_exness_archive_result(result: Any) -> None:
+    console.print(
+        f"Collected {result.rows} Exness archive tick rows into {result.file_count} files "
+        f"({result.months_attempted} months attempted, {result.empty_months} empty, {result.failed_months} failed)"
+    )
+    if result.errors:
+        console.print("[yellow]Warnings/errors:[/yellow]")
+        for error in result.errors[:20]:
+            console.print(f"- {error}")
+        if len(result.errors) > 20:
+            console.print(f"... {len(result.errors) - 20} more")
+    for file_result in result.files:
+        console.print(f"- {file_result.path} ({file_result.rows} rows, {file_result.format}, {file_result.period})")
+
+
+@app.command()
+def collect_exness_ticks(
+    symbol: str = typer.Option(..., help="Exness archive base symbol, e.g. XAUUSD"),
+    start: str = typer.Option(..., help="UTC start date/datetime, e.g. 2025-07-01"),
+    end: str = typer.Option(..., help="UTC end date/datetime, e.g. 2026-07-01"),
+    output_dir: str = typer.Option("data/raw", help="Raw data root directory"),
+    continue_on_error: bool = typer.Option(
+        True,
+        "--continue-on-error/--fail-fast",
+        help="Continue when an archive month is unavailable",
+    ),
+) -> None:
+    """Collect historical ticks directly from the Exness public archive."""
+    from slytrade.data.exness_archive import ExnessArchiveDownloader
+
+    downloader = ExnessArchiveDownloader(output_dir)
+    result = downloader.collect(
+        symbol,
+        parse_utc_datetime(start),
+        parse_utc_datetime(end),
+        continue_on_error=continue_on_error,
+    )
+    print_exness_archive_result(result)
+
+
+@app.command()
+def collect_recent_exness_ticks(
+    symbol: str = typer.Option(..., help="Exness archive base symbol, e.g. XAUUSD"),
+    lookback: str = typer.Option("1y", help="Lookback duration, e.g. 1m, 6m, 1y, 2y"),
+    end: str | None = typer.Option(None, help="UTC end date/datetime. Defaults to current UTC time."),
+    output_dir: str = typer.Option("data/raw", help="Raw data root directory"),
+    continue_on_error: bool = typer.Option(
+        True,
+        "--continue-on-error/--fail-fast",
+        help="Continue when an archive month is unavailable",
+    ),
+) -> None:
+    """Collect Exness archive ticks using a relative lookback from now or --end."""
+    from slytrade.data.exness_archive import ExnessArchiveDownloader
+
+    end_dt = parse_utc_datetime(end) if end is not None else None
+    start_dt, resolved_end = date_range_from_lookback(lookback, end=end_dt)
+    console.print(
+        f"Collecting Exness archive ticks from {start_dt.isoformat()} to {resolved_end.isoformat()} "
+        f"(lookback={lookback})"
+    )
+    downloader = ExnessArchiveDownloader(output_dir)
+    result = downloader.collect(symbol, start_dt, resolved_end, continue_on_error=continue_on_error)
+    print_exness_archive_result(result)
+
+
 @app.command()
 def run_backtest(
     bars_file: str = typer.Option(..., help="Canonical bars file (.csv or .parquet)"),
