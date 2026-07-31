@@ -37,6 +37,14 @@ def load_mt5() -> Any:
             raise RuntimeError(
                 "No MT5 Python integration found. Install the `mt5` optional dependencies and start your MT5 bridge."
             ) from exc
+        except Exception as exc:
+            message = str(exc)
+            if "invalid message type" in message.lower():
+                raise RuntimeError(
+                    "mt5linux connected to an incompatible or stale RPyC server. "
+                    "Restart the Wine mt5linux server and make sure Linux and Wine Python use compatible mt5linux/rpyc versions."
+                ) from exc
+            raise RuntimeError(f"Could not connect to mt5linux bridge: {exc}") from exc
 
 
 def initialize_mt5(mt5: Any) -> None:
@@ -98,11 +106,12 @@ def info() -> None:
 
 @app.command()
 def collect_ticks(
-    symbol: str = typer.Option(..., help="Resolved MT5 symbol, e.g. XAUUSD or XAUUSDm"),
+    symbol: str = typer.Option(..., help="Base or resolved MT5 symbol, e.g. XAUUSD or XAUUSDm"),
     start: str = typer.Option(..., help="UTC start date/datetime, e.g. 2026-01-01"),
     end: str = typer.Option(..., help="UTC end date/datetime, e.g. 2026-01-02"),
     chunk_size: str = typer.Option("day", help="day, week, or month"),
     output_dir: str = typer.Option("data/raw", help="Raw data root directory"),
+    resolve: bool = typer.Option(True, "--resolve/--no-resolve", help="Resolve base symbol to broker-specific MT5 symbol"),
 ) -> None:
     """Collect MT5 historical ticks into partitioned storage."""
     from slytrade.data.mt5_collectors import MT5TickCollector
@@ -112,7 +121,9 @@ def collect_ticks(
     initialize_mt5(mt5)
     try:
         collector = MT5TickCollector(mt5, MarketDataStorage(Path(output_dir)))
-        result = collector.collect(symbol, parse_utc_datetime(start), parse_utc_datetime(end), chunk_size=chunk_size)  # type: ignore[arg-type]
+        result = collector.collect(symbol, parse_utc_datetime(start), parse_utc_datetime(end), chunk_size=chunk_size, resolve=resolve)  # type: ignore[arg-type]
+        if result.symbol != symbol:
+            console.print(f"Resolved symbol: {symbol} -> {result.symbol}")
         console.print(f"Collected {result.rows} tick rows into {result.file_count} files")
         for file_result in result.files:
             console.print(f"- {file_result.path} ({file_result.rows} rows, {file_result.format})")
@@ -122,12 +133,13 @@ def collect_ticks(
 
 @app.command()
 def collect_bars(
-    symbol: str = typer.Option(..., help="Resolved MT5 symbol, e.g. XAUUSD or XAUUSDm"),
+    symbol: str = typer.Option(..., help="Base or resolved MT5 symbol, e.g. XAUUSD or XAUUSDm"),
     timeframe: str = typer.Option(..., help="Timeframe, e.g. M1, M5, H1"),
     start: str = typer.Option(..., help="UTC start date/datetime, e.g. 2026-01-01"),
     end: str = typer.Option(..., help="UTC end date/datetime, e.g. 2026-01-02"),
     chunk_size: str = typer.Option("month", help="day, week, or month"),
     output_dir: str = typer.Option("data/raw", help="Raw data root directory"),
+    resolve: bool = typer.Option(True, "--resolve/--no-resolve", help="Resolve base symbol to broker-specific MT5 symbol"),
 ) -> None:
     """Collect MT5 historical bars/rates into partitioned storage."""
     from slytrade.data.mt5_collectors import MT5BarCollector
@@ -143,7 +155,10 @@ def collect_bars(
             parse_utc_datetime(start),
             parse_utc_datetime(end),
             chunk_size=chunk_size,  # type: ignore[arg-type]
+            resolve=resolve,
         )
+        if result.symbol != symbol:
+            console.print(f"Resolved symbol: {symbol} -> {result.symbol}")
         console.print(f"Collected {result.rows} bar rows into {result.file_count} files")
         for file_result in result.files:
             console.print(f"- {file_result.path} ({file_result.rows} rows, {file_result.format})")
@@ -363,19 +378,25 @@ def mt5_info() -> None:
 
 
 @app.command()
-def resolve_symbols(contains: str = typer.Option("XAU", help="Case-insensitive symbol name filter")) -> None:
-    """List MT5 symbols matching a text filter."""
+def resolve_symbols(contains: str = typer.Option("XAU", help="Base symbol or case-insensitive symbol name filter")) -> None:
+    """Resolve a base symbol and list matching MT5 symbols."""
+    from slytrade.brokers.symbols import list_matching_symbols, resolve_symbol
+
     mt5 = load_mt5()
     initialize_mt5(mt5)
     try:
-        symbols = mt5.symbols_get()
-        table = Table(title=f"MT5 Symbols containing '{contains}'")
-        table.add_column("Name")
+        table = Table(title=f"MT5 Symbol resolution for '{contains}'")
+        table.add_column("Resolved")
+        table.add_column("Exact")
         table.add_column("Description")
-        for symbol in symbols or []:
-            name = str(getattr(symbol, "name", ""))
-            if contains.lower() in name.lower():
-                table.add_row(name, str(getattr(symbol, "description", "")))
+        try:
+            resolved = resolve_symbol(mt5, contains, select=False)
+            table.add_row(f"[bold green]{resolved.resolved}[/bold green]", str(resolved.exact), resolved.description)
+        except Exception as exc:
+            table.add_row(f"[red]not resolved: {exc}[/red]", "False", "")
+        for match in list_matching_symbols(mt5, contains):
+            if match.resolved != contains:
+                table.add_row(match.resolved, str(match.exact), match.description)
         console.print(table)
     finally:
         shutdown_mt5(mt5)

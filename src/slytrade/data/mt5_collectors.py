@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from slytrade.brokers.symbols import resolve_symbol
 from slytrade.data.schemas import normalize_bar_frame, normalize_tick_frame
 from slytrade.data.storage import MarketDataStorage, WriteResult
 from slytrade.data.time import ChunkSize, iter_time_chunks
@@ -40,24 +41,33 @@ class MT5TickCollector:
         self.mt5 = mt5
         self.storage = storage or MarketDataStorage()
 
-    def collect(self, symbol: str, start: datetime, end: datetime, *, chunk_size: ChunkSize = "day") -> CollectionResult:
+    def collect(
+        self,
+        symbol: str,
+        start: datetime,
+        end: datetime,
+        *,
+        chunk_size: ChunkSize = "day",
+        resolve: bool = True,
+    ) -> CollectionResult:
         rows = 0
         files: list[WriteResult] = []
         reports: list[ValidationReport] = []
         copy_flag = self.mt5.COPY_TICKS_ALL
+        actual_symbol = resolve_symbol(self.mt5, symbol).resolved if resolve else symbol
 
         for chunk_start, chunk_end in iter_time_chunks(start, end, chunk_size):
-            raw = self.mt5.copy_ticks_range(symbol, chunk_start, chunk_end, copy_flag)
-            normalized = normalize_tick_frame(raw, symbol)
+            raw = self.mt5.copy_ticks_range(actual_symbol, chunk_start, chunk_end, copy_flag)
+            normalized = normalize_tick_frame(raw, actual_symbol)
             clean, report = validate_tick_frame(normalized)
             reports.append(report)
             if clean.empty:
                 continue
-            write_result = self.storage.write_ticks(symbol, chunk_start, clean)
+            write_result = self.storage.write_ticks(actual_symbol, chunk_start, clean)
             rows += write_result.rows
             files.append(write_result)
 
-        return CollectionResult(symbol=symbol, dataset="ticks", rows=rows, files=files, reports=reports)
+        return CollectionResult(symbol=actual_symbol, dataset="ticks", rows=rows, files=files, reports=reports)
 
 
 class MT5BarCollector:
@@ -80,21 +90,23 @@ class MT5BarCollector:
         end: datetime,
         *,
         chunk_size: ChunkSize = "month",
+        resolve: bool = True,
     ) -> CollectionResult:
         rows = 0
         files: list[WriteResult] = []
         reports: list[ValidationReport] = []
         tf_const = self.timeframe_constant(timeframe)
+        actual_symbol = resolve_symbol(self.mt5, symbol).resolved if resolve else symbol
 
         for chunk_start, chunk_end in iter_time_chunks(start, end, chunk_size):
-            raw = self.mt5.copy_rates_range(symbol, tf_const, chunk_start, chunk_end)
-            normalized = normalize_bar_frame(raw, symbol, timeframe)
+            raw = self.mt5.copy_rates_range(actual_symbol, tf_const, chunk_start, chunk_end)
+            normalized = normalize_bar_frame(raw, actual_symbol, timeframe)
             clean, report = validate_bar_frame(normalized)
             reports.append(report)
             if clean.empty:
                 continue
-            write_result = self.storage.write_bars(symbol, timeframe, chunk_start, clean)
+            write_result = self.storage.write_bars(actual_symbol, timeframe, chunk_start, clean)
             rows += write_result.rows
             files.append(write_result)
 
-        return CollectionResult(symbol=symbol, dataset="bars", rows=rows, files=files, reports=reports)
+        return CollectionResult(symbol=actual_symbol, dataset="bars", rows=rows, files=files, reports=reports)
