@@ -346,6 +346,65 @@ def run_tick_backtest(
 
 
 @app.command()
+def mt5_info() -> None:
+    """Check MT5 / mt5linux bridge connectivity."""
+    mt5 = load_mt5()
+    initialize_mt5(mt5)
+    try:
+        terminal_info = mt5.terminal_info() if hasattr(mt5, "terminal_info") else None
+        account_info = mt5.account_info() if hasattr(mt5, "account_info") else None
+        symbols = mt5.symbols_get() if hasattr(mt5, "symbols_get") else []
+        console.print("[bold green]MT5 bridge initialized[/bold green]")
+        console.print(f"Terminal: {terminal_info}")
+        console.print(f"Account : {account_info}")
+        console.print(f"Symbols : {len(symbols) if symbols is not None else 0}")
+    finally:
+        shutdown_mt5(mt5)
+
+
+@app.command()
+def resolve_symbols(contains: str = typer.Option("XAU", help="Case-insensitive symbol name filter")) -> None:
+    """List MT5 symbols matching a text filter."""
+    mt5 = load_mt5()
+    initialize_mt5(mt5)
+    try:
+        symbols = mt5.symbols_get()
+        table = Table(title=f"MT5 Symbols containing '{contains}'")
+        table.add_column("Name")
+        table.add_column("Description")
+        for symbol in symbols or []:
+            name = str(getattr(symbol, "name", ""))
+            if contains.lower() in name.lower():
+                table.add_row(name, str(getattr(symbol, "description", "")))
+        console.print(table)
+    finally:
+        shutdown_mt5(mt5)
+
+
+@app.command()
+def inspect_data(
+    bars_file: str | None = typer.Option(None, help="Canonical bars file (.csv or .parquet)"),
+    ticks_file: str | None = typer.Option(None, help="Canonical ticks file (.csv or .parquet)"),
+    timeframe: str | None = typer.Option(None, help="Timeframe override for decision-time alignment, e.g. M1"),
+) -> None:
+    """Inspect bars/ticks and print data-quality diagnostics."""
+    from slytrade.backtest.reporting import load_bars_file, load_ticks_file
+    from slytrade.data.diagnostics import (
+        inspect_bars,
+        inspect_tick_bar_coverage,
+        inspect_ticks,
+        render_data_diagnostics,
+    )
+
+    bars = load_bars_file(Path(bars_file)) if bars_file else None
+    ticks = load_ticks_file(Path(ticks_file)) if ticks_file else None
+    bars_diag = inspect_bars(bars, timeframe=timeframe) if bars is not None else None
+    ticks_diag = inspect_ticks(ticks) if ticks is not None else None
+    coverage = inspect_tick_bar_coverage(bars, ticks, timeframe=timeframe) if bars is not None and ticks is not None else None
+    render_data_diagnostics(bars=bars_diag, ticks=ticks_diag, coverage=coverage, console=console)
+
+
+@app.command()
 def live() -> None:
     """Live trading placeholder."""
     console.print("[bold red]Live trading is disabled at bootstrap stage.[/bold red]")

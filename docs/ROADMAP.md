@@ -41,6 +41,9 @@
 - [x] Backtest captures trade ledger records
 - [x] Tick-aware backtest engine
 - [x] Tick quote execution CLI
+- [x] Bar-close decision-time alignment
+- [x] Data diagnostics CLI
+- [x] MT5 bridge info / symbol resolver commands
 - [ ] Stop-loss / take-profit simulation
 - [ ] Trade ledger persistence
 

@@ -59,7 +59,9 @@ def test_tick_backtest_engine_executes_on_tick_quote():
     result = engine.run(make_bars(), make_ticks(), BuyAndHoldOnceStrategy(symbol="XAUUSD", volume=1.0))
 
     assert len(result.trades) == 1
-    assert result.trades[0].price == 101.0
+    # The first bar signal is executable only at bar close (M1 => 00:01),
+    # so the fill uses the latest tick available at the causal decision time.
+    assert result.trades[0].price == 102.0
     assert result.reports[0].status == OrderStatus.FILLED
     assert result.metrics.final_equity > result.metrics.start_equity
 

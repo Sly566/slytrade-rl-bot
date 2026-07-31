@@ -7,6 +7,7 @@ import pandas as pd
 from slytrade.backtest.engine import BacktestConfig, BacktestResult, BarStrategy, quote_from_bar
 from slytrade.backtest.execution import ExecutionConfig, Quote
 from slytrade.backtest.metrics import compute_performance_metrics
+from slytrade.data.timeframes import decision_time_for_bar
 from slytrade.execution.models import ExecutionReport
 from slytrade.execution.paper_broker import PaperBroker
 from slytrade.risk.guardrails import GuardrailConfig
@@ -80,8 +81,10 @@ class TickBacktestEngine:
         fallback_bar_quotes = 0
 
         for index, bar in ordered_bars.iterrows():
-            bar_time = pd.Timestamp(bar["time"])
-            while tick_index < len(ordered_ticks) and pd.Timestamp(ordered_ticks.loc[tick_index, "time_msc"]) <= bar_time:
+            # MT5 bars are timestamped at bar open. If the strategy uses the
+            # completed OHLC bar, the earliest causal decision is at bar close.
+            decision_time = decision_time_for_bar(bar)
+            while tick_index < len(ordered_ticks) and pd.Timestamp(ordered_ticks.loc[tick_index, "time_msc"]) <= decision_time:
                 tick_quote = quote_from_tick(ordered_ticks.loc[tick_index])
                 last_quote_by_symbol[tick_quote.symbol] = tick_quote
                 broker.update_quote(tick_quote)
