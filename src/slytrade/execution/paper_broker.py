@@ -47,15 +47,35 @@ class PaperBroker:
         self.last_marks[quote.symbol] = quote.mid
         return self.portfolio.mark_to_market(self.last_marks)
 
+    def is_reducing_position(self, intent: OrderIntent) -> bool:
+        """Return True when an order reduces or closes current exposure.
+
+        Risk guardrails should never block risk-reducing exit orders. They may
+        block new/increasing exposure, but exits must remain possible after a
+        kill switch or drawdown breach.
+        """
+        position = self.portfolio.positions.get(intent.symbol)
+        if position is None or position.is_flat:
+            return False
+        if position.quantity > 0 and intent.side.value == "sell":
+            return intent.volume <= abs(position.quantity) + 1e-12
+        if position.quantity < 0 and intent.side.value == "buy":
+            return intent.volume <= abs(position.quantity) + 1e-12
+        return False
+
     def submit_order(self, intent: OrderIntent, quote: Quote) -> PaperBrokerResult:
         equity = self.update_quote(quote)
-        decision = self.guardrails.approve_order(
-            intent,
-            equity=equity,
-            spread_points=quote.spread / max(self.execution.config.point_size, 1e-12),
-            live=False,
-        )
-        if not decision.approved:
+        reducing_position = self.is_reducing_position(intent)
+        if reducing_position:
+            decision = None
+        else:
+            decision = self.guardrails.approve_order(
+                intent,
+                equity=equity,
+                spread_points=quote.spread / max(self.execution.config.point_size, 1e-12),
+                live=False,
+            )
+        if decision is not None and not decision.approved:
             self.oms.create_order(intent)
             report = ExecutionReport(
                 client_order_id=intent.client_order_id,

@@ -68,6 +68,8 @@
 - [x] Breakeven after partial TP
 - [x] ATR trailing stop support
 - [x] Conservative same-bar SL/TP handling
+- [x] Trade analytics / exit reason metrics
+- [x] Risk-reducing exits allowed after kill switch
 - [ ] Trade ledger persistence
 
 ## Phase 5: Strategy Baselines and RL

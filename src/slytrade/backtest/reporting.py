@@ -9,6 +9,7 @@ from rich.console import Console
 from rich.table import Table
 
 from slytrade.backtest.aligned_engine import AlignedBacktestEngine
+from slytrade.backtest.analytics import compute_result_analytics
 from slytrade.backtest.engine import BacktestConfig, BacktestResult, BarBacktestEngine, BarStrategy
 from slytrade.backtest.tick_engine import TickBacktestEngine
 from slytrade.backtest.trade_management import ManagedAlignedBacktestEngine, TradeManagementConfig
@@ -267,6 +268,33 @@ def render_backtest_report(
     table.add_row("Trades", str(metrics.trades))
     table.add_row("Orders", str(len(result.orders)))
     table.add_row("Ledger Records", str(len(result.trades)))
+    target.print(table)
+    if result.orders or result.trades:
+        render_trade_analytics(result, console=target)
+
+
+def render_trade_analytics(result: BacktestResult, *, console: Console | None = None) -> None:
+    target = console or Console()
+    analytics = compute_result_analytics(result)
+    table = Table(title="Trade Analytics")
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    table.add_row("Fills", str(analytics.fills))
+    table.add_row("Entry Fills", str(analytics.entry_fills))
+    table.add_row("Exit Fills", str(analytics.exit_fills))
+    table.add_row("Net Realized PnL", f"{analytics.net_realized_pnl:,.2f}")
+    table.add_row("Gross Profit", f"{analytics.gross_profit:,.2f}")
+    table.add_row("Gross Loss", f"{analytics.gross_loss:,.2f}")
+    table.add_row("Profit Factor", "∞" if analytics.profit_factor == float("inf") else f"{analytics.profit_factor:.4f}")
+    table.add_row("Win Rate", f"{analytics.win_rate:.2%}")
+    table.add_row("Average Win", f"{analytics.average_win:,.2f}")
+    table.add_row("Average Loss", f"{analytics.average_loss:,.2f}")
+    table.add_row("Expectancy", f"{analytics.expectancy:,.2f}")
+    table.add_row("Commission", f"{analytics.total_commission:,.2f}")
+    table.add_row("Order Status", str(analytics.order_status_counts))
+    table.add_row("Exit Reasons", str(analytics.exit_reason_counts))
+    if analytics.order_reject_reasons:
+        table.add_row("Reject Reasons", str(analytics.order_reject_reasons))
     target.print(table)
 
 
