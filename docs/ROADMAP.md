@@ -64,6 +64,10 @@
 - [x] Stale quote protection in tick backtests
 - [x] Stop-loss / take-profit simulation
 - [x] ATR-based managed trade exits
+- [x] Partial take-profit support
+- [x] Breakeven after partial TP
+- [x] ATR trailing stop support
+- [x] Conservative same-bar SL/TP handling
 - [ ] Trade ledger persistence
 
 ## Phase 5: Strategy Baselines and RL

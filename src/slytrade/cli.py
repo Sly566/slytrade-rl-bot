@@ -625,9 +625,14 @@ def run_managed_backtest(
     slippage_points: float = typer.Option(0.0, help="Adverse slippage in points"),
     commission_per_volume: float = typer.Option(0.0, help="Commission per traded volume unit"),
     stop_loss_atr: float = typer.Option(1.0, help="Stop-loss distance in ATR multiples"),
-    take_profit_atr: float = typer.Option(2.0, help="Take-profit distance in ATR multiples"),
+    take_profit_atr: float = typer.Option(2.0, help="Final take-profit distance in ATR multiples"),
     min_stop_distance: float = typer.Option(0.10, help="Minimum stop/target distance in price units"),
     max_bars_in_trade: int | None = typer.Option(None, help="Optional time exit in bars"),
+    partial_take_profit: bool = typer.Option(False, "--partial-tp/--no-partial-tp", help="Enable partial take-profit"),
+    partial_take_profit_atr: float = typer.Option(1.0, help="Partial take-profit distance in ATR multiples"),
+    partial_close_fraction: float = typer.Option(0.5, help="Fraction of initial volume to close at partial TP"),
+    breakeven_after_partial: bool = typer.Option(True, "--breakeven/--no-breakeven", help="Move SL to breakeven after partial TP"),
+    trailing_stop_atr: float | None = typer.Option(None, help="Optional trailing stop distance in ATR multiples"),
     fast_window: int = typer.Option(5, help="Fast MA window for ma-cross"),
     slow_window: int = typer.Option(20, help="Slow MA window for ma-cross"),
 ) -> None:
@@ -663,6 +668,11 @@ def run_managed_backtest(
             take_profit_atr=take_profit_atr,
             min_stop_distance=min_stop_distance,
             max_bars_in_trade=max_bars_in_trade,
+            partial_take_profit_enabled=partial_take_profit,
+            partial_take_profit_atr=partial_take_profit_atr,
+            partial_close_fraction=partial_close_fraction,
+            move_to_breakeven_after_partial=breakeven_after_partial,
+            trailing_stop_atr=trailing_stop_atr,
         ),
     )
     render_backtest_report(result, strategy_name=f"managed-{strategy}", console=console)
