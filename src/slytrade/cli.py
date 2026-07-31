@@ -613,6 +613,62 @@ def run_aligned_backtest(
 
 
 @app.command()
+def run_managed_backtest(
+    bars_file: str = typer.Option(..., help="Aligned bars file with quote/tick/ICT columns"),
+    strategy: str = typer.Option("ict-bias", help="Entry strategy: buy-and-hold, ma-cross, or ict-bias"),
+    symbol: str | None = typer.Option(None, help="Symbol override if needed"),
+    volume: float = typer.Option(0.1, help="Order volume"),
+    initial_balance: float = typer.Option(100_000.0, help="Initial account balance"),
+    point_size: float = typer.Option(0.01, help="Instrument point size"),
+    point_value: float = typer.Option(1.0, help="PnL value per price unit and volume"),
+    symbol_spec_file: str | None = typer.Option(None, help="Optional symbol spec JSON to set point size/value"),
+    slippage_points: float = typer.Option(0.0, help="Adverse slippage in points"),
+    commission_per_volume: float = typer.Option(0.0, help="Commission per traded volume unit"),
+    stop_loss_atr: float = typer.Option(1.0, help="Stop-loss distance in ATR multiples"),
+    take_profit_atr: float = typer.Option(2.0, help="Take-profit distance in ATR multiples"),
+    min_stop_distance: float = typer.Option(0.10, help="Minimum stop/target distance in price units"),
+    max_bars_in_trade: int | None = typer.Option(None, help="Optional time exit in bars"),
+    fast_window: int = typer.Option(5, help="Fast MA window for ma-cross"),
+    slow_window: int = typer.Option(20, help="Slow MA window for ma-cross"),
+) -> None:
+    """Run an aligned backtest with basic stop-loss/take-profit management."""
+    from slytrade.backtest.reporting import (
+        VALID_STRATEGIES,
+        load_bars_file,
+        render_backtest_report,
+        run_managed_aligned_backtest_from_bars,
+    )
+    from slytrade.backtest.trade_management import TradeManagementConfig
+
+    if strategy not in VALID_STRATEGIES or strategy == "no-trade":
+        raise typer.BadParameter("managed backtest strategy must be one of: buy-and-hold, ma-cross, ict-bias")
+    bars = load_bars_file(Path(bars_file))
+    result = run_managed_aligned_backtest_from_bars(
+        bars,
+        strategy_name=strategy,
+        symbol=symbol,
+        volume=volume,
+        fast_window=fast_window,
+        slow_window=slow_window,
+        config=build_backtest_config_from_cli(
+            initial_balance=initial_balance,
+            point_size=point_size,
+            point_value=point_value,
+            slippage_points=slippage_points,
+            commission_per_volume=commission_per_volume,
+            symbol_spec_file=symbol_spec_file,
+        ),
+        trade_config=TradeManagementConfig(
+            stop_loss_atr=stop_loss_atr,
+            take_profit_atr=take_profit_atr,
+            min_stop_distance=min_stop_distance,
+            max_bars_in_trade=max_bars_in_trade,
+        ),
+    )
+    render_backtest_report(result, strategy_name=f"managed-{strategy}", console=console)
+
+
+@app.command()
 def run_tick_backtest(
     bars_file: str = typer.Option(..., help="Canonical bars file (.csv or .parquet)"),
     ticks_file: str = typer.Option(..., help="Canonical ticks file (.csv or .parquet)"),

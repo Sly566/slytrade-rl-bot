@@ -11,6 +11,7 @@ from rich.table import Table
 from slytrade.backtest.aligned_engine import AlignedBacktestEngine
 from slytrade.backtest.engine import BacktestConfig, BacktestResult, BarBacktestEngine, BarStrategy
 from slytrade.backtest.tick_engine import TickBacktestEngine
+from slytrade.backtest.trade_management import ManagedAlignedBacktestEngine, TradeManagementConfig
 from slytrade.features.ict import FEATURE_COLUMNS, compute_ict_features
 from slytrade.strategies.baselines import (
     BuyAndHoldStrategy,
@@ -146,6 +147,30 @@ def run_aligned_backtest_from_bars(
         slow_window=slow_window,
     )
     engine = AlignedBacktestEngine(config)
+    return engine.run(prepared_bars, strategy)
+
+
+def run_managed_aligned_backtest_from_bars(
+    aligned_bars: pd.DataFrame,
+    *,
+    strategy_name: str,
+    symbol: str | None = None,
+    volume: float = 0.1,
+    fast_window: int = 5,
+    slow_window: int = 20,
+    config: BacktestConfig | None = None,
+    trade_config: TradeManagementConfig | None = None,
+) -> BacktestResult:
+    resolved_symbol = infer_symbol(aligned_bars, symbol)
+    prepared_bars = ensure_ict_features(aligned_bars) if strategy_name == "ict-bias" else aligned_bars.copy()
+    strategy = build_strategy(
+        strategy_name,
+        symbol=resolved_symbol,
+        volume=volume,
+        fast_window=fast_window,
+        slow_window=slow_window,
+    )
+    engine = ManagedAlignedBacktestEngine(config, trade_config)
     return engine.run(prepared_bars, strategy)
 
 

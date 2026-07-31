@@ -62,7 +62,8 @@
 - [x] MT5 bridge info / symbol resolver commands
 - [x] Fresh tick quote coverage diagnostics
 - [x] Stale quote protection in tick backtests
-- [ ] Stop-loss / take-profit simulation
+- [x] Stop-loss / take-profit simulation
+- [x] ATR-based managed trade exits
 - [ ] Trade ledger persistence
 
 ## Phase 5: Strategy Baselines and RL
