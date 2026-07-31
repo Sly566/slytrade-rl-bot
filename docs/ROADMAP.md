@@ -23,6 +23,8 @@
 - [x] Dataset alignment layer
 - [x] Source manifest for aligned bars/ticks
 - [x] Symbol alias normalization for research datasets
+- [x] Precomputed decision quotes in aligned bars
+- [x] Fast aligned backtest path
 - [ ] Tick schema validation
 - [ ] Bar schema validation
 - [ ] Parquet storage

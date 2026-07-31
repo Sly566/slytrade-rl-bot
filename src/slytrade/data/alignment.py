@@ -13,6 +13,16 @@ from slytrade.data.diagnostics import TickBarCoverageDiagnostics, inspect_tick_b
 from slytrade.data.exness_archive import normalize_exness_symbol
 from slytrade.data.timeframes import add_decision_time
 
+QUOTE_COLUMNS = [
+    "quote_time",
+    "quote_bid",
+    "quote_ask",
+    "quote_mid",
+    "quote_spread",
+    "quote_age_seconds",
+    "quote_is_fresh",
+]
+
 
 @dataclass(frozen=True)
 class DatasetManifest:
@@ -73,6 +83,51 @@ def infer_canonical_symbol(bar_symbol: str, tick_symbol: str, canonical_symbol: 
     )
 
 
+def attach_decision_quotes(
+    bars: pd.DataFrame,
+    ticks: pd.DataFrame,
+    *,
+    max_quote_age_seconds: float = 5.0,
+) -> pd.DataFrame:
+    """Attach latest tick quote at or before each bar decision time.
+
+    This precomputes execution quotes so repeated baseline/RL evaluations do not
+    need to rescan millions of ticks for every strategy.
+    """
+    if "decision_time" not in bars.columns:
+        raise ValueError("bars must include decision_time before attaching quotes")
+    required_ticks = {"time_msc", "bid", "ask"}
+    missing_ticks = required_ticks.difference(ticks.columns)
+    if missing_ticks:
+        raise ValueError(f"ticks missing required columns: {sorted(missing_ticks)}")
+
+    bars_sorted = bars.sort_values("decision_time").reset_index(drop=True).copy()
+    ticks_sorted = ticks.sort_values("time_msc").reset_index(drop=True).copy()
+    bars_sorted["decision_time"] = pd.to_datetime(bars_sorted["decision_time"], utc=True)
+    ticks_sorted["time_msc"] = pd.to_datetime(ticks_sorted["time_msc"], utc=True)
+
+    quote_frame = ticks_sorted[["time_msc", "bid", "ask"]].rename(
+        columns={"time_msc": "quote_time", "bid": "quote_bid", "ask": "quote_ask"}
+    )
+    merged = pd.merge_asof(
+        bars_sorted,
+        quote_frame,
+        left_on="decision_time",
+        right_on="quote_time",
+        direction="backward",
+        allow_exact_matches=True,
+    )
+    merged["quote_time"] = pd.to_datetime(merged["quote_time"], utc=True)
+    merged["quote_mid"] = (merged["quote_bid"] + merged["quote_ask"]) / 2.0
+    merged["quote_spread"] = merged["quote_ask"] - merged["quote_bid"]
+    merged["quote_age_seconds"] = (merged["decision_time"] - merged["quote_time"]).dt.total_seconds()
+    merged["quote_is_fresh"] = (merged["quote_age_seconds"] >= 0.0) & (
+        merged["quote_age_seconds"] <= max_quote_age_seconds
+    )
+    merged["quote_is_fresh"] = merged["quote_is_fresh"].fillna(False)
+    return merged.sort_values("time").reset_index(drop=True)
+
+
 def align_market_data(
     bars: pd.DataFrame,
     ticks: pd.DataFrame,
@@ -114,6 +169,11 @@ def align_market_data(
         aligned_bars,
         aligned_ticks,
         timeframe=resolved_timeframe,
+        max_quote_age_seconds=max_quote_age_seconds,
+    )
+    aligned_bars = attach_decision_quotes(
+        aligned_bars,
+        aligned_ticks,
         max_quote_age_seconds=max_quote_age_seconds,
     )
 
