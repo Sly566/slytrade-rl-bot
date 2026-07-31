@@ -8,7 +8,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from slytrade.data.time import parse_utc_datetime
+from slytrade.data.time import date_range_from_lookback, parse_utc_datetime
 
 app = typer.Typer(help="SlyTrade RL Bot CLI")
 console = Console()
@@ -57,6 +57,22 @@ def initialize_mt5(mt5: Any) -> None:
 def shutdown_mt5(mt5: Any) -> None:
     if hasattr(mt5, "shutdown"):
         mt5.shutdown()
+
+
+def print_collection_result(result: Any, original_symbol: str) -> None:
+    if result.symbol != original_symbol:
+        console.print(f"Resolved symbol: {original_symbol} -> {result.symbol}")
+    console.print(
+        f"Collected {result.rows} {result.dataset} rows into {result.file_count} files "
+        f"({result.chunks_attempted} chunks attempted, {result.empty_chunks} empty chunks)"
+    )
+    if result.empty_chunks:
+        console.print(
+            "[yellow]Warning:[/yellow] some chunks returned no data. "
+            "For ticks this may indicate broker/terminal tick-history limits."
+        )
+    for file_result in result.files:
+        console.print(f"- {file_result.path} ({file_result.rows} rows, {file_result.format})")
 
 
 @app.command()
@@ -122,11 +138,7 @@ def collect_ticks(
     try:
         collector = MT5TickCollector(mt5, MarketDataStorage(Path(output_dir)))
         result = collector.collect(symbol, parse_utc_datetime(start), parse_utc_datetime(end), chunk_size=chunk_size, resolve=resolve)  # type: ignore[arg-type]
-        if result.symbol != symbol:
-            console.print(f"Resolved symbol: {symbol} -> {result.symbol}")
-        console.print(f"Collected {result.rows} tick rows into {result.file_count} files")
-        for file_result in result.files:
-            console.print(f"- {file_result.path} ({file_result.rows} rows, {file_result.format})")
+        print_collection_result(result, symbol)
     finally:
         shutdown_mt5(mt5)
 
@@ -157,11 +169,73 @@ def collect_bars(
             chunk_size=chunk_size,  # type: ignore[arg-type]
             resolve=resolve,
         )
-        if result.symbol != symbol:
-            console.print(f"Resolved symbol: {symbol} -> {result.symbol}")
-        console.print(f"Collected {result.rows} bar rows into {result.file_count} files")
-        for file_result in result.files:
-            console.print(f"- {file_result.path} ({file_result.rows} rows, {file_result.format})")
+        print_collection_result(result, symbol)
+    finally:
+        shutdown_mt5(mt5)
+
+
+@app.command()
+def collect_recent_bars(
+    symbol: str = typer.Option(..., help="Base or resolved MT5 symbol, e.g. XAUUSD or XAUUSDm"),
+    timeframe: str = typer.Option(..., help="Timeframe, e.g. M1, M5, H1"),
+    lookback: str = typer.Option("1y", help="Lookback duration, e.g. 1d, 1w, 1m, 1y, 2y"),
+    end: str | None = typer.Option(None, help="UTC end date/datetime. Defaults to current UTC time."),
+    chunk_size: str = typer.Option("month", help="day, week, or month"),
+    output_dir: str = typer.Option("data/raw", help="Raw data root directory"),
+    resolve: bool = typer.Option(True, "--resolve/--no-resolve", help="Resolve base symbol to broker-specific MT5 symbol"),
+) -> None:
+    """Collect recent MT5 bars using a relative lookback from now or --end."""
+    from slytrade.data.mt5_collectors import MT5BarCollector
+    from slytrade.data.storage import MarketDataStorage
+
+    end_dt = parse_utc_datetime(end) if end is not None else None
+    start_dt, resolved_end = date_range_from_lookback(lookback, end=end_dt)
+    console.print(f"Collecting bars from {start_dt.isoformat()} to {resolved_end.isoformat()} (lookback={lookback})")
+    mt5 = load_mt5()
+    initialize_mt5(mt5)
+    try:
+        collector = MT5BarCollector(mt5, MarketDataStorage(Path(output_dir)))
+        result = collector.collect(
+            symbol,
+            timeframe,
+            start_dt,
+            resolved_end,
+            chunk_size=chunk_size,  # type: ignore[arg-type]
+            resolve=resolve,
+        )
+        print_collection_result(result, symbol)
+    finally:
+        shutdown_mt5(mt5)
+
+
+@app.command()
+def collect_recent_ticks(
+    symbol: str = typer.Option(..., help="Base or resolved MT5 symbol, e.g. XAUUSD or XAUUSDm"),
+    lookback: str = typer.Option("1m", help="Lookback duration, e.g. 1d, 1w, 1m, 1y, 2y"),
+    end: str | None = typer.Option(None, help="UTC end date/datetime. Defaults to current UTC time."),
+    chunk_size: str = typer.Option("day", help="day, week, or month"),
+    output_dir: str = typer.Option("data/raw", help="Raw data root directory"),
+    resolve: bool = typer.Option(True, "--resolve/--no-resolve", help="Resolve base symbol to broker-specific MT5 symbol"),
+) -> None:
+    """Collect recent MT5 ticks using a relative lookback from now or --end."""
+    from slytrade.data.mt5_collectors import MT5TickCollector
+    from slytrade.data.storage import MarketDataStorage
+
+    end_dt = parse_utc_datetime(end) if end is not None else None
+    start_dt, resolved_end = date_range_from_lookback(lookback, end=end_dt)
+    console.print(f"Collecting ticks from {start_dt.isoformat()} to {resolved_end.isoformat()} (lookback={lookback})")
+    mt5 = load_mt5()
+    initialize_mt5(mt5)
+    try:
+        collector = MT5TickCollector(mt5, MarketDataStorage(Path(output_dir)))
+        result = collector.collect(
+            symbol,
+            start_dt,
+            resolved_end,
+            chunk_size=chunk_size,  # type: ignore[arg-type]
+            resolve=resolve,
+        )
+        print_collection_result(result, symbol)
     finally:
         shutdown_mt5(mt5)
 

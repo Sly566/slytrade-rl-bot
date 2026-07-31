@@ -30,6 +30,8 @@ class CollectionResult:
     rows: int = 0
     files: list[WriteResult] = field(default_factory=list)
     reports: list[ValidationReport] = field(default_factory=list)
+    chunks_attempted: int = 0
+    empty_chunks: int = 0
 
     @property
     def file_count(self) -> int:
@@ -53,21 +55,33 @@ class MT5TickCollector:
         rows = 0
         files: list[WriteResult] = []
         reports: list[ValidationReport] = []
+        chunks_attempted = 0
+        empty_chunks = 0
         copy_flag = self.mt5.COPY_TICKS_ALL
         actual_symbol = resolve_symbol(self.mt5, symbol).resolved if resolve else symbol
 
         for chunk_start, chunk_end in iter_time_chunks(start, end, chunk_size):
+            chunks_attempted += 1
             raw = self.mt5.copy_ticks_range(actual_symbol, chunk_start, chunk_end, copy_flag)
             normalized = normalize_tick_frame(raw, actual_symbol)
             clean, report = validate_tick_frame(normalized)
             reports.append(report)
             if clean.empty:
+                empty_chunks += 1
                 continue
             write_result = self.storage.write_ticks(actual_symbol, chunk_start, clean)
             rows += write_result.rows
             files.append(write_result)
 
-        return CollectionResult(symbol=actual_symbol, dataset="ticks", rows=rows, files=files, reports=reports)
+        return CollectionResult(
+            symbol=actual_symbol,
+            dataset="ticks",
+            rows=rows,
+            files=files,
+            reports=reports,
+            chunks_attempted=chunks_attempted,
+            empty_chunks=empty_chunks,
+        )
 
 
 class MT5BarCollector:
@@ -95,18 +109,30 @@ class MT5BarCollector:
         rows = 0
         files: list[WriteResult] = []
         reports: list[ValidationReport] = []
+        chunks_attempted = 0
+        empty_chunks = 0
         tf_const = self.timeframe_constant(timeframe)
         actual_symbol = resolve_symbol(self.mt5, symbol).resolved if resolve else symbol
 
         for chunk_start, chunk_end in iter_time_chunks(start, end, chunk_size):
+            chunks_attempted += 1
             raw = self.mt5.copy_rates_range(actual_symbol, tf_const, chunk_start, chunk_end)
             normalized = normalize_bar_frame(raw, actual_symbol, timeframe)
             clean, report = validate_bar_frame(normalized)
             reports.append(report)
             if clean.empty:
+                empty_chunks += 1
                 continue
             write_result = self.storage.write_bars(actual_symbol, timeframe, chunk_start, clean)
             rows += write_result.rows
             files.append(write_result)
 
-        return CollectionResult(symbol=actual_symbol, dataset="bars", rows=rows, files=files, reports=reports)
+        return CollectionResult(
+            symbol=actual_symbol,
+            dataset="bars",
+            rows=rows,
+            files=files,
+            reports=reports,
+            chunks_attempted=chunks_attempted,
+            empty_chunks=empty_chunks,
+        )
