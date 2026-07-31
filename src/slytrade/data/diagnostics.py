@@ -42,7 +42,12 @@ class TickBarCoverageDiagnostics:
     bars: int
     bars_with_tick_before_decision: int
     bars_missing_tick_before_decision: int
+    bars_with_fresh_tick_before_decision: int
+    bars_with_stale_tick_before_decision: int
+    max_quote_age_seconds: float
+    max_observed_quote_age_seconds: float
     first_missing_decision_time: str | None
+    first_stale_decision_time: str | None
 
 
 def _single_value(frame: pd.DataFrame, column: str, fallback: str = "unknown") -> str:
@@ -118,35 +123,71 @@ def inspect_ticks(ticks: pd.DataFrame) -> TickDiagnostics:
     )
 
 
-def inspect_tick_bar_coverage(bars: pd.DataFrame, ticks: pd.DataFrame, *, timeframe: str | None = None) -> TickBarCoverageDiagnostics:
+def inspect_tick_bar_coverage(
+    bars: pd.DataFrame,
+    ticks: pd.DataFrame,
+    *,
+    timeframe: str | None = None,
+    max_quote_age_seconds: float = 5.0,
+) -> TickBarCoverageDiagnostics:
     if bars.empty:
-        return TickBarCoverageDiagnostics(0, 0, 0, None)
-    if ticks.empty:
-        aligned = add_decision_time(bars, timeframe=timeframe)
-        return TickBarCoverageDiagnostics(len(aligned), 0, len(aligned), str(aligned["decision_time"].min()))
-
+        return TickBarCoverageDiagnostics(0, 0, 0, 0, 0, max_quote_age_seconds, 0.0, None, None)
     aligned = add_decision_time(bars, timeframe=timeframe).sort_values("decision_time").reset_index(drop=True)
+
+    if ticks.empty:
+        return TickBarCoverageDiagnostics(
+            len(aligned),
+            0,
+            len(aligned),
+            0,
+            0,
+            max_quote_age_seconds,
+            0.0,
+            str(aligned["decision_time"].min()),
+            None,
+        )
+
     ticks_sorted = ticks.copy()
     ticks_sorted["time_msc"] = pd.to_datetime(ticks_sorted["time_msc"], utc=True)
     ticks_sorted = ticks_sorted.sort_values("time_msc").reset_index(drop=True)
 
     tick_index = 0
     seen = 0
+    fresh = 0
+    stale = 0
+    max_observed_age = 0.0
     missing_times: list[str] = []
+    stale_times: list[str] = []
+    last_tick_time: pd.Timestamp | None = None
+
     for _, bar in aligned.iterrows():
         decision_time = pd.Timestamp(bar["decision_time"])
         while tick_index < len(ticks_sorted) and pd.Timestamp(ticks_sorted.loc[tick_index, "time_msc"]) <= decision_time:
+            last_tick_time = pd.Timestamp(ticks_sorted.loc[tick_index, "time_msc"])
             tick_index += 1
-        if tick_index > 0:
-            seen += 1
-        else:
+        if last_tick_time is None:
             missing_times.append(str(decision_time))
+            continue
+        seen += 1
+        age = float((decision_time - last_tick_time).total_seconds())
+        max_observed_age = max(max_observed_age, age)
+        if 0.0 <= age <= max_quote_age_seconds:
+            fresh += 1
+        else:
+            stale += 1
+            stale_times.append(str(decision_time))
+
     missing = len(aligned) - seen
     return TickBarCoverageDiagnostics(
         bars=len(aligned),
         bars_with_tick_before_decision=seen,
         bars_missing_tick_before_decision=missing,
+        bars_with_fresh_tick_before_decision=fresh,
+        bars_with_stale_tick_before_decision=stale,
+        max_quote_age_seconds=max_quote_age_seconds,
+        max_observed_quote_age_seconds=max_observed_age,
         first_missing_decision_time=missing_times[0] if missing_times else None,
+        first_stale_decision_time=stale_times[0] if stale_times else None,
     )
 
 

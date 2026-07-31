@@ -17,6 +17,7 @@ from slytrade.risk.guardrails import GuardrailConfig
 class TickBacktestStats:
     ticks_processed: int
     fallback_bar_quotes: int
+    stale_quotes: int
 
 
 def quote_from_tick(tick: pd.Series) -> Quote:
@@ -30,17 +31,35 @@ def quote_from_tick(tick: pd.Series) -> Quote:
     )
 
 
+def quote_age_seconds(quote: Quote, decision_time: pd.Timestamp) -> float:
+    quote_time = pd.Timestamp(quote.time)
+    if quote_time.tzinfo is None:
+        quote_time = quote_time.tz_localize("UTC")
+    else:
+        quote_time = quote_time.tz_convert("UTC")
+    if decision_time.tzinfo is None:
+        decision_time = decision_time.tz_localize("UTC")
+    else:
+        decision_time = decision_time.tz_convert("UTC")
+    return float((decision_time - quote_time).total_seconds())
+
+
+def is_quote_fresh(quote: Quote, decision_time: pd.Timestamp, max_age_seconds: float) -> bool:
+    age = quote_age_seconds(quote, decision_time)
+    return 0.0 <= age <= max_age_seconds
+
+
 class TickBacktestEngine:
     """Bar-signal, tick-execution backtest engine.
 
     Strategy decisions are made on bars, but quotes and fills come from ticks
     where available. The engine processes ticks only up to the current bar's
-    timestamp, so it remains causal. This assumes bars are timestamped at the
-    time the signal is known (typically bar close in a prepared research set).
+    causal decision time (bar close for MT5 bars), then enforces quote freshness.
     """
 
     def __init__(self, config: BacktestConfig | None = None):
         self.config = config or BacktestConfig()
+        self.last_stats = TickBacktestStats(ticks_processed=0, fallback_bar_quotes=0, stale_quotes=0)
 
     def make_broker(self) -> PaperBroker:
         return PaperBroker(
@@ -79,6 +98,7 @@ class TickBacktestEngine:
         tick_index = 0
         last_quote_by_symbol: dict[str, Quote] = {}
         fallback_bar_quotes = 0
+        stale_quotes = 0
 
         for index, bar in ordered_bars.iterrows():
             # MT5 bars are timestamped at bar open. If the strategy uses the
@@ -92,7 +112,19 @@ class TickBacktestEngine:
 
             symbol = str(bar["symbol"])
             quote = last_quote_by_symbol.get(symbol)
-            if quote is None:
+            quote_is_fresh = quote is not None and is_quote_fresh(
+                quote,
+                decision_time,
+                self.config.max_quote_age_seconds,
+            )
+            if quote is not None and not quote_is_fresh:
+                stale_quotes += 1
+
+            if quote is None or not quote_is_fresh:
+                if not self.config.allow_bar_quote_fallback:
+                    # No fresh executable quote: skip signal/execution for this bar.
+                    equity_curve.append(broker.portfolio.mark_to_market(broker.last_marks))
+                    continue
                 quote = quote_from_bar(
                     bar,
                     default_spread_points=self.config.default_spread_points,
@@ -107,6 +139,11 @@ class TickBacktestEngine:
                 reports.append(result.report)
             equity_curve.append(broker.portfolio.mark_to_market(broker.last_marks))
 
+        self.last_stats = TickBacktestStats(
+            ticks_processed=tick_index,
+            fallback_bar_quotes=fallback_bar_quotes,
+            stale_quotes=stale_quotes,
+        )
         metrics = compute_performance_metrics(equity_curve, trades=len(broker.ledger.records))
         return BacktestResult(
             equity_curve=equity_curve,

@@ -30,6 +30,8 @@ class BacktestConfig:
     commission_per_volume: float = 0.0
     max_spread_points: float = 1_000.0
     max_position_volume: float = 100.0
+    max_quote_age_seconds: float = 5.0
+    allow_bar_quote_fallback: bool = True
 
 
 @dataclass(frozen=True)

@@ -44,6 +44,8 @@
 - [x] Bar-close decision-time alignment
 - [x] Data diagnostics CLI
 - [x] MT5 bridge info / symbol resolver commands
+- [x] Fresh tick quote coverage diagnostics
+- [x] Stale quote protection in tick backtests
 - [ ] Stop-loss / take-profit simulation
 - [ ] Trade ledger persistence
 

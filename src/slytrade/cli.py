@@ -323,6 +323,12 @@ def run_tick_backtest(
     default_spread_points: float = typer.Option(20.0, help="Fallback spread in points when no tick quote exists"),
     slippage_points: float = typer.Option(0.0, help="Adverse slippage in points"),
     commission_per_volume: float = typer.Option(0.0, help="Commission per traded volume unit"),
+    max_quote_age_seconds: float = typer.Option(5.0, help="Maximum fresh quote age at each bar decision time"),
+    allow_bar_quote_fallback: bool = typer.Option(
+        False,
+        "--allow-bar-quote-fallback/--no-bar-quote-fallback",
+        help="Allow synthetic bar-close quote when no fresh tick is available",
+    ),
     fast_window: int = typer.Option(5, help="Fast MA window for ma-cross"),
     slow_window: int = typer.Option(20, help="Slow MA window for ma-cross"),
 ) -> None:
@@ -355,6 +361,8 @@ def run_tick_backtest(
             point_value=point_value,
             slippage_points=slippage_points,
             commission_per_volume=commission_per_volume,
+            max_quote_age_seconds=max_quote_age_seconds,
+            allow_bar_quote_fallback=allow_bar_quote_fallback,
         ),
     )
     render_backtest_report(result, strategy_name=f"tick-{strategy}", console=console)
@@ -407,6 +415,7 @@ def inspect_data(
     bars_file: str | None = typer.Option(None, help="Canonical bars file (.csv or .parquet)"),
     ticks_file: str | None = typer.Option(None, help="Canonical ticks file (.csv or .parquet)"),
     timeframe: str | None = typer.Option(None, help="Timeframe override for decision-time alignment, e.g. M1"),
+    max_quote_age_seconds: float = typer.Option(5.0, help="Maximum fresh quote age at each bar decision time"),
 ) -> None:
     """Inspect bars/ticks and print data-quality diagnostics."""
     from slytrade.backtest.reporting import load_bars_file, load_ticks_file
@@ -421,7 +430,11 @@ def inspect_data(
     ticks = load_ticks_file(Path(ticks_file)) if ticks_file else None
     bars_diag = inspect_bars(bars, timeframe=timeframe) if bars is not None else None
     ticks_diag = inspect_ticks(ticks) if ticks is not None else None
-    coverage = inspect_tick_bar_coverage(bars, ticks, timeframe=timeframe) if bars is not None and ticks is not None else None
+    coverage = (
+        inspect_tick_bar_coverage(bars, ticks, timeframe=timeframe, max_quote_age_seconds=max_quote_age_seconds)
+        if bars is not None and ticks is not None
+        else None
+    )
     render_data_diagnostics(bars=bars_diag, ticks=ticks_diag, coverage=coverage, console=console)
 
 
