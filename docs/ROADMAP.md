@@ -29,9 +29,9 @@
 - [x] Causal ICT features embedded in aligned datasets
 - [x] Dataset quality status / issues in manifest
 - [x] Market data scope documented (historical L1 vs L2)
-- [ ] Tick schema validation
-- [ ] Bar schema validation
-- [ ] Parquet storage
+- [x] Tick schema validation
+- [x] Bar schema validation
+- [x] Parquet storage
 
 ## Phase 3: Causal ICT/SMC Features
 
