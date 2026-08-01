@@ -394,7 +394,7 @@ def run_backtest(
 ) -> None:
     """Run a baseline backtest from a canonical bars file."""
     from slytrade.backtest.reporting import (
-        VALID_STRATEGIES,
+VALID_STRATEGIES = ["buy-and-hold", "ma-cross", "ict-bias", "ict-confluence", "mtf-ict-confluence"]
         load_bars_file,
         render_backtest_report,
         run_backtest_from_bars,
@@ -615,7 +615,7 @@ def run_aligned_backtest(
 @app.command()
 def run_managed_backtest(
     bars_file: str = typer.Option(..., help="Aligned bars file with quote/tick/ICT columns"),
-    strategy: str = typer.Option("ict-bias", help="Entry strategy (validated at runtime)"),
+    strategy: str = typer.Option("ict-bias", help="Entry strategy: buy-and-hold, ma-cross, or ict-bias"),
     symbol: str | None = typer.Option(None, help="Symbol override if needed"),
     volume: float = typer.Option(0.1, help="Order volume"),
     initial_balance: float = typer.Option(100_000.0, help="Initial account balance"),
@@ -646,7 +646,7 @@ def run_managed_backtest(
     from slytrade.backtest.trade_management import TradeManagementConfig
 
     if strategy not in VALID_STRATEGIES or strategy == "no-trade":
-        raise typer.BadParameter("managed backtest strategy must be one of: buy-and-hold, ma-cross, ict-bias, ict-confluence, mtf-ict-confluence")
+        raise typer.BadParameter("managed backtest strategy must be one of: buy-and-hold, ma-cross, ict-bias")
     bars = load_bars_file(Path(bars_file))
     result = run_managed_aligned_backtest_from_bars(
         bars,
