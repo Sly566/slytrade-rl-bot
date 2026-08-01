@@ -17,12 +17,13 @@ from slytrade.features.ict import FEATURE_COLUMNS, compute_ict_features
 from slytrade.strategies.baselines import (
     BuyAndHoldStrategy,
     ICTBiasBaselineStrategy,
+    ICTConfluenceStrategy,
     MovingAverageCrossStrategy,
     NoTradeStrategy,
 )
 
-StrategyName = Literal["no-trade", "buy-and-hold", "ma-cross", "ict-bias"]
-VALID_STRATEGIES: tuple[str, ...] = ("no-trade", "buy-and-hold", "ma-cross", "ict-bias")
+StrategyName = Literal["no-trade", "buy-and-hold", "ma-cross", "ict-bias", "ict-confluence"]
+VALID_STRATEGIES: tuple[str, ...] = ("no-trade", "buy-and-hold", "ma-cross", "ict-bias", "ict-confluence")
 
 
 @dataclass(frozen=True)
@@ -102,6 +103,8 @@ def build_strategy(
         return MovingAverageCrossStrategy(symbol=symbol, volume=volume, fast_window=fast_window, slow_window=slow_window)
     if strategy_name == "ict-bias":
         return ICTBiasBaselineStrategy(symbol=symbol, volume=volume)
+    if strategy_name == "ict-confluence":
+        return ICTConfluenceStrategy(symbol=symbol, volume=volume)
     raise ValueError(f"Unknown strategy '{strategy_name}'. Valid strategies: {', '.join(VALID_STRATEGIES)}")
 
 

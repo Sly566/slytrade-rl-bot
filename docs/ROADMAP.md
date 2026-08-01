@@ -78,6 +78,7 @@
 - [x] BuyAndHold baseline
 - [x] MovingAverageCross baseline
 - [x] ICTBias baseline
+- [x] ICTConfluence tuned baseline
 - [x] Backtest reporting CLI
 - [x] Baseline comparison report
 - [ ] Gymnasium environment
