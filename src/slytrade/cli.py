@@ -536,6 +536,7 @@ def align_dataset(
     include_ict_features: bool = typer.Option(True, "--features/--no-features", help="Compute causal ICT/SMC features"),
     include_tick_features: bool = typer.Option(True, "--tick-features/--no-tick-features", help="Compute per-bar tick microstructure features"),
     require_fresh_quotes: bool = typer.Option(True, "--fresh-only/--keep-stale", help="Drop bars without fresh decision quotes"),
+    mtf: bool = typer.Option(False, "--mtf", help="Enable multi-timeframe HTF feature injection"),
     copy_ticks: bool = typer.Option(False, "--copy-ticks/--no-copy-ticks", help="Copy full tick file into processed dataset"),
 ) -> None:
     """Align bars and ticks into a canonical dataset with a manifest."""
