@@ -616,6 +616,8 @@ def run_aligned_backtest(
 def run_managed_backtest(
     bars_file: str = typer.Option(..., help="Aligned bars file with quote/tick/ICT columns"),
     strategy: str = typer.Option("ict-bias", help="Entry strategy (validated at runtime)"),
+    min_mtf_score: int = typer.Option(2, help="Minimum MTF confluence score required"),
+    require_mtf_bias_alignment: bool = typer.Option(True, "--require-mtf-bias/--no-require-mtf-bias", help="Require HTF bias alignment"),
     symbol: str | None = typer.Option(None, help="Symbol override if needed"),
     volume: float = typer.Option(0.1, help="Order volume"),
     initial_balance: float = typer.Option(100_000.0, help="Initial account balance"),

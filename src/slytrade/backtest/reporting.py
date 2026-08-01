@@ -23,7 +23,7 @@ from slytrade.strategies.baselines import (
 )
 
 StrategyName = Literal["no-trade", "buy-and-hold", "ma-cross", "ict-bias", "ict-confluence"]
-VALID_STRATEGIES: tuple[str, ...] = ("no-trade", "buy-and-hold", "ma-cross", "ict-bias", "ict-confluence")
+VALID_STRATEGIES: tuple[str, ...] = ("no-trade", "buy-and-hold", "ma-cross", "ict-bias", "ict-confluence", "mtf-ict-confluence")
 
 
 @dataclass(frozen=True)
@@ -105,6 +105,9 @@ def build_strategy(
         return ICTBiasBaselineStrategy(symbol=symbol, volume=volume)
     if strategy_name == "ict-confluence":
         return ICTConfluenceStrategy(symbol=symbol, volume=volume)
+    if strategy_name == "mtf-ict-confluence":
+        from slytrade.strategies.mtf_confluence import MTFICTConfluenceStrategy
+        return MTFICTConfluenceStrategy(symbol=symbol, volume=volume)
     raise ValueError(f"Unknown strategy '{strategy_name}'. Valid strategies: {', '.join(VALID_STRATEGIES)}")
 
 
