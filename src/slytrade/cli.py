@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 from typing import Any
+
 import pandas as pd
 import typer
 from rich.console import Console
@@ -391,6 +392,8 @@ def run_backtest(
     commission_per_volume: float = typer.Option(0.0, help="Commission per traded volume unit"),
     fast_window: int = typer.Option(5, help="Fast MA window for ma-cross"),
     slow_window: int = typer.Option(20, help="Slow MA window for ma-cross"),
+    # MTF Tuning Parameters (fully dynamic)
+    min_mtf_score: int = typer.Option(2, help="Minimum MTF confluence score"),
 ) -> None:
     """Run a baseline backtest from a canonical bars file."""
     from slytrade.backtest.reporting import (
@@ -437,6 +440,7 @@ def compare_baselines(
     commission_per_volume: float = typer.Option(0.0, help="Commission per traded volume unit"),
     fast_window: int = typer.Option(5, help="Fast MA window for ma-cross"),
     slow_window: int = typer.Option(20, help="Slow MA window for ma-cross"),
+    # MTF Tuning Parameters (fully dynamic)
     output_csv: str | None = typer.Option(None, help="Optional path to save comparison as CSV"),
 ) -> None:
     """Run all baseline strategies and print a comparison table."""
@@ -617,6 +621,7 @@ def run_aligned_backtest(
     commission_per_volume: float = typer.Option(0.0, help="Commission per traded volume unit"),
     fast_window: int = typer.Option(5, help="Fast MA window for ma-cross"),
     slow_window: int = typer.Option(20, help="Slow MA window for ma-cross"),
+    # MTF Tuning Parameters (fully dynamic)
 ) -> None:
     """Run a fast backtest from an aligned bars file with precomputed quotes."""
     from slytrade.backtest.reporting import (
@@ -652,8 +657,6 @@ def run_aligned_backtest(
 def run_managed_backtest(
     bars_file: str = typer.Option(..., help="Aligned bars file with quote/tick/ICT columns"),
     strategy: str = typer.Option("ict-bias", help="Entry strategy (validated at runtime)"),
-    min_mtf_score: int = typer.Option(2, help="Minimum MTF confluence score required"),
-    require_mtf_bias_alignment: bool = typer.Option(True, "--require-mtf-bias/--no-require-mtf-bias", help="Require HTF bias alignment"),
     symbol: str | None = typer.Option(None, help="Symbol override if needed"),
     volume: float = typer.Option(0.1, help="Order volume"),
     initial_balance: float = typer.Option(100_000.0, help="Initial account balance"),
@@ -673,6 +676,7 @@ def run_managed_backtest(
     trailing_stop_atr: float | None = typer.Option(None, help="Optional trailing stop distance in ATR multiples"),
     fast_window: int = typer.Option(5, help="Fast MA window for ma-cross"),
     slow_window: int = typer.Option(20, help="Slow MA window for ma-cross"),
+    # MTF Tuning Parameters (fully dynamic)
 ) -> None:
     """Run an aligned backtest with basic stop-loss/take-profit management."""
     from slytrade.backtest.reporting import (
@@ -738,6 +742,7 @@ def run_tick_backtest(
     ),
     fast_window: int = typer.Option(5, help="Fast MA window for ma-cross"),
     slow_window: int = typer.Option(20, help="Slow MA window for ma-cross"),
+    # MTF Tuning Parameters (fully dynamic)
 ) -> None:
     """Run a baseline backtest where bar signals execute on tick bid/ask quotes."""
     from slytrade.backtest.reporting import (

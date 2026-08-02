@@ -8,7 +8,12 @@ class MTFConfig:
     target_timeframe: str = "M5"
     intraday_timeframe: str = "M15"
 
-    observe_timeframes: list[str] = field(default_factory=lambda: ["M1", "M5", "M15", "H1", "H4", "D1", "W1"])
+    # Dynamic MTF scoring parameters (no magic numbers)
+    min_mtf_score: int = 2
+    require_mtf_bias_alignment: bool = True
+
+    observe_timeframes: list[str] = field(default_factory=lambda: 
+        ["M1", "M5", "M15", "H1", "H4", "D1", "W1"])
 
     primary_symbols: list[str] = field(default_factory=lambda: ["XAUUSD"])
     secondary_symbols: list[str] = field(default_factory=lambda: ["BTCUSD"])
@@ -35,7 +40,8 @@ TIMEFRAME_TO_MINUTES = {
 
 def get_higher_timeframes(execution_tf: str = "M1") -> list[str]:
     exec_min = TIMEFRAME_TO_MINUTES[execution_tf]
-    return [tf for tf in DEFAULT_MTF.observe_timeframes if TIMEFRAME_TO_MINUTES.get(tf, 0) >= exec_min]
+    return [tf for tf in DEFAULT_MTF.observe_timeframes 
+            if TIMEFRAME_TO_MINUTES.get(tf, 0) >= exec_min]
 
 def is_valid_timeframe(tf: str) -> bool:
     return tf in TIMEFRAME_TO_MINUTES

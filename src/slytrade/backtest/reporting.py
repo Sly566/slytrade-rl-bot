@@ -94,6 +94,8 @@ def build_strategy(
     volume: float,
     fast_window: int = 5,
     slow_window: int = 20,
+    min_mtf_score: int = 2,
+    require_mtf_bias_alignment: bool = True,
 ) -> BarStrategy:
     if strategy_name == "no-trade":
         return NoTradeStrategy()
@@ -111,7 +113,12 @@ def build_strategy(
         return ICTConfluenceStrategy(symbol=symbol, volume=volume)
     if strategy_name == "mtf-ict-confluence":
         from slytrade.strategies.mtf_confluence import MTFICTConfluenceStrategy
-        return MTFICTConfluenceStrategy(symbol=symbol, volume=volume)
+        return MTFICTConfluenceStrategy(
+            symbol=symbol,
+            volume=volume,
+            min_mtf_score=min_mtf_score,
+            require_mtf_bias_alignment=require_mtf_bias_alignment
+        )
     raise ValueError(f"Unknown strategy '{strategy_name}'. Valid strategies: {', '.join(VALID_STRATEGIES)}")
 
 
