@@ -9,7 +9,7 @@ import yaml
 @dataclass
 class TraderPersonality:
     name: str = "SlyMasterICT"
-    description: str = "Adaptive scalping and day trading ICT specialist"
+    description: str = "Adaptive scalping and day trading ICT specialist with full market awareness"
 
     aggression: float = 0.65
     selectivity: float = 0.75
