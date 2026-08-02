@@ -104,6 +104,10 @@ def build_strategy(
     if strategy_name == "ict-bias":
         return ICTBiasBaselineStrategy(symbol=symbol, volume=volume)
     if strategy_name == "ict-confluence":
+
+        if strategy_name == "mtf-ict-confluence":
+            from slytrade.strategies.mtf_confluence import MTFICTConfluenceStrategy
+            return MTFICTConfluenceStrategy(symbol=symbol, volume=volume)
         return ICTConfluenceStrategy(symbol=symbol, volume=volume)
     if strategy_name == "mtf-ict-confluence":
         from slytrade.strategies.mtf_confluence import MTFICTConfluenceStrategy

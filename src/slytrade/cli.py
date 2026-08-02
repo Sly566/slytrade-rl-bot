@@ -3,7 +3,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 from typing import Any
-
+import pandas as pd
 import typer
 from rich.console import Console
 from rich.table import Table
@@ -558,6 +558,41 @@ def align_dataset(
         include_tick_features=include_tick_features,
         require_fresh_quotes=require_fresh_quotes,
     )
+    # === MTF Feature Injection ===
+    if mtf:
+        from slytrade.config.mtf import get_higher_timeframes
+        from slytrade.features.mtf import compute_mtf_ict_features
+
+        console.print("[bold cyan]MTF mode enabled — injecting higher timeframe features...[/bold cyan]")
+
+        higher_tf_data = {}
+        bars_path = Path(bars_file)
+
+        # Find the symbol directory (go up until we find "symbol=")
+        symbol_dir = bars_path
+        while symbol_dir.parent.name != "mt5_bars" and symbol_dir != symbol_dir.parent:
+            symbol_dir = symbol_dir.parent
+
+        for tf in get_higher_timeframes(timeframe):
+            if tf == timeframe:
+                continue
+            # Look for higher timeframe bars under the same symbol directory
+            tf_dir = symbol_dir / f"timeframe={tf}"
+            if tf_dir.exists():
+                tf_files = list(tf_dir.glob("**/*.parquet"))
+                if tf_files:
+                    higher_tf_data[tf] = pd.read_parquet(tf_files[0])
+                    console.print(f"  Loaded {tf}: {len(higher_tf_data[tf])} rows")
+
+        if higher_tf_data:
+            # Extract bars from AlignedDataset, apply MTF features, then put back
+            from slytrade.data.alignment import AlignedDataset
+            bars_with_mtf = compute_mtf_ict_features(dataset.bars, higher_tf_data)
+            dataset = AlignedDataset(bars=bars_with_mtf, ticks=dataset.ticks, manifest=dataset.manifest)
+            console.print(f"[green]✓ Injected MTF features from {len(higher_tf_data)} timeframes[/green]")
+        else:
+            console.print("[yellow]Warning: No higher timeframe bars found for MTF injection[/yellow]")
+
     manifest = save_aligned_dataset(
         dataset,
         output_dir,
