@@ -1,0 +1,15 @@
+trader_personality:
+  name: "SlyMasterICT"
+  description: "Adaptive scalping and day trading ICT specialist"
+
+  aggression: 0.65
+  selectivity: 0.75
+  risk_tolerance: 0.60
+
+  scalping_bias: 0.70
+  day_trading_bias: 0.30
+
+  macro_respect: 0.85
+  session_sensitivity: 0.80
+
+  confluence_style: "balanced"

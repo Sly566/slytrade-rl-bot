@@ -409,8 +409,7 @@ def run_backtest(
     result = run_backtest_from_bars(
         bars,
         strategy_name=strategy,
-            min_mtf_score=min_mtf_score,
-            require_mtf_bias_alignment=require_mtf_bias_alignment,
+            
         symbol=symbol,
         volume=volume,
         fast_window=fast_window,
@@ -426,8 +425,7 @@ def run_backtest(
         ),
     )
     render_backtest_report(result, strategy_name=strategy,
-            min_mtf_score=min_mtf_score,
-            require_mtf_bias_alignment=require_mtf_bias_alignment, console=console)
+             console=console)
 
 
 @app.command()
@@ -641,8 +639,7 @@ def run_aligned_backtest(
     result = run_aligned_backtest_from_bars(
         bars,
         strategy_name=strategy,
-            min_mtf_score=min_mtf_score,
-            require_mtf_bias_alignment=require_mtf_bias_alignment,
+            
         symbol=symbol,
         volume=volume,
         fast_window=fast_window,
@@ -701,8 +698,7 @@ def run_managed_backtest(
     result = run_managed_aligned_backtest_from_bars(
         bars,
         strategy_name=strategy,
-            min_mtf_score=min_mtf_score,
-            require_mtf_bias_alignment=require_mtf_bias_alignment,
+            
         symbol=symbol,
         volume=volume,
         fast_window=fast_window,
@@ -771,8 +767,7 @@ def run_tick_backtest(
         bars,
         ticks,
         strategy_name=strategy,
-            min_mtf_score=min_mtf_score,
-            require_mtf_bias_alignment=require_mtf_bias_alignment,
+            
         symbol=symbol,
         volume=volume,
         fast_window=fast_window,

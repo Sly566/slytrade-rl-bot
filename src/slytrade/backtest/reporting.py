@@ -116,8 +116,6 @@ def build_strategy(
         return MTFICTConfluenceStrategy(
             symbol=symbol,
             volume=volume,
-            min_mtf_score=min_mtf_score,
-            require_mtf_bias_alignment=require_mtf_bias_alignment
         )
     raise ValueError(f"Unknown strategy '{strategy_name}'. Valid strategies: {', '.join(VALID_STRATEGIES)}")
 
@@ -140,8 +138,6 @@ def run_backtest_from_bars(
         volume=volume,
         fast_window=fast_window,
         slow_window=slow_window,
-        min_mtf_score=min_mtf_score,
-        require_mtf_bias_alignment=require_mtf_bias_alignment,
     )
     engine = BarBacktestEngine(config)
     return engine.run(prepared_bars, strategy)
@@ -165,8 +161,6 @@ def run_aligned_backtest_from_bars(
         volume=volume,
         fast_window=fast_window,
         slow_window=slow_window,
-        min_mtf_score=min_mtf_score,
-        require_mtf_bias_alignment=require_mtf_bias_alignment,
     )
     engine = AlignedBacktestEngine(config)
     return engine.run(prepared_bars, strategy)
@@ -193,8 +187,6 @@ def run_managed_aligned_backtest_from_bars(
         volume=volume,
         fast_window=fast_window,
         slow_window=slow_window,
-        min_mtf_score=min_mtf_score,
-        require_mtf_bias_alignment=require_mtf_bias_alignment,
     )
     engine = ManagedAlignedBacktestEngine(config, trade_config)
     return engine.run(prepared_bars, strategy)
@@ -219,8 +211,6 @@ def run_tick_backtest_from_frames(
         volume=volume,
         fast_window=fast_window,
         slow_window=slow_window,
-        min_mtf_score=min_mtf_score,
-        require_mtf_bias_alignment=require_mtf_bias_alignment,
     )
     engine = TickBacktestEngine(config)
     return engine.run(prepared_bars, ticks, strategy)
