@@ -140,6 +140,8 @@ def run_backtest_from_bars(
         volume=volume,
         fast_window=fast_window,
         slow_window=slow_window,
+        min_mtf_score=min_mtf_score,
+        require_mtf_bias_alignment=require_mtf_bias_alignment,
     )
     engine = BarBacktestEngine(config)
     return engine.run(prepared_bars, strategy)
@@ -163,6 +165,8 @@ def run_aligned_backtest_from_bars(
         volume=volume,
         fast_window=fast_window,
         slow_window=slow_window,
+        min_mtf_score=min_mtf_score,
+        require_mtf_bias_alignment=require_mtf_bias_alignment,
     )
     engine = AlignedBacktestEngine(config)
     return engine.run(prepared_bars, strategy)
@@ -176,6 +180,8 @@ def run_managed_aligned_backtest_from_bars(
     volume: float = 0.1,
     fast_window: int = 5,
     slow_window: int = 20,
+    min_mtf_score: int = 2,
+    require_mtf_bias_alignment: bool = True,
     config: BacktestConfig | None = None,
     trade_config: TradeManagementConfig | None = None,
 ) -> BacktestResult:
@@ -187,6 +193,8 @@ def run_managed_aligned_backtest_from_bars(
         volume=volume,
         fast_window=fast_window,
         slow_window=slow_window,
+        min_mtf_score=min_mtf_score,
+        require_mtf_bias_alignment=require_mtf_bias_alignment,
     )
     engine = ManagedAlignedBacktestEngine(config, trade_config)
     return engine.run(prepared_bars, strategy)
@@ -211,6 +219,8 @@ def run_tick_backtest_from_frames(
         volume=volume,
         fast_window=fast_window,
         slow_window=slow_window,
+        min_mtf_score=min_mtf_score,
+        require_mtf_bias_alignment=require_mtf_bias_alignment,
     )
     engine = TickBacktestEngine(config)
     return engine.run(prepared_bars, ticks, strategy)

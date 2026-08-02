@@ -409,6 +409,8 @@ def run_backtest(
     result = run_backtest_from_bars(
         bars,
         strategy_name=strategy,
+            min_mtf_score=min_mtf_score,
+            require_mtf_bias_alignment=require_mtf_bias_alignment,
         symbol=symbol,
         volume=volume,
         fast_window=fast_window,
@@ -423,7 +425,9 @@ def run_backtest(
             symbol_spec_file=symbol_spec_file,
         ),
     )
-    render_backtest_report(result, strategy_name=strategy, console=console)
+    render_backtest_report(result, strategy_name=strategy,
+            min_mtf_score=min_mtf_score,
+            require_mtf_bias_alignment=require_mtf_bias_alignment, console=console)
 
 
 @app.command()
@@ -637,6 +641,8 @@ def run_aligned_backtest(
     result = run_aligned_backtest_from_bars(
         bars,
         strategy_name=strategy,
+            min_mtf_score=min_mtf_score,
+            require_mtf_bias_alignment=require_mtf_bias_alignment,
         symbol=symbol,
         volume=volume,
         fast_window=fast_window,
@@ -657,6 +663,8 @@ def run_aligned_backtest(
 def run_managed_backtest(
     bars_file: str = typer.Option(..., help="Aligned bars file with quote/tick/ICT columns"),
     strategy: str = typer.Option("ict-bias", help="Entry strategy (validated at runtime)"),
+    min_mtf_score: int = typer.Option(2, help="Minimum MTF confluence score"),
+    require_mtf_bias_alignment: bool = typer.Option(True, "--require-mtf-bias/--no-require-mtf-bias", help="Require HTF bias alignment"),
     symbol: str | None = typer.Option(None, help="Symbol override if needed"),
     volume: float = typer.Option(0.1, help="Order volume"),
     initial_balance: float = typer.Option(100_000.0, help="Initial account balance"),
@@ -693,6 +701,8 @@ def run_managed_backtest(
     result = run_managed_aligned_backtest_from_bars(
         bars,
         strategy_name=strategy,
+            min_mtf_score=min_mtf_score,
+            require_mtf_bias_alignment=require_mtf_bias_alignment,
         symbol=symbol,
         volume=volume,
         fast_window=fast_window,
@@ -761,6 +771,8 @@ def run_tick_backtest(
         bars,
         ticks,
         strategy_name=strategy,
+            min_mtf_score=min_mtf_score,
+            require_mtf_bias_alignment=require_mtf_bias_alignment,
         symbol=symbol,
         volume=volume,
         fast_window=fast_window,
