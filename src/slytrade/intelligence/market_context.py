@@ -21,7 +21,7 @@ class MarketContextEngine:
         if higher_tf_data:
             context["macro_strength"] = "strong" if len(higher_tf_data) >= 3 else "moderate"
 
-        # Session placeholder
+        # Session placeholder (expandable)
         context["session"] = "unknown"
 
         return context
