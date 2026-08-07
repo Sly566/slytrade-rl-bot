@@ -16,7 +16,6 @@ class MTFICTConfluenceStrategy(ICTConfluenceStrategy):
         self.context_engine = MarketContextEngine(self.personality)
         self.alignment_engine = MicroMacroAlignmentEngine(self.personality)
 
-        # Dynamic base threshold from personality
         self.min_mtf_score = int(2 * self.personality.selectivity)
         self.require_mtf_bias_alignment = True
 
@@ -24,22 +23,27 @@ class MTFICTConfluenceStrategy(ICTConfluenceStrategy):
         context = self.context_engine.analyze(bars, higher_tf_data or {})
         alignment_score = self.alignment_engine.evaluate(bars, context)
 
-        # === Dynamic Threshold (Personality + Context) ===
+        # === Dynamic Threshold Logic ===
         threshold = self.min_mtf_score
 
         # Aggression influence
         if self.personality.aggression > 0.8:
             threshold = max(1, threshold - 1)
 
-        # Context influence
+        # Volatility influence
         if context.get("volatility") == "high":
-            threshold += 1  # Become more selective in high volatility
+            threshold += 1
 
+        # Macro respect influence
         if context.get("macro_strength") == "strong" and self.personality.macro_respect > 0.7:
-            threshold = max(1, threshold - 1)  # Slightly more aggressive when macro is strong
+            threshold = max(1, threshold - 1)
 
         # Alignment bonus
         if alignment_score > 0.75:
+            threshold = max(1, threshold - 1)
+
+        # Session sensitivity (basic example)
+        if context.get("session") == "london_open" and self.personality.session_sensitivity > 0.7:
             threshold = max(1, threshold - 1)
 
         base_signals = super().generate_signals(bars, **kwargs)  # type: ignore[misc]
