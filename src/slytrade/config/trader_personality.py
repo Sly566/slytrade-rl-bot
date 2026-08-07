@@ -25,9 +25,8 @@ class TraderPersonality:
     session_sensitivity: float = 0.80
 
     # Decision Style
-    confluence_style: str = "balanced"   # conservative, balanced, aggressive
+    confluence_style: str = "balanced"
 
-    # Adaptive Rules
     adaptive_rules: dict[str, Any] = field(default_factory=dict)
 
     @classmethod

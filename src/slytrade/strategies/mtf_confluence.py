@@ -23,9 +23,13 @@ class MTFICTConfluenceStrategy(ICTConfluenceStrategy):
         context = self.context_engine.analyze(bars, higher_tf_data or {})
         alignment_score = self.alignment_engine.evaluate(bars, context)
 
-        # Dynamic threshold
+        # Dynamic threshold influenced by personality + context
         threshold = self.min_mtf_score
         if alignment_score > 0.75:
+            threshold = max(1, threshold - 1)
+
+        # Aggression influence (future expansion point)
+        if self.personality.aggression > 0.8:
             threshold = max(1, threshold - 1)
 
         base_signals = super().generate_signals(bars, **kwargs)  # type: ignore[misc]
