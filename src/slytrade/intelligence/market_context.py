@@ -1,29 +1,27 @@
-"""Market Context Engine – understands current market state"""
-from typing import Literal
+"""Market Context Engine"""
 
 import pandas as pd
 
 from slytrade.config.trader_personality import TraderPersonality
 
-MarketRegime = Literal["trending", "ranging", "high_volatility", "low_volatility", "transition"]
 
 class MarketContextEngine:
     def __init__(self, personality: TraderPersonality):
         self.personality = personality
 
-    def analyze(self, bars: pd.DataFrame, higher_tf_data: dict = None) -> dict:
+    def analyze(self, bars: pd.DataFrame, higher_tf_data: dict | None = None) -> dict:
         context = {}
 
-        # Volatility detection
+        # Volatility
         if "atr_norm" in bars.columns:
             avg_atr = bars["atr_norm"].tail(20).mean()
-            context["volatility_state"] = "high" if avg_atr > 0.8 else "normal"
+            context["volatility"] = "high" if avg_atr > 0.8 else "normal"
 
-        # Session detection (basic)
-        context["session"] = "unknown"
-
-        # Macro bias strength
+        # Macro strength
         if higher_tf_data:
-            context["macro_strength"] = "strong" if len(higher_tf_data) > 2 else "moderate"
+            context["macro_strength"] = "strong" if len(higher_tf_data) >= 3 else "moderate"
+
+        # Session awareness placeholder
+        context["session"] = "unknown"
 
         return context
