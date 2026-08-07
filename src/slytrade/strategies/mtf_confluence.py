@@ -46,11 +46,11 @@ class MTFICTConfluenceStrategy(ICTConfluenceStrategy):
         if context.get("session") == "london_open" and self.personality.session_sensitivity > 0.7:
             threshold = max(1, threshold - 1)
 
-        # Risk tolerance (tighter in low risk tolerance)
+        # Risk tolerance
         if self.personality.risk_tolerance < 0.5:
             threshold += 1
 
-        # Scalping bias (slightly lower threshold for scalping)
+        # Scalping bias
         if self.personality.scalping_bias > 0.7:
             threshold = max(1, threshold - 1)
 
