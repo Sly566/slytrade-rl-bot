@@ -23,18 +23,18 @@ class MTFICTConfluenceStrategy(ICTConfluenceStrategy):
         context = self.context_engine.analyze(bars, higher_tf_data or {})
         alignment_score = self.alignment_engine.evaluate(bars, context)
 
-        # === Dynamic Threshold Logic ===
+        # === Dynamic Threshold (All Personality Traits) ===
         threshold = self.min_mtf_score
 
-        # Aggression influence
+        # Aggression
         if self.personality.aggression > 0.8:
             threshold = max(1, threshold - 1)
 
-        # Volatility influence
+        # Volatility
         if context.get("volatility") == "high":
             threshold += 1
 
-        # Macro respect influence
+        # Macro respect
         if context.get("macro_strength") == "strong" and self.personality.macro_respect > 0.7:
             threshold = max(1, threshold - 1)
 
@@ -42,8 +42,16 @@ class MTFICTConfluenceStrategy(ICTConfluenceStrategy):
         if alignment_score > 0.75:
             threshold = max(1, threshold - 1)
 
-        # Session sensitivity (basic example)
+        # Session sensitivity
         if context.get("session") == "london_open" and self.personality.session_sensitivity > 0.7:
+            threshold = max(1, threshold - 1)
+
+        # Risk tolerance (tighter in low risk tolerance)
+        if self.personality.risk_tolerance < 0.5:
+            threshold += 1
+
+        # Scalping bias (slightly lower threshold for scalping)
+        if self.personality.scalping_bias > 0.7:
             threshold = max(1, threshold - 1)
 
         base_signals = super().generate_signals(bars, **kwargs)  # type: ignore[misc]
