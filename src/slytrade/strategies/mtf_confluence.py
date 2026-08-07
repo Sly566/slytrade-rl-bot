@@ -10,7 +10,7 @@ from slytrade.strategies.baselines import ICTConfluenceStrategy
 class MTFICTConfluenceStrategy(ICTConfluenceStrategy):
     name = "mtf-ict-confluence"
 
-    def __init__(self, personality: TraderPersonality = None, **kwargs):
+    def __init__(self, personality: "TraderPersonality" | None = None, **kwargs):
         super().__init__(**kwargs)
         self.personality = personality or TraderPersonality.from_yaml()
         self.context_engine = MarketContextEngine(self.personality)
@@ -20,7 +20,7 @@ class MTFICTConfluenceStrategy(ICTConfluenceStrategy):
         self.min_mtf_score = int(2 * self.personality.selectivity)
         self.require_mtf_bias_alignment = True
 
-    def generate_signals(self, bars: pd.DataFrame, higher_tf_data: dict = None, **kwargs):
+    def generate_signals(self, bars: pd.DataFrame, higher_tf_data: dict | None = None, **kwargs):
         context = self.context_engine.analyze(bars, higher_tf_data)
         alignment_score = self.alignment_engine.evaluate(bars, context)
 
