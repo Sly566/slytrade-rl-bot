@@ -71,6 +71,7 @@
 - [x] Trade analytics / exit reason metrics
 - [x] Risk-reducing exits allowed after kill switch
 - [ ] Trade ledger persistence
+  - SQLite event journaling and OMS/ledger rehydration are implemented; broker reconciliation remains required.
 
 ## Phase 5: Strategy Baselines and RL
 
@@ -81,7 +82,7 @@
 - [x] ICTConfluence tuned baseline
 - [x] Backtest reporting CLI
 - [x] Baseline comparison report
-- [ ] Gymnasium environment
+- [x] Gymnasium environment foundation with transaction costs
 - [ ] PPO baseline
 - [ ] Walk-forward validation
 
@@ -95,8 +96,19 @@
 
 ## Phase 6: Production
 
-- [ ] MT5 broker adapter
+- [x] Guarded MT5 broker adapter and read-only preflight
 - [ ] Broker reconciliation
 - [ ] Monitoring
 - [ ] Alerts
 - [ ] Kill switch
+
+## Deployment gates
+
+The project now exposes explicit readiness primitives in
+`slytrade.monitoring.gates`. Demo trading must not be enabled until the Python 3.12 environment, tests,
+lint, type checks, historical validation, cost stress, seed stability, lockbox
+test, paper stability, MT5 reconciliation, rollback verification, and manual
+approval checks are complete. See `docs/EVALUATION_STANDARD.md`.
+The RL environment is a foundation only; it is not a deployment approval or a
+profitability claim. Walk-forward evaluation and model governance remain
+mandatory before any policy can influence orders.

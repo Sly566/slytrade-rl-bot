@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 
 import pandas as pd
 
-from slytrade.execution.journal import JsonlJournal
+from slytrade.execution.journal import JsonlJournal, SqliteJournal
 from slytrade.execution.models import OrderIntent, Side
 
 
@@ -25,9 +25,11 @@ class TradeRecord:
 class TradeLedger:
     """Append-only in-memory trade ledger with optional JSONL persistence."""
 
-    def __init__(self, journal: JsonlJournal | None = None):
+    def __init__(self, journal: JsonlJournal | SqliteJournal | None = None):
         self.records: list[TradeRecord] = []
         self.journal = journal
+        if journal is not None:
+            self._restore(journal.read_all())
 
     def record_fill(
         self,
@@ -65,3 +67,27 @@ class TradeLedger:
     @property
     def total_commission(self) -> float:
         return sum(record.commission for record in self.records)
+
+    def _restore(self, events: list[dict[str, object]]) -> None:
+        for event in events:
+            if event.get("event_type") != "trade_record":
+                continue
+            raw = event.get("trade")
+            if not isinstance(raw, dict):
+                continue
+            try:
+                self.records.append(
+                    TradeRecord(
+                        client_order_id=str(raw["client_order_id"]),
+                        symbol=str(raw["symbol"]),
+                        side=Side(str(raw["side"])),
+                        volume=float(raw["volume"]),
+                        price=float(raw["price"]),
+                        commission=float(raw["commission"]),
+                        realized_pnl=float(raw["realized_pnl"]),
+                        reason=str(raw["reason"]),
+                        event_time=datetime.fromisoformat(str(raw["event_time"])),
+                    )
+                )
+            except (KeyError, TypeError, ValueError):
+                continue

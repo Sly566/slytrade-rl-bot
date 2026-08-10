@@ -17,7 +17,7 @@ PortfolioState
    ↓
 TradeLedger
    ↓
-JsonlJournal
+JsonlJournal / SqliteJournal
 ```
 
 ## Order Management System
@@ -48,9 +48,15 @@ The trade ledger stores realized fill records:
 - reason
 - timestamp
 
-## JSONL journal
+## Durable journals
 
-The JSONL journal is an append-only audit trail. It is intentionally simple and can later be backed by SQLite/Postgres, but even at this stage every order and trade event is inspectable.
+`JsonlJournal` remains useful for simple audit exports. `SqliteJournal` is the
+durable runtime option: it stores ordered, transactional events and allows the
+OMS and trade ledger to rehydrate after a process restart.
+
+Persistence is necessary but not sufficient for live trading. A broker adapter
+must still reconcile open orders and positions before it is allowed to submit
+new exposure.
 
 ## Paper Broker
 

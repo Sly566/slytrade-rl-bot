@@ -45,7 +45,9 @@ class PaperBroker:
     def update_quote(self, quote: Quote) -> float:
         """Update latest mark price and return current equity."""
         self.last_marks[quote.symbol] = quote.mid
-        return self.portfolio.mark_to_market(self.last_marks)
+        equity = self.portfolio.mark_to_market(self.last_marks)
+        self.guardrails.observe_equity(equity, current_date=quote.time.date())
+        return equity
 
     def is_reducing_position(self, intent: OrderIntent) -> bool:
         """Return True when an order reduces or closes current exposure.
@@ -74,6 +76,7 @@ class PaperBroker:
                 equity=equity,
                 spread_points=quote.spread / max(self.execution.config.point_size, 1e-12),
                 live=False,
+                current_date=quote.time.date(),
             )
         if decision is not None and not decision.approved:
             self.oms.create_order(intent)

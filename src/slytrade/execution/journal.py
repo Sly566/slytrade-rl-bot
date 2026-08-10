@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from enum import Enum
@@ -49,3 +50,44 @@ class JsonlJournal:
                 if line.strip():
                     rows.append(json.loads(line))
         return rows
+
+
+class SqliteJournal:
+    """Durable, transactional append-only event journal.
+
+    SQLite is used deliberately here because it is available in the standard
+    library, survives process restarts, and gives each event an ordering
+    sequence that can be used for deterministic state reconstruction.
+    """
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS execution_events (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_type TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.commit()
+
+    def append(self, event_type: str, payload: dict[str, Any]) -> None:
+        row = json.dumps(to_jsonable(payload), sort_keys=True)
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                "INSERT INTO execution_events (event_type, payload, created_at) VALUES (?, ?, ?)",
+                (event_type, row, datetime.now().astimezone().isoformat()),
+            )
+            connection.commit()
+
+    def read_all(self) -> list[dict[str, Any]]:
+        with sqlite3.connect(self.path) as connection:
+            rows = connection.execute(
+                "SELECT event_type, payload FROM execution_events ORDER BY sequence"
+            ).fetchall()
+        return [{"event_type": event_type, **json.loads(payload)} for event_type, payload in rows]

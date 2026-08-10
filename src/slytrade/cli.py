@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,11 @@ from slytrade.data.time import date_range_from_lookback, parse_utc_datetime
 
 app = typer.Typer(help="SlyTrade RL Bot CLI")
 console = Console()
+MT5_EXPECTED_POSITION_OPTION = typer.Option(
+    [],
+    "--expected-position",
+    help="Expected broker position as SYMBOL=SIGNED_VOLUME; repeat for multiple symbols",
+)
 
 
 def module_available(name: str) -> bool:
@@ -33,7 +39,8 @@ def load_mt5() -> Any:
         try:
             from mt5linux import MetaTrader5 as MT5Linux  # type: ignore[import-not-found]
 
-            return MT5Linux()
+            bridge_timeout = float(os.getenv("SLYTRADE_MT5_TIMEOUT_SECONDS", "15"))
+            return MT5Linux(timeout=bridge_timeout)
         except ImportError as exc:
             raise RuntimeError(
                 "No MT5 Python integration found. Install the `mt5` optional dependencies and start your MT5 bridge."
@@ -802,6 +809,49 @@ def mt5_info() -> None:
         console.print(f"Symbols : {len(symbols) if symbols is not None else 0}")
     finally:
         shutdown_mt5(mt5)
+
+
+@app.command()
+def mt5_preflight(
+    symbol: str = typer.Option("XAUUSD", help="Broker symbol to validate"),
+    expected_position: list[str] = MT5_EXPECTED_POSITION_OPTION,
+) -> None:
+    """Run a read-only MT5 connectivity, quote, account, and reconciliation check."""
+    from slytrade.brokers.mt5_adapter import MT5BrokerAdapter
+    from slytrade.execution.oms import OrderManagementSystem
+    from slytrade.risk.guardrails import GuardrailConfig, TradingGuardrails
+
+    expected_positions: dict[str, float] = {}
+    for item in expected_position:
+        try:
+            position_symbol, raw_volume = item.split("=", 1)
+            expected_positions[position_symbol.strip()] = float(raw_volume)
+        except ValueError as exc:
+            raise typer.BadParameter(f"expected position must be SYMBOL=SIGNED_VOLUME, got {item!r}") from exc
+
+    mt5 = load_mt5()
+    adapter = MT5BrokerAdapter(
+        mt5,
+        oms=OrderManagementSystem(),
+        guardrails=TradingGuardrails(config=GuardrailConfig(), initial_equity=1.0),
+        allow_trading=False,
+        expected_positions=expected_positions,
+    )
+    try:
+        adapter.connect()
+        account = adapter.account_info()
+        resolved_symbol = adapter.resolve_symbol(symbol)
+        quote = adapter.quote(resolved_symbol)
+        spec = adapter.symbol_spec(resolved_symbol)
+        reconciliation = adapter.reconcile()
+        console.print(f"MT5 connected: equity={getattr(account, 'equity', 'unknown')}")
+        console.print(f"{symbol} -> {resolved_symbol}: bid={quote.bid} ask={quote.ask} spread={quote.spread}")
+        console.print(f"symbol spec: digits={spec.digits} point={spec.point} volume_step={spec.volume_step}")
+        console.print(f"reconciliation: {'OK' if reconciliation.reconciled else 'BLOCKED'} ({reconciliation.detail})")
+        if not reconciliation.reconciled:
+            raise typer.Exit(code=2)
+    finally:
+        adapter.disconnect()
 
 
 @app.command()
