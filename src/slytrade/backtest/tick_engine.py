@@ -49,6 +49,11 @@ def is_quote_fresh(quote: Quote, decision_time: pd.Timestamp, max_age_seconds: f
     return 0.0 <= age <= max_age_seconds
 
 
+def _base_symbol(symbol: str) -> str:
+    normalized = symbol.strip().upper()
+    return normalized[:-1] if normalized.endswith("M") and len(normalized) > 6 else normalized
+
+
 class TickBacktestEngine:
     """Bar-signal, tick-execution backtest engine.
 
@@ -106,12 +111,14 @@ class TickBacktestEngine:
             decision_time = decision_time_for_bar(bar)
             while tick_index < len(ordered_ticks) and pd.Timestamp(ordered_ticks.loc[tick_index, "time_msc"]) <= decision_time:
                 tick_quote = quote_from_tick(ordered_ticks.loc[tick_index])
-                last_quote_by_symbol[tick_quote.symbol] = tick_quote
+                last_quote_by_symbol[_base_symbol(tick_quote.symbol)] = tick_quote
                 broker.update_quote(tick_quote)
                 tick_index += 1
 
             symbol = str(bar["symbol"])
-            quote = last_quote_by_symbol.get(symbol)
+            quote = last_quote_by_symbol.get(_base_symbol(symbol))
+            if quote is not None and quote.symbol != symbol:
+                quote = Quote(symbol=symbol, bid=quote.bid, ask=quote.ask, time=quote.time)
             quote_is_fresh = quote is not None and is_quote_fresh(
                 quote,
                 decision_time,
