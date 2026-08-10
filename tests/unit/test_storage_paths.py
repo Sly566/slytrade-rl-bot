@@ -27,3 +27,8 @@ def test_write_frame_fallback_or_parquet(tmp_path):
     assert result.rows == 2
     assert result.path.exists()
     assert result.format in {"parquet", "csv"}
+    second = storage.write_frame(frame, tmp_path / "sample.parquet")
+    assert second.rows == 2
+    assert (tmp_path / "sample.parquet.manifest.json").exists() or (
+        tmp_path / "sample.csv.manifest.json"
+    ).exists()
