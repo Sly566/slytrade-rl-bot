@@ -15,7 +15,23 @@ walk_forward:
   validation_window_bars: 50000
   embargo_bars: 500
 
-training:
+rl:
   algorithm: PPO
   total_timesteps: 100000
   seed: 42
+  learning_rate: 3.0e-4
+  n_steps: 1024
+  batch_size: 64
+  n_epochs: 10
+  gamma: 0.99
+  gae_lambda: 0.95
+  risk_per_trade: 0.005
+  stop_loss_atr: 1.0
+  take_profit_atr: 2.0
+  reward_scale: 1.0
+
+regime:
+  volatility_lookback: 100
+  volatile_z_threshold: 0.8
+  quiet_z_threshold: -0.8
+  trend_threshold_atr: 0.15

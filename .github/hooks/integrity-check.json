@@ -1,0 +1,1 @@
+{"name":"integrity-check","description":"Prevents hard-coded values","trigger":"preToolUse","condition":"edit_file and (mtf_confluence or trader_personality)","action":{"type":"prompt","message":"⚠️ Reminder: Ensure no hard-coded values are introduced. All parameters must come from YAML configs."}}

@@ -25,6 +25,21 @@ def module_available(name: str) -> bool:
     return importlib.util.find_spec(name) is not None
 
 
+def infer_symbol(bars: pd.DataFrame, symbol: str | None = None) -> str:
+    """Resolve the trading symbol for a bars frame."""
+    if symbol:
+        return symbol
+    if "symbol" not in bars.columns or bars.empty:
+        raise ValueError("symbol must be supplied when bars file is empty or lacks a symbol column")
+    symbols = sorted(str(value) for value in bars["symbol"].dropna().unique())
+    if len(symbols) != 1:
+        raise ValueError(f"bars file must contain exactly one symbol or --symbol must be provided; found {symbols}")
+    return symbols[0]
+
+
+
+
+
 def load_mt5() -> Any:
     """Load an MT5-compatible Python module/object lazily.
 
@@ -436,7 +451,156 @@ def run_backtest(
 
 
 @app.command()
+def persona_backtest(
+    bars_file: str = typer.Option(..., help="Aligned bars file with ICT feature columns (.csv or .parquet)"),
+    strategy: str = typer.Option("persona-adaptive", help="Strategy to backtest"),
+    symbol: str | None = typer.Option(None, help="Symbol override if the file contains multiple symbols"),
+    volume: float = typer.Option(0.1, help="Order volume used by baseline strategies"),
+    initial_balance: float = typer.Option(100_000.0, help="Initial account balance"),
+    point_size: float = typer.Option(0.01, help="Instrument point size"),
+    point_value: float = typer.Option(1.0, help="PnL value per price unit and volume"),
+    symbol_spec_file: str | None = typer.Option(None, help="Optional symbol spec JSON to set point size/value"),
+    default_spread_points: float = typer.Option(20.0, help="Fallback spread in points when bars have no spread"),
+    slippage_points: float = typer.Option(0.0, help="Adverse slippage in points"),
+    commission_per_volume: float = typer.Option(0.0, help="Commission per traded volume unit"),
+    fast_window: int = typer.Option(5, help="Fast MA window for ma-cross"),
+    slow_window: int = typer.Option(20, help="Slow MA window for ma-cross"),
+) -> None:
+    """Run a backtest using the personality-adaptive ICT strategy.
+
+    The persona strategy reads configs/trader_personality.yaml and adapts its
+    thresholds and sizing to the detected market regime at each bar.
+    """
+    from slytrade.backtest.reporting import (
+        VALID_STRATEGIES,
+        load_bars_file,
+        render_backtest_report,
+        run_managed_aligned_backtest_from_bars,
+    )
+
+    if strategy not in VALID_STRATEGIES:
+        raise typer.BadParameter(f"strategy must be one of: {', '.join(VALID_STRATEGIES)}")
+    bars = load_bars_file(Path(bars_file))
+    result = run_managed_aligned_backtest_from_bars(
+        bars,
+        strategy_name=strategy,
+        symbol=symbol,
+        volume=volume,
+        fast_window=fast_window,
+        slow_window=slow_window,
+        config=build_backtest_config_from_cli(
+            initial_balance=initial_balance,
+            default_spread_points=default_spread_points,
+            point_size=point_size,
+            point_value=point_value,
+            slippage_points=slippage_points,
+            commission_per_volume=commission_per_volume,
+            symbol_spec_file=symbol_spec_file,
+        ),
+    )
+    render_backtest_report(result, strategy_name=strategy, console=console)
+
+
+@app.command()
+def train_rl(
+    bars_file: str = typer.Option(..., help="Aligned bars file with decision quote / ICT columns (.csv or .parquet)"),
+    total_timesteps: int = typer.Option(100_000, help="Number of PPO training steps"),
+    seed: int = typer.Option(42, help="Random seed"),
+    learning_rate: float = typer.Option(3e-4, help="PPO learning rate"),
+    n_steps: int = typer.Option(1024, help="PPO rollout buffer length"),
+    batch_size: int = typer.Option(64, help="PPO minibatch size"),
+    n_epochs: int = typer.Option(10, help="PPO epochs per rollout"),
+    gamma: float = typer.Option(0.99, help="PPO discount factor"),
+    gae_lambda: float = typer.Option(0.95, help="PPO GAE lambda"),
+    model_dir: str = typer.Option("models/rl", help="Directory to save the trained policy"),
+    symbol: str | None = typer.Option(None, help="Symbol override if the file contains multiple symbols"),
+    personality_file: str = typer.Option("configs/trader_personality.yaml", help="Trader personality YAML path"),
+) -> None:
+    """Train a PPO policy on the SlyTrade RL environment.
+
+    Requires the `rl` optional dependencies (gymnasium, stable-baselines3,
+    torch). The environment uses the causal feature stack and a no-leakage
+    scaler fitted on the training slice.
+    """
+    from slytrade.backtest.reporting import load_bars_file
+    from slytrade.rl.dataset import build_rl_dataset
+    from slytrade.rl.walkforward import evaluate_ppo, train_ppo
+
+    bars = load_bars_file(Path(bars_file))
+    resolved_symbol = infer_symbol(bars, symbol)
+    bars = bars[bars["symbol"] == resolved_symbol].copy()
+    dataset = build_rl_dataset(bars)
+    scaler_params = dataset.fit_scaler(0, len(dataset.bars))
+    env = dataset.env_factory(0, len(dataset.bars), seed=seed, scaler_params=scaler_params)
+    model = train_ppo(
+        env,
+        total_timesteps=total_timesteps,
+        seed=seed,
+        learning_rate=learning_rate,
+        n_steps=n_steps,
+        batch_size=batch_size,
+        n_epochs=n_epochs,
+        gamma=gamma,
+        gae_lambda=gae_lambda,
+        model_dir=model_dir,
+    )
+
+
+
+    results = evaluate_ppo(model, env, episodes=3, seed=seed)
+    console.print(f"[green]Trained PPO policy saved to {model_dir}.zip[/green]")
+    console.print(f"Mean total return: {results['mean_total_return']:.4f}")
+    console.print(f"Mean max drawdown: {results['mean_max_drawdown']:.4f}")
+    console.print(f"Mean trades per episode: {results['mean_n_trades']:.1f}")
+
+
+@app.command()
+def walk_forward(
+    bars_file: str = typer.Option(..., help="Aligned bars file with decision quote / ICT columns (.csv or .parquet)"),
+    train_window: int = typer.Option(200_000, help="Walk-forward train window (bars)"),
+    validation_window: int = typer.Option(50_000, help="Walk-forward validation window (bars)"),
+    test_window: int = typer.Option(50_000, help="Walk-forward test window (bars)"),
+    embargo: int = typer.Option(500, help="Embargo gap between train/val/test (bars)"),
+    step: int | None = typer.Option(None, help="Step between folds (defaults to test_window)"),
+    total_timesteps: int = typer.Option(20_000, help="PPO steps per fold"),
+    seed: int = typer.Option(42, help="Random seed"),
+    symbol: str | None = typer.Option(None, help="Symbol override if the file contains multiple symbols"),
+    personality_file: str = typer.Option("configs/trader_personality.yaml", help="Trader personality YAML path"),
+) -> None:
+    """Run walk-forward validation of PPO training (honest out-of-sample test).
+
+    Requires the `rl` optional dependencies. Each fold trains on its train
+    window and evaluates on the test window. Prints a per-fold DataFrame and
+    an aggregate summary row.
+    """
+    from slytrade.backtest.reporting import load_bars_file
+    from slytrade.rl.dataset import build_rl_dataset
+    from slytrade.rl.walkforward import make_walk_forward_folds, walk_forward_validation
+
+    bars = load_bars_file(Path(bars_file))
+    resolved_symbol = infer_symbol(bars, symbol)
+    bars = bars[bars["symbol"] == resolved_symbol].copy()
+    dataset = build_rl_dataset(bars)
+    folds = make_walk_forward_folds(
+        len(dataset.bars),
+        train_window=train_window,
+        validation_window=validation_window,
+        test_window=test_window,
+        embargo=embargo,
+        step=step,
+    )
+    table = walk_forward_validation(dataset, folds, total_timesteps=total_timesteps, seed=seed)
+    console.print(table.to_string(index=False))
+
+
+
+
+
+@app.command()
 def compare_baselines(
+
+
+
     bars_file: str = typer.Option(..., help="Canonical bars file (.csv or .parquet)"),
     symbol: str | None = typer.Option(None, help="Symbol override if the file contains multiple symbols"),
     volume: float = typer.Option(0.1, help="Order volume used by baseline strategies"),

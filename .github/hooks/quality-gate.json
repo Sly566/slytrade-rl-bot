@@ -1,0 +1,1 @@
+{"name":"quality-gate","description":"Runs quality checks after edits","trigger":"postToolUse","condition":"edit_file or write_file","action":{"type":"shell","command":"echo '🔍 Running quality gates...' && python -m pytest --tb=no -q || echo '⚠️ Tests failed' && ruff check . --quiet || echo '⚠️ Ruff issues' && mypy src --no-error-summary || echo '⚠️ Type issues'"}}

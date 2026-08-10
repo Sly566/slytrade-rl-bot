@@ -21,9 +21,29 @@ from slytrade.strategies.baselines import (
     MovingAverageCrossStrategy,
     NoTradeStrategy,
 )
+from slytrade.strategies.personality_adaptive import PersonalityAdaptiveStrategy
 
-StrategyName = Literal["no-trade", "buy-and-hold", "ma-cross", "ict-bias", "ict-confluence"]
-VALID_STRATEGIES: tuple[str, ...] = ("no-trade", "buy-and-hold", "ma-cross", "ict-bias", "ict-confluence", "mtf-ict-confluence")
+StrategyName = Literal[
+    "no-trade",
+    "buy-and-hold",
+    "ma-cross",
+    "ict-bias",
+    "ict-confluence",
+    "mtf-ict-confluence",
+    "persona-adaptive",
+]
+VALID_STRATEGIES: tuple[str, ...] = (
+    "no-trade",
+    "buy-and-hold",
+    "ma-cross",
+    "ict-bias",
+    "ict-confluence",
+    "mtf-ict-confluence",
+    "persona-adaptive",
+)
+
+
+
 
 
 @dataclass(frozen=True)
@@ -117,7 +137,12 @@ def build_strategy(
             symbol=symbol,
             volume=volume,
         )
+    if strategy_name == "persona-adaptive":
+        return PersonalityAdaptiveStrategy(symbol=symbol, volume=volume)
     raise ValueError(f"Unknown strategy '{strategy_name}'. Valid strategies: {', '.join(VALID_STRATEGIES)}")
+
+
+
 
 
 def run_backtest_from_bars(

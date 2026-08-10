@@ -18,11 +18,59 @@ trader_personality:
   # Confluence Style
   confluence_style: "balanced"
 
+  # === Deep ICT Persona Traits ===
+  # Conviction: how strongly a confirmed setup is acted upon.
+  conviction: 0.70
+  # Patience: willingness to wait for the perfect liquidity sweep + OB entry.
+  patience: 0.75
+  # Discipline: adherence to rules; resists revenge trading after losses.
+  discipline: 0.85
+  # Adaptability: how quickly thresholds shift with changing market regimes.
+  adaptability: 0.80
+  # Time pressure: prefers faster entries/exits (1.0) vs waiting for confirmations (0.0).
+  time_pressure: 0.35
+  # Structure focus: how strongly the trader respects HTF market structure.
+  structure_focus: 0.90
+  # Liquidity focus: how much the trader hunts liquidity sweeps before entries.
+  liquidity_focus: 0.88
+  # Trade duration bias: 0.0 = scalps only, 1.0 = holds for day swings.
+  trade_duration_bias: 0.45
+
+  # Entry/exit style
+  entry_style: "balanced"
+  exit_style: "balanced"
+
+  # Risk behavior
+  cut_losses_fast: 0.75
+  let_winners_run: 0.60
+  max_risk_per_trade_default: 0.005
+  position_sizing: "risk_based"
+
+  # Confidence thresholds mapped to action (regime-adaptive)
+  confidence_thresholds:
+    min_entry_score: 4
+    add_on_strong_conviction: 0.8
+    scale_out_threshold: 0.6
+
+  # Preference windows / conditions
+  session_preferences: ["london", "ny_am", "ny_pm"]
+  volatility_preferences: ["normal", "high"]
+  trend_preferences: ["bull", "bear"]
+
+  # Kill-switch / risk circuit breaker
+  kill_switch_trigger_daily_drawdown: 0.03
+  kill_switch_trigger_total_drawdown: 0.08
+
+  # Edge optimism (0..1). 0 = skeptical, 1 = trusts the edge.
+  edge_optimism: 0.55
+
   # Adaptive Rules
   adaptive_rules:
     high_volatility:
       aggression_multiplier: 0.75
       selectivity_multiplier: 1.25
+    high_volatility_selectivity:
+      selectivity_multiplier: 1.15
     low_volatility:
       aggression_multiplier: 1.15
       selectivity_multiplier: 0.85
