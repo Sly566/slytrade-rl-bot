@@ -6,6 +6,9 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from slytrade.execution.ledger import TradeLedger
+from slytrade.execution.models import OrderIntent, Side
+
 gym: Any
 spaces: Any
 
@@ -79,3 +82,111 @@ else:
     class TradingEnvironment:  # type: ignore[no-redef]
         def __init__(self, bars: pd.DataFrame, config: EnvironmentConfig | None = None):
             raise ImportError("TradingEnvironment requires the optional 'rl' dependencies")
+
+
+@dataclass(frozen=True)
+class RLEnvironmentConfig:
+    initial_balance: float = 100_000.0
+    point_size: float = 0.01
+    point_value: float = 1.0
+    transaction_cost: float = 0.0002
+    max_position_volume: float = 10.0
+    risk_per_trade: float = 0.005
+    seed: int = 42
+
+
+if gym is not None:
+
+    class SlyTradeRLEnvironment(gym.Env):
+        """Causal feature environment with bounded target-position actions."""
+
+        metadata: dict[str, object] = {"render_modes": []}
+
+        def __init__(
+            self,
+            features: pd.DataFrame,
+            bars: pd.DataFrame,
+            config: RLEnvironmentConfig | None = None,
+            mode_vector: np.ndarray | None = None,
+            ledger: TradeLedger | None = None,
+            **_: object,
+        ):
+            if features.empty or len(features) != len(bars):
+                raise ValueError("features and bars must be non-empty and aligned")
+            required = {"time", "symbol", "open", "high", "low", "close"}
+            if not required.issubset(bars.columns):
+                raise ValueError(f"bars missing required columns: {sorted(required.difference(bars.columns))}")
+            super().__init__()
+            self.features = features.reset_index(drop=True)
+            self.bars = bars.reset_index(drop=True)
+            self.config = config or RLEnvironmentConfig()
+            self.mode_vector = mode_vector
+            shape = len(self.features.columns) + (len(mode_vector) if mode_vector is not None else 0)
+            self.observation_space = spaces.Box(-np.inf, np.inf, shape=(shape,), dtype=np.float32)
+            self.action_space = spaces.Discrete(4)
+            self.ledger = ledger or TradeLedger()
+            self.current_step = 0
+            self._position = 0
+            self._equity = self.config.initial_balance
+
+        def reset(self, *, seed: int | None = None, options: dict | None = None):
+            super().reset(seed=seed)
+            self.current_step = 0
+            self._position = 0
+            self._equity = self.config.initial_balance
+            self.ledger.records.clear()
+            return self._observation(), {}
+
+        def step(self, action: int):
+            if action not in (0, 1, 2, 3):
+                raise ValueError("action must be 0 (hold), 1 (long), 2 (short), or 3 (flatten)")
+            if self.current_step >= len(self.bars):
+                raise RuntimeError("step() called past the end of the episode; call reset()")
+            previous = float(self.bars.iloc[self.current_step]["close"])
+            target = self._position
+            if action == 1:
+                target = 1
+            elif action == 2:
+                target = -1
+            elif action == 3:
+                target = 0
+            turnover = abs(target - self._position)
+            if turnover and target:
+                intent = OrderIntent(
+                    symbol=str(self.bars.iloc[self.current_step]["symbol"]),
+                    side=Side.BUY if target > 0 else Side.SELL,
+                    volume=min(self.config.max_position_volume, self.config.risk_per_trade),
+                    reason="rl_entry",
+                )
+                self.ledger.record_fill(
+                    intent,
+                    volume=intent.volume,
+                    price=previous,
+                    commission=self.config.transaction_cost * intent.volume,
+                    realized_pnl=0.0,
+                    event_time=pd.Timestamp(self.bars.iloc[self.current_step]["time"]).to_pydatetime(),
+                )
+            self.current_step += 1
+            current = float(self.bars.iloc[min(self.current_step, len(self.bars) - 1)]["close"])
+            reward = self._equity * (target * (current - previous) / max(previous, 1e-12))
+            reward -= self._equity * turnover * self.config.transaction_cost
+            self._equity += reward
+            self._position = target
+            terminated = self.current_step >= len(self.bars) - 1 or self._equity <= 0
+            return self._observation(), float(reward), terminated, False, {
+                "equity": float(self._equity),
+                "n_trades": len(self.ledger.records),
+            }
+
+        def _observation(self) -> np.ndarray:
+            index = min(self.current_step, len(self.features) - 1)
+            row = self.features.iloc[index].to_numpy(dtype=np.float32)
+            if self.mode_vector is not None:
+                row = np.concatenate((row, np.asarray(self.mode_vector, dtype=np.float32)))
+            return np.asarray(row, dtype=np.float32)
+
+else:
+
+    class SlyTradeRLEnvironment:  # type: ignore[no-redef]
+        def __init__(self, *args: object, **kwargs: object):
+            raise ImportError("SlyTradeRLEnvironment requires the optional 'rl' dependencies")
