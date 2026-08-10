@@ -13,15 +13,19 @@ class SymbolResolution:
 
 
 def _symbol_name(symbol: Any) -> str:
+    if isinstance(symbol, dict):
+        return str(symbol.get("name", symbol))
     return str(getattr(symbol, "name", symbol))
 
 
 def _symbol_description(symbol: Any) -> str:
+    if isinstance(symbol, dict):
+        return str(symbol.get("description", ""))
     return str(getattr(symbol, "description", ""))
 
 
 def get_all_symbol_names(mt5: Any) -> list[str]:
-    symbols = mt5.symbols_get()
+    symbols = _symbols_get(mt5)
     if symbols is None:
         return []
     return sorted(_symbol_name(symbol) for symbol in symbols)
@@ -30,7 +34,7 @@ def get_all_symbol_names(mt5: Any) -> list[str]:
 def list_matching_symbols(mt5: Any, contains: str) -> list[SymbolResolution]:
     """List symbols whose name contains a case-insensitive text fragment."""
     fragment = contains.lower()
-    symbols = mt5.symbols_get()
+    symbols = _symbols_get(mt5)
     if symbols is None:
         return []
     matches: list[SymbolResolution] = []
@@ -61,7 +65,7 @@ def resolve_symbol(mt5: Any, requested: str, *, select: bool = True) -> SymbolRe
     if not requested_clean:
         raise ValueError("requested symbol cannot be empty")
 
-    symbols = mt5.symbols_get()
+    symbols = _symbols_get(mt5)
     if symbols is None:
         raise RuntimeError("mt5.symbols_get() returned None; cannot resolve symbols")
 
@@ -95,3 +99,20 @@ def resolve_symbol(mt5: Any, requested: str, *, select: bool = True) -> SymbolRe
         description=_symbol_description(raw_symbol),
         exact=rank == 0,
     )
+
+
+def _symbols_get(mt5: Any) -> list[Any]:
+    """Read symbol names safely through mt5linux's remote interpreter.
+
+    RPyC cannot pickle MetaTrader's dynamically-created ``SymbolInfo`` named
+    tuples. The bridge can evaluate a projection to plain dictionaries/strings
+    remotely, which preserves compatibility with the official local API.
+    """
+    try:
+        symbols = mt5.symbols_get()
+    except Exception:
+        container = getattr(mt5, "_container", None)
+        if container is None or not hasattr(container, "eval"):
+            raise
+        return list(container.eval("[s._asdict() for s in (mt5.symbols_get() or [])]"))
+    return list(symbols or [])

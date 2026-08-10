@@ -223,6 +223,20 @@ def attach_decision_quotes(
         raise ValueError(f"ticks missing required columns: {sorted(missing_ticks)}")
 
     bars_sorted = bars.sort_values("decision_time").reset_index(drop=True).copy()
+    # Alignment may be rerun on a previously aligned dataset. Remove stale
+    # quote columns so merge_asof produces one canonical quote projection.
+    stale_quote_columns = [
+        "quote_time",
+        "quote_bid",
+        "quote_ask",
+        "quote_mid",
+        "quote_spread",
+        "quote_age_seconds",
+        "quote_is_fresh",
+    ]
+    bars_sorted = bars_sorted.drop(
+        columns=[column for column in stale_quote_columns if column in bars_sorted.columns]
+    )
     ticks_sorted = ticks.sort_values("time_msc").reset_index(drop=True).copy()
     bars_sorted["decision_time"] = pd.to_datetime(bars_sorted["decision_time"], utc=True)
     ticks_sorted["time_msc"] = pd.to_datetime(ticks_sorted["time_msc"], utc=True)

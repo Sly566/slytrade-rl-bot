@@ -28,6 +28,19 @@ class FakeMT5:
         return True
 
 
+class BridgeMT5(FakeMT5):
+    class Container:
+        @staticmethod
+        def eval(expression: str):
+            assert "symbols_get" in expression
+            return [{"name": "XAUUSDm", "description": "Gold"}]
+
+    def symbols_get(self):
+        raise RuntimeError("Can't pickle SymbolInfo")
+
+    _container = Container()
+
+
 def test_resolve_prefers_exact_match():
     mt5 = FakeMT5()
     resolved = resolve_symbol(mt5, "XAUUSD")
@@ -56,3 +69,9 @@ def test_resolve_unknown_symbol_raises():
     mt5 = FakeMT5()
     with pytest.raises(ValueError):
         resolve_symbol(mt5, "UNKNOWN")
+
+
+def test_resolve_uses_bridge_safe_symbol_projection():
+    resolved = resolve_symbol(BridgeMT5(), "XAUUSD")
+    assert resolved.resolved == "XAUUSDm"
+    assert resolved.description == "Gold"
