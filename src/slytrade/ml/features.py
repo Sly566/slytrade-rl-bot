@@ -11,6 +11,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from slytrade.ml.volume_profile import compute_volume_profile_features
+
 ML_FEATURE_COLUMNS = [
     "ml_ret_1",
     "ml_ret_5",
@@ -24,6 +26,13 @@ ML_FEATURE_COLUMNS = [
     "ml_volume_ratio",
     "ml_high_low_range",
     "ml_body_ratio",
+    "vp_position",
+    "vp_poc_distance_atr",
+    "vp_volume_concentration",
+    "ml_upper_wick_ratio",
+    "ml_lower_wick_ratio",
+    "ml_close_location",
+    "ml_range_efficiency",
 ]
 
 ML_SCALE_COLUMNS = ML_FEATURE_COLUMNS[:-2]  # scaled features (range/body dropped)
@@ -90,11 +99,18 @@ def compute_ml_features(bars: pd.DataFrame) -> pd.DataFrame:
     out["ml_high_low_range"] = ((high - low) / close.replace(0.0, np.nan)).fillna(0.0)
     body = (close - open_).abs()
     out["ml_body_ratio"] = (body / (high - low).replace(0.0, np.nan)).fillna(0.0)
+    candle_range = (high - low).replace(0.0, np.nan)
+    out["ml_upper_wick_ratio"] = ((high - pd.concat([open_, close], axis=1).max(axis=1)) / candle_range).fillna(0.0)
+    out["ml_lower_wick_ratio"] = ((pd.concat([open_, close], axis=1).min(axis=1) - low) / candle_range).fillna(0.0)
+    out["ml_close_location"] = ((close - low) / candle_range).fillna(0.5).clip(0.0, 1.0)
+    out["ml_range_efficiency"] = (close.diff().abs() / (high - low).replace(0.0, np.nan)).fillna(0.0).clip(0.0, 10.0)
 
     # Defensive clip on ratio-type features
     for col in ["ml_volume_ratio", "ml_high_low_range", "ml_body_ratio"]:
         out[col] = out[col].clip(0.0, 10.0)
 
+    volume_profile = compute_volume_profile_features(data)
+    out = pd.concat([out, volume_profile[["vp_position", "vp_poc_distance_atr", "vp_volume_concentration"]]], axis=1)
     out = out.reindex(index=bars.index)
     out = out[ML_FEATURE_COLUMNS]
     return out
