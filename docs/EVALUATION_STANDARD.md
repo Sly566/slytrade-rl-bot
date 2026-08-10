@@ -32,3 +32,15 @@ Relevant public references:
 These references inform acceptance criteria; none is a guarantee of
 profitability. A model must pass the repository's deployment gate and remain
 behind the OMS, broker reconciliation, and risk guardrails.
+
+The executable controls are provided by `slytrade.rl.governance`:
+
+- `evaluate_seeds` aggregates independent runs with confidence intervals;
+- `evaluate_lockbox` rejects a training/lockbox hash collision;
+- `evaluate_cost_stress` evaluates identical seeds under explicit cost cases;
+- `ModelRegistry` records immutable, hash-chained registration and promotion
+  events.
+
+Online learning is intentionally not allowed to rewrite a promoted policy.
+Adaptation must produce a new content-addressed model, pass the same lockbox
+and cost-stress gates, and receive an explicit promotion decision.

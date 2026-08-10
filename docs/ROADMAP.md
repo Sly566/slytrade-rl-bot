@@ -83,8 +83,10 @@
 - [x] Backtest reporting CLI
 - [x] Baseline comparison report
 - [x] Gymnasium environment foundation with transaction costs
-- [ ] PPO baseline
-- [ ] Walk-forward validation
+- [x] PPO training hook
+- [x] Embargoed walk-forward validation scaffolding
+- [x] Multi-seed, lockbox, and cost-stress governance primitives
+- [x] Hash-chained model registry and promotion checks
 
 ## Phase 5.5: OMS / Ledger / Paper Broker
 
@@ -97,10 +99,10 @@
 ## Phase 6: Production
 
 - [x] Guarded MT5 broker adapter and read-only preflight
-- [ ] Broker reconciliation
-- [ ] Monitoring
-- [ ] Alerts
-- [ ] Kill switch
+- [x] Broker reconciliation
+- [x] Monitoring
+- [x] Alerts / soak monitoring
+- [x] Persistent kill switch and rollback artifact
 
 ## Deployment gates
 
@@ -112,3 +114,7 @@ approval checks are complete. See `docs/EVALUATION_STANDARD.md`.
 The RL environment is a foundation only; it is not a deployment approval or a
 profitability claim. Walk-forward evaluation and model governance remain
 mandatory before any policy can influence orders.
+The governance primitives are implemented in `slytrade.rl.governance`, while
+paper/shadow soak and rollback controls are in `slytrade.monitoring.operations`.
+These components enforce evidence collection; they do not manufacture a
+profitability edge or permit unsafe online self-modification.

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+from pathlib import Path
 
 from slytrade.execution.models import OrderIntent
+from slytrade.monitoring.operations import PersistentKillSwitch
 
 
 @dataclass(frozen=True)
@@ -22,18 +24,21 @@ class GuardrailDecision:
 
 
 class TradingGuardrails:
-    def __init__(self, config: GuardrailConfig, initial_equity: float):
+    def __init__(self, config: GuardrailConfig, initial_equity: float, *, kill_switch_path: str | Path | None = None):
         self.config = config
         self.initial_equity = float(initial_equity)
         self.peak_equity = float(initial_equity)
-        self.kill_switch = False
+        self._persistent_kill_switch = (
+            PersistentKillSwitch(kill_switch_path) if kill_switch_path is not None else None
+        )
+        self.kill_switch = bool(self._persistent_kill_switch and self._persistent_kill_switch.active)
         self.session_date: date | None = None
         self.session_start_equity = float(initial_equity)
 
     def observe_equity(self, equity: float, *, current_date: date | None = None) -> GuardrailDecision:
         """Track equity and activate the kill switch on configured drawdowns."""
         if equity <= 0:
-            self.kill_switch = True
+            self._activate_kill_switch("equity must remain positive")
             return GuardrailDecision(False, "equity must remain positive")
         day = current_date or date.today()
         if self.session_date is None:
@@ -46,12 +51,27 @@ class TradingGuardrails:
         daily_dd = (self.session_start_equity - equity) / max(self.session_start_equity, 1e-9)
         total_dd = (self.peak_equity - equity) / max(self.peak_equity, 1e-9)
         if daily_dd >= self.config.max_daily_drawdown:
-            self.kill_switch = True
+            self._activate_kill_switch("max daily drawdown breached")
             return GuardrailDecision(False, "max daily drawdown breached")
         if total_dd >= self.config.max_total_drawdown:
-            self.kill_switch = True
+            self._activate_kill_switch("max total drawdown breached")
             return GuardrailDecision(False, "max total drawdown breached")
         return GuardrailDecision(True)
+
+    def _activate_kill_switch(self, reason: str) -> None:
+        self.kill_switch = True
+        if self._persistent_kill_switch is not None:
+            self._persistent_kill_switch.activate(reason)
+
+    @property
+    def kill_switch_reason(self) -> str | None:
+        return self._persistent_kill_switch.reason if self._persistent_kill_switch is not None else None
+
+    def clear_kill_switch(self) -> None:
+        """Explicitly re-arm trading after an operator has reviewed the incident."""
+        if self._persistent_kill_switch is not None:
+            self._persistent_kill_switch.clear()
+        self.kill_switch = False
 
     def approve_order(
         self,
