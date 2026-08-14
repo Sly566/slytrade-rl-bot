@@ -101,12 +101,39 @@ docker compose run --rm slytrade doctor
 docker compose --profile dev run --rm dev pytest
 ```
 
-`data/` and `logs/` are the only writable bind mounts. Never put credentials
-in the image; use an untracked `.env` file or an orchestrator secret store.
-The MT5 terminal and Linux bridge remain external services and must be
-reachable from the container before any broker preflight. Containerization
-does not bypass reconciliation, freshness, model-governance, paper-soak, or
-manual-approval gates.
+`data/`, `logs/` and `state/` are the only writable bind mounts. Never put
+credentials in the image; use an untracked `.env` file or an orchestrator
+secret store. The MT5 terminal and Linux bridge remain external services and
+must be reachable from the container before any broker preflight.
+Containerization does not bypass reconciliation, freshness, model-governance,
+paper-soak, or manual-approval gates.
+
+## Paper trading & observability (production runtime)
+
+```bash
+slytrade paper                              # live quotes via the MT5 bridge
+slytrade paper --replay-ticks data/ticks.parquet   # deterministic replay
+slytrade serve                              # Prometheus metrics + /healthz + /readyz
+slytrade reconcile --symbol XAUUSD          # scheduled broker reconciliation (exit 0/2)
+slytrade train-rl --algorithm ppo|sac|td3   # RL training (PPO/SAC/TD3 + optional MLflow)
+```
+
+- Orders flow through the full guarded path: strategy → guardrails → OMS → paper
+  broker → portfolio → ledger, with a persistent kill switch, loss circuit breaker,
+  session window, red-folder news gate, risk-budgeted sizing and SQLite journaling
+  (restart-safe).
+- Operator alerts: generic webhook + Telegram (see `.env.example`).
+- Metrics: `http://<host>:9108/metrics`, `/healthz`, `/readyz`.
+
+## Container & Kubernetes deployment
+
+```bash
+docker compose up -d slytrade               # paper loop + metrics on :9108
+kubectl apply -k deploy/kubernetes          # namespace + deployment + service + CronJob
+```
+
+See `docs/PRODUCTION_DEPLOYMENT.md`, `docs/COMPETITOR_BENCHMARK.md` and
+`ANALYSIS_REPORT.md`.
 
 ## Safety Notice
 

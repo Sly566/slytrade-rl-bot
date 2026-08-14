@@ -103,6 +103,34 @@
 - [x] Monitoring
 - [x] Alerts / soak monitoring
 - [x] Persistent kill switch and rollback artifact
+- [x] Paper-trading runtime loop (replay + live MT5 quote providers)
+- [x] Loss circuit breaker (consecutive losses, daily loss/trade caps, cooldown)
+- [x] Trading-window (session) enforcement
+- [x] Risk-budgeted + fractional-Kelly position sizing
+- [x] Structured JSON logging
+- [x] Prometheus metrics + /healthz + /readyz server
+- [x] Fail-closed runtime settings (env-driven, validated)
+- [x] Multi-stage non-root Docker image with healthcheck
+- [x] docker-compose (init + paper + doctor)
+- [x] Kubernetes manifests (kustomize) + Prometheus scrape annotations
+- [x] systemd unit (hardened) for non-container hosts
+- [x] CI: container build + coverage threshold
+
+## Phase 7: Evidence & hardening
+
+- [x] RL algorithm breadth (SAC/TD3) behind the existing governance layer
+- [x] MLflow experiment tracking wired to `train_rl` (opt-in)
+- [x] Automated broker reconciliation job (`slytrade reconcile` + CronJob)
+- [x] Economic-calendar / news gate for red-folder avoidance
+- [x] Webhook + Telegram alerting on kill-switch, soak and broker errors
+
+## Phase 8: Outstanding (not yet done)
+
+- [ ] Recurrent policy for regime memory
+- [ ] Swap/margin/holiday handling in the live adapter
+- [ ] PVC-backed durable state for Kubernetes
+- [ ] Multi-symbol paper portfolio (parallel loops)
+- [ ] Calendar-feed integration for the news gate (explicit events today)
 
 ## Deployment gates
 

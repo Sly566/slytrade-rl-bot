@@ -1,21 +1,33 @@
+# Version control & CI
 .git
+.gitignore
+
+# Python runtime caches
 .venv
 venv
 __pycache__
+*.pyc
+*.pyo
 .pytest_cache
 .mypy_cache
 .ruff_cache
-*.pyc
-*.pyo
-data/raw
-data/processed
-data/features
-data/models
-data/journal
+*.egg-info
+
+# Data, artifacts and secrets
+data
+state
 logs
+reports
 .env
 *.parquet
 *.npy
 *.npz
 *.pt
 *.zip
+*.csv.gz
+*.db
+
+# Transport artifacts (kept out of the image build context)
+apply_and_commit.sh
+slytrade-upgrade.patch
+*.patch

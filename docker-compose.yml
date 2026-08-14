@@ -1,4 +1,6 @@
 services:
+  # Production paper-trading service (default). Runs the supervised loop with
+  # Prometheus metrics on :9108. Fail-closed: live trading stays disabled.
   slytrade:
     build:
       context: .
@@ -10,22 +12,29 @@ services:
     read_only: true
     tmpfs:
       - /tmp:size=256m,noexec,nosuid
-    command: ["doctor"]
+    command: ["paper"]
     environment:
       SLYTRADE_ENV: production
       SLYTRADE_ALLOW_LIVE: "0"
+      SLYTRADE_STAGE: paper
+      SLYTRADE_SYMBOL: "${SLYTRADE_SYMBOL:-XAUUSD}"
+      SLYTRADE_TIMEFRAME: "${SLYTRADE_TIMEFRAME:-M1}"
       SLYTRADE_METRICS_PORT: "9108"
+      SLYTRADE_METRICS_BIND: "0.0.0.0"
     volumes:
       - ./configs:/app/configs:ro
       - ./data:/app/data
       - ./logs:/app/logs
+      - ./state:/app/state
+    ports:
+      - "9108:9108"
     healthcheck:
-      test: ["CMD", "python", "-m", "slytrade.cli", "doctor"]
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9108/healthz', timeout=5).status == 200 else 1)"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 20s
-    restart: "no"
+    restart: unless-stopped
 
   # Development and CI image. It is opt-in so a production compose up never
   # mounts source or test code into the runtime container.

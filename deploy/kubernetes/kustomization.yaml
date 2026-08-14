@@ -1,0 +1,27 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: slytrade
+
+resources:
+  - namespace.yaml
+  - deployment.yaml
+  - service.yaml
+  - cronjob-reconcile.yaml
+
+# The trading configs are baked into the image but re-mounted here from a
+# ConfigMap so operators can adjust risk/personality without rebuilding.
+configMapGenerator:
+  - name: slytrade-config
+    files:
+      - ../../configs/assets.yaml
+      - ../../configs/broker.yaml
+      - ../../configs/data.yaml
+      - ../../configs/risk.yaml
+      - ../../configs/training.yaml
+      - ../../configs/trader_personality.yaml
+
+images:
+  - name: slytrade-rl-bot
+    newName: slytrade-rl-bot
+    newTag: latest

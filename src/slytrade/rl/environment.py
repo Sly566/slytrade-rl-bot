@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -9,15 +8,12 @@ import pandas as pd
 from slytrade.execution.ledger import TradeLedger
 from slytrade.execution.models import OrderIntent, Side
 
-gym: Any
-spaces: Any
-
 try:
     import gymnasium as gym
     from gymnasium import spaces
 except ImportError:  # pragma: no cover
-    gym = None
-    spaces = None
+    gym = None  # type: ignore[assignment]
+    spaces = None  # type: ignore[assignment]
 
 
 @dataclass(frozen=True)

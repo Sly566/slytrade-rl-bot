@@ -504,27 +504,37 @@ def persona_backtest(
 @app.command()
 def train_rl(
     bars_file: str = typer.Option(..., help="Aligned bars file with decision quote / ICT columns (.csv or .parquet)"),
-    total_timesteps: int = typer.Option(100_000, help="Number of PPO training steps"),
+    algorithm: str = typer.Option("ppo", help="RL algorithm: ppo, sac, or td3"),
+    total_timesteps: int = typer.Option(100_000, help="Number of training steps"),
     seed: int = typer.Option(42, help="Random seed"),
-    learning_rate: float = typer.Option(3e-4, help="PPO learning rate"),
+    learning_rate: float = typer.Option(3e-4, help="Learning rate"),
     n_steps: int = typer.Option(1024, help="PPO rollout buffer length"),
     batch_size: int = typer.Option(64, help="PPO minibatch size"),
     n_epochs: int = typer.Option(10, help="PPO epochs per rollout"),
-    gamma: float = typer.Option(0.99, help="PPO discount factor"),
+    gamma: float = typer.Option(0.99, help="Discount factor"),
     gae_lambda: float = typer.Option(0.95, help="PPO GAE lambda"),
     model_dir: str = typer.Option("models/rl", help="Directory to save the trained policy"),
     symbol: str | None = typer.Option(None, help="Symbol override if the file contains multiple symbols"),
     personality_file: str = typer.Option("configs/trader_personality.yaml", help="Trader personality YAML path"),
 ) -> None:
-    """Train a PPO policy on the SlyTrade RL environment.
+    """Train a policy (PPO/SAC/TD3) on the SlyTrade RL environment.
 
     Requires the `rl` optional dependencies (gymnasium, stable-baselines3,
     torch). The environment uses the causal feature stack and a no-leakage
-    scaler fitted on the training slice.
+    scaler fitted on the training slice. If MLflow is installed the run is
+    recorded as an experiment.
     """
     from slytrade.backtest.reporting import load_bars_file
     from slytrade.rl.dataset import build_rl_dataset
-    from slytrade.rl.walkforward import evaluate_ppo, train_ppo
+    from slytrade.rl.tracking import maybe_end_run, maybe_log_metrics, maybe_log_params, maybe_start_run
+    from slytrade.rl.walkforward import (
+        evaluate_policy,
+        resolve_algorithm,
+        train_policy,
+        train_ppo,
+    )
+
+    algorithm = resolve_algorithm(algorithm)
 
     bars = load_bars_file(Path(bars_file))
     resolved_symbol = infer_symbol(bars, symbol)
@@ -532,23 +542,57 @@ def train_rl(
     dataset = build_rl_dataset(bars)
     scaler_params = dataset.fit_scaler(0, len(dataset.bars))
     env = dataset.env_factory(0, len(dataset.bars), seed=seed, scaler_params=scaler_params)
-    model = train_ppo(
-        env,
-        total_timesteps=total_timesteps,
-        seed=seed,
-        learning_rate=learning_rate,
-        n_steps=n_steps,
-        batch_size=batch_size,
-        n_epochs=n_epochs,
-        gamma=gamma,
-        gae_lambda=gae_lambda,
-        model_dir=model_dir,
+
+    run = maybe_start_run("slytrade-rl", run_name=f"{algorithm}-{resolved_symbol}-{seed}")
+    maybe_log_params(
+        run,
+        {
+            "algorithm": algorithm,
+            "symbol": resolved_symbol,
+            "seed": seed,
+            "total_timesteps": total_timesteps,
+            "learning_rate": learning_rate,
+            "gamma": gamma,
+            "bars": len(dataset.bars),
+        },
     )
+    try:
+        if algorithm == "ppo":
+            model = train_ppo(
+                env,
+                total_timesteps=total_timesteps,
+                seed=seed,
+                learning_rate=learning_rate,
+                n_steps=n_steps,
+                batch_size=batch_size,
+                n_epochs=n_epochs,
+                gamma=gamma,
+                gae_lambda=gae_lambda,
+                model_dir=model_dir,
+            )
+        else:
+            model = train_policy(
+                algorithm,
+                env,
+                total_timesteps=total_timesteps,
+                seed=seed,
+                model_dir=model_dir,
+                policy_kwargs={"learning_rate": learning_rate, "gamma": gamma},
+            )
 
+        results = evaluate_policy(model, env, episodes=3, seed=seed)
+        maybe_log_metrics(
+            run,
+            {
+                "mean_total_return": float(results["mean_total_return"]),
+                "mean_max_drawdown": float(results["mean_max_drawdown"]),
+                "mean_n_trades": float(results["mean_n_trades"]),
+            },
+        )
+    finally:
+        maybe_end_run(run)
 
-
-    results = evaluate_ppo(model, env, episodes=3, seed=seed)
-    console.print(f"[green]Trained PPO policy saved to {model_dir}.zip[/green]")
+    console.print(f"[green]Trained {algorithm.upper()} policy saved to {model_dir}.zip[/green]")
     console.print(f"Mean total return: {results['mean_total_return']:.4f}")
     console.print(f"Mean max drawdown: {results['mean_max_drawdown']:.4f}")
     console.print(f"Mean trades per episode: {results['mean_n_trades']:.1f}")
@@ -1072,9 +1116,163 @@ def inspect_data(
 
 
 @app.command()
+def paper(
+    symbol: str | None = typer.Option(None, help="Symbol override (default from SLYTRADE_SYMBOL / XAUUSD)"),
+    timeframe: str | None = typer.Option(None, help="Bar timeframe for signal decisions (default M1)"),
+    replay_ticks: str | None = typer.Option(None, help="Replay a canonical ticks file (.csv/.parquet) instead of live MT5"),
+    max_bars: int = typer.Option(0, help="Stop after N bars (0 = run until stopped)"),
+    max_seconds: float = typer.Option(0.0, help="Stop after N seconds (0 = run until stopped)"),
+) -> None:
+    """Run the guarded paper-trading loop.
+
+    Without ``--replay-ticks`` the loop connects to the MT5 bridge and streams
+    live quotes. Orders flow through the full production path: strategy ->
+    guardrails -> OMS -> paper broker -> portfolio -> ledger, with a persistent
+    kill switch, loss circuit breaker, session window, news gate and Prometheus
+    metrics. This command never places real orders.
+    """
+    from slytrade.runtime.metrics_server import MetricsServer
+    from slytrade.runtime.paper_loop import (
+        MT5QuoteProvider,
+        PaperTradingLoop,
+        ReplayQuoteProvider,
+    )
+    from slytrade.runtime.settings import RuntimeSettings
+
+    settings = RuntimeSettings()
+    if symbol:
+        settings.symbol = symbol
+    if timeframe:
+        settings.timeframe = timeframe
+
+    if replay_ticks:
+        from slytrade.backtest.reporting import load_ticks_file
+
+        ticks = load_ticks_file(Path(replay_ticks))
+        provider: object = ReplayQuoteProvider(ticks, symbol=settings.symbol)
+    else:
+        provider = MT5QuoteProvider(settings.symbol, load_mt5(), poll_seconds=settings.poll_seconds)
+
+    loop = PaperTradingLoop(settings, provider)  # type: ignore[arg-type]
+
+    server: MetricsServer | None = None
+    if settings.metrics_enabled:
+        server = MetricsServer(
+            port=settings.metrics_port,
+            bind=settings.metrics_bind,
+            metrics=loop.metrics,
+            readiness=lambda: (not loop.guardrails.kill_switch, "kill switch active" if loop.guardrails.kill_switch else "ok"),
+        )
+        server.start()
+        console.print(f"[green]Metrics:[/green] http://{settings.metrics_bind}:{settings.metrics_port}/metrics")
+
+    try:
+        summary = loop.run(max_bars=max_bars or None, max_seconds=max_seconds)
+    finally:
+        if server is not None:
+            server.stop()
+
+    table = Table(title="Paper trading summary")
+    for key, value in summary.__dict__.items():
+        table.add_row(key, str(value))
+    console.print(table)
+
+
+@app.command()
+def serve(
+    port: int | None = typer.Option(None, help="Metrics port (default SLYTRADE_METRICS_PORT=9108)"),
+) -> None:
+    """Run the Prometheus metrics + health server standalone.
+
+    Useful as a sidecar or for validating the observability surface before
+    deploying the full paper loop.
+    """
+    import time
+
+    from slytrade.runtime.metrics_server import MetricsServer, TradingMetrics
+    from slytrade.runtime.settings import RuntimeSettings
+
+    settings = RuntimeSettings()
+    metrics = TradingMetrics()
+    metrics.equity.set(0.0)
+    server = MetricsServer(port=port or settings.metrics_port, bind=settings.metrics_bind, metrics=metrics)
+    server.start()
+    console.print(f"[green]Serving[/green] http://{settings.metrics_bind}:{port or settings.metrics_port}")
+    console.print("Endpoints: /metrics  /healthz  /readyz")
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        console.print("Stopping metrics server")
+    finally:
+        server.stop()
+
+
+@app.command()
+def reconcile(
+    symbol: str = typer.Option("XAUUSD", help="Broker symbol to validate"),
+    expected_position: list[str] = MT5_EXPECTED_POSITION_OPTION,
+) -> None:
+    """Read-only broker reconciliation; exit 0 if reconciled, 2 otherwise.
+
+    Designed for scheduled runs (cron / Kubernetes CronJob). Compares broker
+    orders/positions against the expected state without placing any orders.
+    """
+    from slytrade.brokers.mt5_adapter import MT5BrokerAdapter
+    from slytrade.execution.oms import OrderManagementSystem
+    from slytrade.risk.guardrails import GuardrailConfig, TradingGuardrails
+
+    expected_positions: dict[str, float] = {}
+    for item in expected_position:
+        try:
+            position_symbol, raw_volume = item.split("=", 1)
+            expected_positions[position_symbol.strip()] = float(raw_volume)
+        except ValueError as exc:
+            raise typer.BadParameter(f"expected position must be SYMBOL=SIGNED_VOLUME, got {item!r}") from exc
+
+    mt5 = load_mt5()
+    adapter = MT5BrokerAdapter(
+        mt5,
+        oms=OrderManagementSystem(),
+        guardrails=TradingGuardrails(config=GuardrailConfig(), initial_equity=1.0),
+        allow_trading=False,
+        expected_positions=expected_positions,
+    )
+    try:
+        adapter.connect()
+        resolved = adapter.resolve_symbol(symbol)
+        result = adapter.reconcile()
+        console.print(f"[bold]Reconciliation[/bold] {symbol} -> {resolved}")
+        console.print(
+            f"broker positions={result.broker_positions} broker orders={result.broker_orders} "
+            f"local open={result.local_open_orders}"
+        )
+        if result.reconciled:
+            console.print("[green]RECONCILED[/green]")
+        else:
+            console.print(f"[red]BLOCKED: {result.detail}[/red]")
+            raise typer.Exit(code=2)
+    finally:
+        adapter.disconnect()
+
+
+@app.command()
 def live() -> None:
-    """Live trading placeholder."""
-    console.print("[bold red]Live trading is disabled at bootstrap stage.[/bold red]")
+    """Live trading entry point (fail-closed by design).
+
+    Live trading stays disabled until the deployment gate in
+    ``slytrade.monitoring.gates`` is satisfied AND ``SLYTRADE_ALLOW_LIVE=1`` is
+    set. Use ``slytrade paper`` for supervised paper trading first.
+    """
+    from slytrade.runtime.settings import RuntimeSettings
+
+    settings = RuntimeSettings()
+    if not settings.allow_live:
+        console.print("[bold red]Live trading is disabled.[/bold red]")
+        console.print("Set SLYTRADE_ALLOW_LIVE=1 only after the deployment gate is approved.")
+        console.print("Run `slytrade paper` for supervised paper trading.")
+        raise typer.Exit(code=1)
+    console.print("[bold yellow]Live trading requires the approved deployment gate.[/bold yellow]")
     raise typer.Exit(code=1)
 
 

@@ -1,0 +1,104 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: slytrade-paper
+  namespace: slytrade
+  labels:
+    app.kubernetes.io/name: slytrade
+    app.kubernetes.io/component: paper-trader
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: slytrade
+      app.kubernetes.io/component: paper-trader
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: slytrade
+        app.kubernetes.io/component: paper-trader
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9108"
+        prometheus.io/path: /metrics
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: paper
+          image: slytrade-rl-bot:latest
+          imagePullPolicy: IfNotPresent
+          args: ["paper"]
+          env:
+            - name: SLYTRADE_ENV
+              value: "production"
+            - name: SLYTRADE_STAGE
+              value: "paper"
+            - name: SLYTRADE_ALLOW_LIVE
+              value: "0"
+            - name: SLYTRADE_SYMBOL
+              value: "XAUUSD"
+            - name: SLYTRADE_TIMEFRAME
+              value: "M1"
+            - name: SLYTRADE_LOG_LEVEL
+              value: "INFO"
+            - name: SLYTRADE_METRICS_PORT
+              value: "9108"
+            - name: SLYTRADE_METRICS_BIND
+              value: "0.0.0.0"
+          ports:
+            - name: metrics
+              containerPort: 9108
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: configs
+              mountPath: /app/configs
+              readOnly: true
+            - name: state
+              mountPath: /app/state
+            - name: logs
+              mountPath: /app/logs
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: configs
+          configMap:
+            name: slytrade-config
+        - name: state
+          emptyDir: {}
+        - name: logs
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}

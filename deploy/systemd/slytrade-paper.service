@@ -1,0 +1,44 @@
+# SlyTrade paper-trading loop as a systemd service (non-container hosts).
+#
+# Install:
+#   sudo cp deploy/systemd/slytrade-paper.service /etc/systemd/system/
+#   sudo useradd --system --home /opt/slytrade slytrade
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now slytrade-paper
+#
+# The service is hardened: it runs as a dedicated user, in a private /tmp, with
+# no new privileges, and refuses to start if SLYTRADE_ALLOW_LIVE is set.
+
+[Unit]
+Description=SlyTrade RL Bot - supervised paper trading loop
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=slytrade
+Group=slytrade
+WorkingDirectory=/opt/slytrade
+EnvironmentFile=/opt/slytrade/.env
+Environment=SLYTRADE_ENV=production
+Environment=SLYTRADE_ALLOW_LIVE=0
+Environment=SLYTRADE_STAGE=paper
+Environment=SLYTRADE_METRICS_BIND=0.0.0.0
+Environment=SLYTRADE_METRICS_PORT=9108
+ExecStart=/opt/slytrade/.venv/bin/python -m slytrade.cli paper
+Restart=on-failure
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/slytrade/data /opt/slytrade/logs /opt/slytrade/state
+CapabilityBoundingSet=
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

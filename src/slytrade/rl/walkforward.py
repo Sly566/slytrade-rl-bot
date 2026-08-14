@@ -148,6 +148,68 @@ def train_ppo(
     return model
 
 
+SUPPORTED_ALGORITHMS: tuple[str, ...] = ("ppo", "sac", "td3")
+
+
+def resolve_algorithm(algorithm: str) -> str:
+    """Normalise and validate an RL algorithm name (fail-fast, no imports)."""
+    normalized = algorithm.strip().lower()
+    if normalized not in SUPPORTED_ALGORITHMS:
+        raise ValueError(f"unsupported algorithm {algorithm!r}; choose from {SUPPORTED_ALGORITHMS}")
+    return normalized
+
+
+def _sb3_class(algorithm: str):
+    """Lazily resolve the stable-baselines3 class for a supported algorithm."""
+    normalized = resolve_algorithm(algorithm)
+    if normalized == "ppo":
+        from stable_baselines3 import PPO
+
+        return PPO
+    if normalized == "sac":
+        from stable_baselines3 import SAC
+
+        return SAC
+    from stable_baselines3 import TD3
+
+    return TD3
+
+
+def train_policy(
+    algorithm: str,
+    env: SlyTradeRLEnvironment,
+    *,
+    total_timesteps: int = 100_000,
+    seed: int = 42,
+    model_dir: str | None = None,
+    policy_kwargs: dict | None = None,
+    verbose: int = 0,
+):
+    """Train a policy with any supported algorithm (PPO/SAC/TD3).
+
+    All stable-baselines3 imports are lazy so the core package keeps working
+    without the `rl` extras. Algorithm-specific hyperparameters are passed via
+    ``policy_kwargs`` (the caller decides what makes sense for the algorithm).
+    """
+    cls = _sb3_class(algorithm)
+    model = cls("MlpPolicy", env, seed=seed, policy_kwargs=policy_kwargs or {}, verbose=verbose)
+    model.learn(total_timesteps=total_timesteps)
+    if model_dir:
+        model.save(model_dir)
+    return model
+
+
+def evaluate_policy(
+    model,
+    env: SlyTradeRLEnvironment,
+    *,
+    episodes: int = 5,
+    seed: int = 7,
+) -> dict:
+    """Run ``episodes`` episodes with a trained policy and return summary stats."""
+    return evaluate_ppo(model, env, episodes=episodes, seed=seed)
+
+
 def evaluate_ppo(
     model,
     env: SlyTradeRLEnvironment,

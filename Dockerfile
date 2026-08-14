@@ -26,7 +26,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     SLYTRADE_ENV=production \
-    SLYTRADE_ALLOW_LIVE=0
+    SLYTRADE_ALLOW_LIVE=0 \
+    SLYTRADE_METRICS_PORT=9108 \
+    SLYTRADE_METRICS_BIND=0.0.0.0
 
 WORKDIR /app
 
@@ -46,25 +48,31 @@ RUN python -m pip install --no-cache-dir /wheels/* \
 
 COPY configs /app/configs
 COPY src /app/src
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
 
 RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin slytrade \
-    && mkdir -p /app/data /app/logs \
+    && mkdir -p /app/data /app/logs /app/state \
     && chown -R slytrade:slytrade /app
 
 USER slytrade
 
+# Liveness/readiness comes from the in-process metrics server (:9108), which the
+# paper loop exposes on /healthz and /readyz.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
-    CMD ["python", "-m", "slytrade.cli", "doctor"]
+    CMD ["python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9108/healthz', timeout=5).status == 200 else 1)"]
 
-ENTRYPOINT ["python", "-m", "slytrade.cli"]
-CMD ["doctor"]
+# Fail-closed entrypoint: refuses to boot if SLYTRADE_ALLOW_LIVE=1 without
+# SLYTRADE_STAGE=demo. Default command runs the supervised paper loop.
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["paper"]
 
 
 FROM runtime AS production
 
 # Production is deliberately fail-closed. Enabling live execution requires an
 # explicit environment override plus all application deployment gates.
-CMD ["doctor"]
+CMD ["paper"]
 
 
 FROM runtime AS development

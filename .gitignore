@@ -14,12 +14,15 @@ data/features/
 data/models/
 data/journal/
 logs/
+state/
+reports/
 *.parquet
 *.npy
 *.npz
 *.pt
 *.zip
 *.csv.gz
+*.db
 
 # Secrets
 .env
@@ -37,6 +40,9 @@ dist/
 
 # Temporary patch files
 *.patch
+
+# Transport scripts (one-time deploy helpers, never committed)
+/apply_and_commit.sh
 
 # Generated local/demo data
 data/samples/
