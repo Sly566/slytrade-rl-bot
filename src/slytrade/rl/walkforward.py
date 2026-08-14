@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pandas as pd
@@ -103,6 +103,47 @@ def make_walk_forward_folds(
     return folds
 
 
+@dataclass(frozen=True)
+class FoldWindows:
+    train_window: int
+    validation_window: int
+    test_window: int
+    embargo: int
+    step: int | None = None
+
+
+def resolve_fold_windows(
+    total: int,
+    *,
+    train_window: int = 200_000,
+    validation_window: int = 50_000,
+    test_window: int = 50_000,
+    embargo: int = 500,
+    step: int | None = None,
+) -> FoldWindows:
+    """Return walk-forward windows that fit the dataset, scaling down if needed.
+
+    When the requested windows are larger than the dataset (a common case for
+    short lookbacks), shrink them proportionally so the pipeline still runs
+    instead of raising.
+    """
+    required = train_window + validation_window + test_window + 2 * embargo
+    if required <= total:
+        return FoldWindows(train_window, validation_window, test_window, embargo, step)
+    available = max(total - 2 * embargo, 3)
+    factor = available / (train_window + validation_window + test_window)
+    tw = max(100, int(train_window * factor))
+    vw = max(50, int(validation_window * factor))
+    sw = max(50, int(test_window * factor))
+    return FoldWindows(
+        train_window=tw,
+        validation_window=vw,
+        test_window=sw,
+        embargo=min(embargo, max(0, (total - tw - vw - sw) // 2)),
+        step=step if step is None else min(step, max(sw, 1)),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Training (stable-baselines3, lazy import)
 # ---------------------------------------------------------------------------
@@ -125,26 +166,49 @@ def train_ppo(
 ):
     """Train a PPO policy on the environment. Returns the trained model.
 
-    ``policy_type`` selects the network: "mlp" (default) or "lstm" (recurrent,
-    for regime memory). All stable-baselines3 imports happen here so importing
-    this module never requires torch/SB3 to be installed.
+    ``policy_type`` selects the network: "mlp" (default, core SB3) or "lstm"
+    (recurrent, regime memory). LSTM policies are NOT part of core
+    stable-baselines3 — they live in ``sb3-contrib`` (RecurrentPPO), so the
+    ``rl`` extra must include ``sb3-contrib``.
     """
-    from stable_baselines3 import PPO
+    normalized = policy_type.strip().lower()
+    model: Any
+    if normalized in ("lstm", "recurrent", "mlplstm"):
+        try:
+            from sb3_contrib import RecurrentPPO  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise ImportError(
+                "LSTM policies require sb3-contrib. Install it with:  pip install 'slytrade-rl-bot[rl]'"
+            ) from exc
+        model = RecurrentPPO(
+            "MlpLstmPolicy",
+            env,
+            learning_rate=learning_rate,
+            n_steps=n_steps,
+            batch_size=batch_size,
+            n_epochs=n_epochs,
+            gamma=gamma,
+            gae_lambda=gae_lambda,
+            seed=seed,
+            policy_kwargs=policy_kwargs or {},
+            verbose=verbose,
+        )
+    else:
+        from stable_baselines3 import PPO
 
-    policy = _policy_class(policy_type)
-    model = PPO(
-        policy,
-        env,
-        learning_rate=learning_rate,
-        n_steps=n_steps,
-        batch_size=batch_size,
-        n_epochs=n_epochs,
-        gamma=gamma,
-        gae_lambda=gae_lambda,
-        seed=seed,
-        policy_kwargs=policy_kwargs or {},
-        verbose=verbose,
-    )
+        model = PPO(
+            "MlpPolicy",
+            env,
+            learning_rate=learning_rate,
+            n_steps=n_steps,
+            batch_size=batch_size,
+            n_epochs=n_epochs,
+            gamma=gamma,
+            gae_lambda=gae_lambda,
+            seed=seed,
+            policy_kwargs=policy_kwargs or {},
+            verbose=verbose,
+        )
     model.learn(total_timesteps=total_timesteps)
     if model_dir:
         model.save(model_dir)
@@ -204,9 +268,10 @@ def train_policy(
     without the `rl` extras. Algorithm-specific hyperparameters are passed via
     ``policy_kwargs`` (the caller decides what makes sense for the algorithm).
     """
+    if policy_type.strip().lower() in ("lstm", "recurrent", "mlplstm"):
+        raise ValueError("LSTM/recurrent policies are only supported for PPO; use train_ppo with policy_type='lstm'")
     cls = _sb3_class(algorithm)
-    policy = _policy_class(policy_type) if algorithm == "ppo" else "MlpPolicy"
-    model = cls(policy, env, seed=seed, policy_kwargs=policy_kwargs or {}, verbose=verbose)
+    model = cls("MlpPolicy", env, seed=seed, policy_kwargs=policy_kwargs or {}, verbose=verbose)
     model.learn(total_timesteps=total_timesteps)
     if model_dir:
         model.save(model_dir)
@@ -247,8 +312,13 @@ def evaluate_ppo(
         equity_curve = [env.config.initial_balance]
         done = False
         truncated = False
+        recurrent_state = None
+        episode_start = True
         while not done and not truncated:
-            action, _ = model.predict(obs, deterministic=True)
+            action, recurrent_state = model.predict(
+                obs, state=recurrent_state, episode_start=episode_start, deterministic=True
+            )
+            episode_start = False
             obs, reward, done, truncated, info = env.step(int(action))
             episode_return += reward
             equity_curve.append(info["equity"])

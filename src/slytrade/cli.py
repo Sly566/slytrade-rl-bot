@@ -565,19 +565,32 @@ def walk_forward(
     """
     from slytrade.backtest.reporting import load_bars_file
     from slytrade.rl.dataset import build_rl_dataset
-    from slytrade.rl.walkforward import make_walk_forward_folds, walk_forward_validation
+    from slytrade.rl.walkforward import make_walk_forward_folds, resolve_fold_windows, walk_forward_validation
 
     bars = load_bars_file(Path(bars_file))
     resolved_symbol = infer_symbol(bars, symbol)
     bars = bars[bars["symbol"] == resolved_symbol].copy()
     dataset = build_rl_dataset(bars)
-    folds = make_walk_forward_folds(
+    windows = resolve_fold_windows(
         len(dataset.bars),
         train_window=train_window,
         validation_window=validation_window,
         test_window=test_window,
         embargo=embargo,
         step=step,
+    )
+    if windows.train_window != train_window:
+        console.print(
+            f"[yellow]Dataset has {len(dataset.bars)} bars; scaling walk-forward windows to "
+            f"train={windows.train_window} val={windows.validation_window} test={windows.test_window}.[/yellow]"
+        )
+    folds = make_walk_forward_folds(
+        len(dataset.bars),
+        train_window=windows.train_window,
+        validation_window=windows.validation_window,
+        test_window=windows.test_window,
+        embargo=windows.embargo,
+        step=windows.step,
     )
     table = walk_forward_validation(dataset, folds, total_timesteps=total_timesteps, seed=seed, reward_type=reward, policy_type=policy)
     console.print(table.to_string(index=False))

@@ -98,6 +98,25 @@ def find_exness_ticks(symbol: str, root: str | Path = "data/raw") -> list[Path]:
     return sorted([p for p in symbol_dir.rglob("*") if p.suffix.lower() in (".parquet", ".csv")])
 
 
+def find_merged_ticks(symbol: str, root: str | Path = "data/raw") -> list[Path]:
+    symbol_dir = _symbol_dir(root, "merged_ticks", symbol)
+    if symbol_dir is None:
+        return []
+    return sorted([p for p in symbol_dir.rglob("*") if p.suffix.lower() in (".parquet", ".csv")])
+
+
+def load_merged_ticks(symbol: str, root: str | Path = "data/raw") -> pd.DataFrame:
+    """Load merged ticks (Exness history + MT5 recent), the preferred tick set."""
+    files = find_merged_ticks(symbol, root)
+    if not files:
+        raise FileNotFoundError(f"no merged ticks for {symbol} under {root}")
+    frames = [pd.read_parquet(p) if p.suffix == ".parquet" else pd.read_csv(p) for p in files]
+    frame = pd.concat(frames, ignore_index=True)
+    if "time_msc" in frame.columns:
+        frame = frame.drop_duplicates(subset=["time_msc"]).sort_values("time_msc")
+    return frame.reset_index(drop=True)
+
+
 def load_collected_bars(symbol: str, timeframe: str, root: str | Path = "data/raw") -> pd.DataFrame:
     files = find_collected_bars(symbol, timeframe, root)
     if not files:
@@ -192,10 +211,13 @@ def collect_all(
 ) -> TaskResult:
     """Collect bars + ticks from their designated sources in one shot.
 
-    SlyTrade's data model is fixed: **bars come from MT5, ticks come from the
-    Exness archive**. ``source`` selects how strictly to follow it:
+    SlyTrade's data model: **bars come from MT5, ticks come from the Exness
+    archive**, with the recent few days of ticks additionally collected from
+    MT5 and merged in so the freshest bars never have a stale quote (the Exness
+    archive lags by roughly a day). ``source`` selects how strictly to follow it:
 
-    * "hybrid" (default) — MT5 bars (every timeframe) + Exness archive ticks.
+    * "hybrid" (default) — MT5 bars (every timeframe) + merged ticks
+      (Exness history + MT5 recent).
     * "auto" — try hybrid first; fall back gracefully if a source is down.
     * "mt5" — bars AND ticks from the MT5 terminal.
     * "exness" — Exness ticks resampled to bars (no terminal; tick-only fallback).
@@ -210,12 +232,12 @@ def collect_all(
             return TaskResult(False, f"MT5 bars failed (hybrid requires MT5): {bars.message}")
         if not include_ticks:
             return bars
-        ticks = _download_exness_ticks(symbol, lookback=lookback, root=root)
+        ticks = _merge_tick_sources(symbol, lookback=lookback, root=root)
         if not ticks.ok:
-            return TaskResult(False, f"Exness ticks failed (hybrid requires Exness): {ticks.message}")
+            return TaskResult(False, f"tick collection failed (hybrid requires ticks): {ticks.message}")
         return TaskResult(
             True,
-            "hybrid collection complete (MT5 bars + Exness ticks)",
+            "hybrid collection complete (MT5 bars + merged Exness/MT5 ticks)",
             {"source": "hybrid", "bars": bars.data or {}, "ticks": ticks.data or {}},
         )
 
@@ -226,10 +248,14 @@ def collect_all(
             bars = TaskResult(False, str(exc))
         if bars.ok:
             if include_ticks:
-                ticks = _download_exness_ticks(symbol, lookback=lookback, root=root)
+                ticks = _merge_tick_sources(symbol, lookback=lookback, root=root)
                 if ticks.ok:
-                    return TaskResult(True, "hybrid collection complete (MT5 bars + Exness ticks)", {"source": "hybrid", "bars": bars.data or {}, "ticks": ticks.data or {}})
-                console.print(f"[yellow]Exness ticks unavailable ({ticks.message}); falling back to MT5 ticks.[/yellow]")
+                    return TaskResult(True, "hybrid collection complete (MT5 bars + merged Exness/MT5 ticks)", {"source": "hybrid", "bars": bars.data or {}, "ticks": ticks.data or {}})
+                console.print(f"[yellow]Merged ticks unavailable ({ticks.message}); falling back to Exness-only ticks.[/yellow]")
+                exness = _download_exness_ticks(symbol, lookback=lookback, root=root)
+                if exness.ok:
+                    return TaskResult(True, "collection complete (MT5 bars + Exness ticks)", {"source": "hybrid", "bars": bars.data or {}, "ticks": exness.data or {}})
+                console.print(f"[yellow]Exness unavailable ({exness.message}); falling back to MT5 ticks.[/yellow]")
                 mt5_ticks = _collect_ticks_from_mt5(symbol, lookback=lookback, root=root)
                 if mt5_ticks.ok:
                     return TaskResult(True, "collection complete (MT5 bars + MT5 ticks)", {"source": "mt5", "bars": bars.data or {}, "ticks": mt5_ticks.data or {}})
@@ -327,6 +353,72 @@ def _download_exness_ticks(
         return TaskResult(False, "Exness archive returned no tick rows")
     console.print(f"  ticks: {result.rows} rows (Exness archive) in {result.file_count} files")
     return TaskResult(True, "Exness ticks downloaded", {"source": "exness", "ticks": result.rows})
+
+
+# Recent MT5 tick window (days) merged on top of the Exness history so the
+# freshest bars never carry a stale quote from the archive's ~1-day lag.
+RECENT_MT5_TICK_DAYS = 3
+
+
+def _merge_tick_sources(
+    symbol: str,
+    *,
+    lookback: str,
+    root: str | Path = "data/raw",
+    recent_days: int = RECENT_MT5_TICK_DAYS,
+) -> TaskResult:
+    """Merge Exness archive ticks (history) with MT5 ticks (recent window).
+
+    Writes the combined, de-duplicated tick set to ``merged_ticks/`` under
+    ``root``, which ``align()`` prefers over either single source.
+    """
+    from slytrade.data.exness_archive import normalize_exness_symbol
+
+    canonical = normalize_exness_symbol(symbol)
+    exness = _download_exness_ticks(symbol, lookback=lookback, root=root)
+    if not exness.ok:
+        return exness
+    try:
+        exness_ticks = load_exness_ticks(canonical, root=root)
+    except FileNotFoundError:
+        return TaskResult(False, "Exness ticks downloaded but could not be loaded")
+
+    frames = [exness_ticks.copy()]
+    mt5_res = _collect_ticks_from_mt5(symbol, lookback=f"{recent_days}d", root=root)
+    if mt5_res.ok:
+        try:
+            mt5_ticks = load_collected_ticks(symbol, root=root)
+            frames.append(mt5_ticks.copy())
+            console.print(f"  recent MT5 ticks: {len(mt5_ticks)} rows (merged on top of Exness)")
+        except FileNotFoundError:  # pragma: no cover - broker dependent
+            console.print("[yellow]Recent MT5 ticks unavailable; using Exness-only ticks.[/yellow]")
+    else:  # pragma: no cover - broker dependent
+        console.print(f"[yellow]Recent MT5 ticks unavailable ({mt5_res.message}); using Exness-only ticks.[/yellow]")
+
+    merged = pd.concat(frames, ignore_index=True)
+    merged["symbol"] = canonical
+    if "time_msc" in merged.columns:
+        merged = merged.drop_duplicates(subset=["time_msc"], keep="first").sort_values("time_msc")
+    merged = merged.reset_index(drop=True)
+
+    _write_merged_ticks(canonical, merged, root=root)
+    console.print(f"  merged ticks: {len(merged)} rows -> {Path(root) / 'merged_ticks'}")
+    return TaskResult(True, "merged ticks written", {"source": "merged", "ticks": len(merged)})
+
+
+def _write_merged_ticks(symbol: str, ticks: pd.DataFrame, *, root: str | Path = "data/raw") -> None:
+    """Write a merged tick frame, chunked by month under ``merged_ticks/``."""
+    out = Path(root) / "merged_ticks" / f"symbol={symbol}"
+    if "time_msc" not in ticks.columns or ticks.empty:
+        out.mkdir(parents=True, exist_ok=True)
+        ticks.to_parquet(out / "ticks.parquet", index=False)
+        return
+    ticks = ticks.copy()
+    ticks["time_msc"] = pd.to_datetime(ticks["time_msc"], utc=True)
+    for (year, month), group in ticks.groupby([ticks["time_msc"].dt.year, ticks["time_msc"].dt.month]):
+        directory = out / f"year={year}" / f"month={int(month):02d}"
+        directory.mkdir(parents=True, exist_ok=True)
+        group.to_parquet(directory / "ticks.parquet", index=False)
 
 
 def _collect_from_exness(symbol: str, *, lookback: str, timeframes: list[str]) -> TaskResult:
@@ -456,15 +548,21 @@ def align(
     if ticks_file is not None:
         ticks = _load_frame(ticks_file)
     else:
-        # Ticks prefer the Exness archive (designated tick source), then MT5
-        # ticks, then the derived/sample tick files.
+        # Ticks prefer the merged set (Exness history + MT5 recent), then the
+        # Exness archive, then MT5 ticks, then derived/sample tick files.
         for label, path in (
+            ("merged", None),
             ("exness", None),
             ("mt5", None),
             ("exness_derived", Path(EXNESS_DERIVED_ROOT) / symbol / "ticks.parquet"),
             ("sample", Path(SAMPLE_ROOT) / symbol / "ticks.parquet"),
         ):
-            if label == "exness":
+            if label == "merged":
+                try:
+                    ticks = load_merged_ticks(symbol, root)
+                except FileNotFoundError:
+                    continue
+            elif label == "exness":
                 try:
                     ticks = load_exness_ticks(symbol, root)
                 except FileNotFoundError:
@@ -480,7 +578,13 @@ def align(
                     continue
                 ticks = _load_frame(path)
                 console.print(f"[yellow]Using {path}[/yellow]")
-            ticks_source = {"exness": "exness_ticks", "mt5": "mt5_ticks", "exness_derived": "exness_ticks", "sample": "sample_ticks"}[label]
+            ticks_source = {
+                "merged": "merged_ticks",
+                "exness": "exness_ticks",
+                "mt5": "mt5_ticks",
+                "exness_derived": "exness_ticks",
+                "sample": "sample_ticks",
+            }[label]
             break
         if ticks is None:
             return TaskResult(False, f"no ticks found for {symbol}; run collection first")
@@ -614,7 +718,7 @@ def train(
     maybe_log_params(run, {"algorithm": algorithm, "symbol": resolved, "seed": seed, "timesteps": total_timesteps, "policy": policy, "reward": reward})
     try:
         if algorithm == "ppo":
-            model = train_ppo(env, total_timesteps=total_timesteps, seed=seed, policy_type=policy, model_dir=str(Path(artifacts_dir) / f"{algorithm}-{resolved}-{seed}"))
+            model = train_ppo(env, total_timesteps=total_timesteps, seed=seed, policy_type=policy)
         else:
             model = train_policy(algorithm, env, total_timesteps=total_timesteps, seed=seed, policy_type=policy)
         results = evaluate_policy(model, env, episodes=3, seed=seed)
@@ -645,12 +749,16 @@ def train(
     return TaskResult(True, "training complete", {"model_id": record["model_id"], "metrics": {k: float(v) for k, v in results.items() if isinstance(v, (int, float))}})
 
 
-def _with_reward(config, reward: str):
-    if reward in ("risk_adjusted", "raw"):
-        from dataclasses import replace
+VALID_REWARDS = ("raw", "risk_adjusted", "trade_pnl")
 
-        return replace(config, reward_type=reward)
-    return config
+
+def _with_reward(config, reward: str):
+    normalized = str(reward).strip().lower()
+    if normalized not in VALID_REWARDS:
+        raise ValueError(f"unknown reward type {reward!r}; choose from {VALID_REWARDS}")
+    from dataclasses import replace
+
+    return replace(config, reward_type=normalized)
 
 
 # ---------------------------------------------------------------------------
@@ -673,19 +781,32 @@ def walk_forward(
 ) -> TaskResult:
     from slytrade.backtest.reporting import infer_symbol, load_bars_file
     from slytrade.rl.dataset import build_rl_dataset
-    from slytrade.rl.walkforward import make_walk_forward_folds, walk_forward_validation
+    from slytrade.rl.walkforward import make_walk_forward_folds, resolve_fold_windows, walk_forward_validation
 
     bars = load_bars_file(Path(bars_file))
     resolved = infer_symbol(bars, symbol)
     bars = bars[bars["symbol"] == resolved].copy()
     try:
         dataset = build_rl_dataset(bars)
-        folds = make_walk_forward_folds(
+        windows = resolve_fold_windows(
             len(dataset.bars),
             train_window=train_window,
             validation_window=validation_window,
             test_window=test_window,
             embargo=embargo,
+        )
+        if windows.train_window != train_window:
+            console.print(
+                f"[yellow]Dataset has {len(dataset.bars)} bars; scaling walk-forward windows to "
+                f"train={windows.train_window} val={windows.validation_window} test={windows.test_window}.[/yellow]"
+            )
+        folds = make_walk_forward_folds(
+            len(dataset.bars),
+            train_window=windows.train_window,
+            validation_window=windows.validation_window,
+            test_window=windows.test_window,
+            embargo=windows.embargo,
+            step=windows.step,
         )
         table = walk_forward_validation(
             dataset, folds, total_timesteps=total_timesteps, seed=seed, reward_type=reward, policy_type=policy

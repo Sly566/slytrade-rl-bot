@@ -36,6 +36,7 @@ dev = [
 rl = [
   "gymnasium>=0.29",
   "stable-baselines3>=2.3",
+  "sb3-contrib>=2.3",
   "torch>=2.2",
   "optuna>=3.6",
   "mlflow>=2.14"

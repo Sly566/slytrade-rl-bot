@@ -155,3 +155,133 @@ def test_align_hybrid_mt5_bars_exness_ticks(tmp_path: Path, monkeypatch) -> None
     assert result.ok, result.message
     # Hybrid alignment: canonical symbol XAUUSD, MT5 bars + Exness ticks.
     assert result.data is not None
+
+
+def test_merge_tick_sources_writes_merged_set(tmp_path: Path, monkeypatch) -> None:
+    """Exness history + MT5 recent ticks merge into one deduplicated tick set."""
+    from slytrade.data.schemas import TICK_COLUMNS
+
+    monkeypatch.setattr(tasks, "SAMPLE_ROOT", str(tmp_path / "samples"))
+    monkeypatch.setattr(tasks, "EXNESS_DERIVED_ROOT", str(tmp_path / "exness_derived"))
+
+    def fake_download(symbol, *, lookback, root):
+        return tasks.TaskResult(True, "ok", {"ticks": 2})
+
+    monkeypatch.setattr(tasks, "_download_exness_ticks", fake_download)
+
+    def fake_mt5_ticks(symbol, *, lookback, root):
+        return tasks.TaskResult(True, "ok", {"ticks": 1})
+
+    monkeypatch.setattr(tasks, "_collect_ticks_from_mt5", fake_mt5_ticks)
+
+    exness = pd.DataFrame(
+        {
+            "time_msc": pd.date_range("2026-08-10", periods=3, freq="s", tz="UTC"),
+            "time": pd.date_range("2026-08-10", periods=3, freq="s", tz="UTC").floor("s"),
+            "symbol": "XAUUSD",
+            "bid": 100.0,
+            "ask": 100.02,
+            "last": 0.0,
+            "volume": 1.0,
+            "volume_real": 0.0,
+            "flags": 0.0,
+            "spread": 0.02,
+            "mid": 100.01,
+        }
+    )[TICK_COLUMNS]
+    recent = pd.DataFrame(
+        {
+            "time_msc": pd.date_range("2026-08-14", periods=2, freq="s", tz="UTC"),
+            "time": pd.date_range("2026-08-14", periods=2, freq="s", tz="UTC").floor("s"),
+            "symbol": "XAUUSDm",
+            "bid": 101.0,
+            "ask": 101.02,
+            "last": 0.0,
+            "volume": 1.0,
+            "volume_real": 0.0,
+            "flags": 0.0,
+            "spread": 0.02,
+            "mid": 101.01,
+        }
+    )[TICK_COLUMNS]
+
+    monkeypatch.setattr(tasks, "load_exness_ticks", lambda symbol, root=None: exness.copy())
+    monkeypatch.setattr(tasks, "load_collected_ticks", lambda symbol, root=None: recent.copy())
+
+    result = tasks._merge_tick_sources("XAUUSD", lookback="1m", root=tmp_path, recent_days=3)
+    assert result.ok, result.message
+    assert result.data["ticks"] == 5  # 3 exness + 2 recent, no dup
+    merged = tasks.load_merged_ticks("XAUUSD", root=tmp_path)
+    assert len(merged) == 5
+    # All relabeled to the canonical base symbol.
+    assert set(merged["symbol"].unique()) == {"XAUUSD"}
+
+
+def test_align_prefers_merged_ticks(tmp_path: Path, monkeypatch) -> None:
+    from slytrade.data.schemas import BAR_COLUMNS, TICK_COLUMNS
+
+    monkeypatch.setattr(tasks, "SAMPLE_ROOT", str(tmp_path / "samples"))
+    monkeypatch.setattr(tasks, "EXNESS_DERIVED_ROOT", str(tmp_path / "exness_derived"))
+
+    bar_dir = tmp_path / "mt5_bars" / "symbol=XAUUSDm" / "timeframe=M1" / "y=2026"
+    bar_dir.mkdir(parents=True)
+    bar_times = pd.date_range("2026-01-01", periods=120, freq="min", tz="UTC")
+    bars = pd.DataFrame(
+        {
+            "time": bar_times,
+            "symbol": "XAUUSDm",
+            "timeframe": "M1",
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.5,
+            "tick_volume": 10.0,
+            "spread": 20.0,
+            "real_volume": 0.0,
+        }
+    )[BAR_COLUMNS]
+    bars.to_parquet(bar_dir / "d.parquet", index=False)
+
+    # Both an Exness-only and a MERGED tick set exist; align must use merged.
+    for subdir, count, sym in (("exness_ticks", 1000, "XAUUSD"), ("merged_ticks", 2000, "XAUUSD")):
+        base = tmp_path / subdir / f"symbol={sym}" / "year=2026" / "month=01"
+        base.mkdir(parents=True)
+        times = pd.date_range("2026-01-01", periods=count, freq="6s", tz="UTC")
+        mid = 100.0 + pd.Series(range(count), dtype=float) * 0.0001
+        ticks = pd.DataFrame(
+            {
+                "time_msc": times,
+                "time": times.floor("s"),
+                "symbol": sym,
+                "bid": (mid - 0.01).round(3),
+                "ask": (mid + 0.01).round(3),
+                "last": 0.0,
+                "volume": 1.0,
+                "volume_real": 0.0,
+                "flags": 0.0,
+                "spread": 0.02,
+                "mid": mid,
+            }
+        )[TICK_COLUMNS]
+        ticks.to_parquet(base / "p.parquet", index=False)
+
+    monkeypatch.chdir(tmp_path)
+    result = tasks.align("XAUUSD", timeframe="M1", root=str(tmp_path))
+    assert result.ok, result.message
+    import json
+
+    manifest = json.loads((tmp_path / "data" / "processed" / "aligned" / "XAUUSD" / "manifest.json").read_text())
+    assert manifest["tick_source"] == "merged_ticks"
+
+
+def test_with_reward_applies_trade_pnl() -> None:
+    config = RLEnvironmentConfig(reward_type="raw")
+    adjusted = tasks._with_reward(config, "trade_pnl")
+    assert adjusted.reward_type == "trade_pnl"
+
+
+def test_with_reward_rejects_unknown() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="unknown reward type"):
+        tasks._with_reward(RLEnvironmentConfig(), "bogus")

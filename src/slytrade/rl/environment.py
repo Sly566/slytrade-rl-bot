@@ -146,6 +146,7 @@ if gym is not None:
                 raise ValueError("action must be 0 (hold), 1 (long), 2 (short), or 3 (flatten)")
             if self.current_step >= len(self.bars):
                 raise RuntimeError("step() called past the end of the episode; call reset()")
+            episode_start = self.current_step == 0
             previous = float(self.bars.iloc[self.current_step]["close"])
             old_position = self._position
             target = self._position
@@ -209,6 +210,7 @@ if gym is not None:
             return self._observation(), float(reward), terminated, False, {
                 "equity": float(self._equity),
                 "n_trades": len(self.ledger.records),
+                "episode_start": episode_start,
             }
 
         def _trade_pnl_reward(self, old_position: int, target: int, turnover: int, price: float) -> float:
