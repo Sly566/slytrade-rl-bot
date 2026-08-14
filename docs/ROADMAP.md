@@ -133,6 +133,15 @@
 - [x] Evidence-gated promotion helper (`promote_artifact`)
 - [x] Inference strategy (RLPolicyStrategy) so a saved artifact can trade
 
+## Phase 9.5: RL learning-signal quality
+
+- [x] Sparse trade-close reward (`reward_type="trade_pnl"`): realized PnL paid
+  only when a position closes; zero while holding. Trains trade quality and
+  stops the policy from churning.
+- [x] Walk-forward evaluation parity: each fold's test env uses the SAME reward
+  objective the policy was trained on.
+- [x] `trade_pnl` is the default reward for `train-rl` / `full-pipeline` / UI.
+
 ## Phase 9: Task-based CLI / GUI and live demo
 
 - [x] `slytrade ui` — Rich interactive task menu (no flags to memorise)

@@ -103,7 +103,7 @@ def task_train() -> None:
         return
     algorithm = _prompt("Algorithm (ppo / sac / td3)", "ppo")
     policy = _prompt("Policy (mlp / lstm)", "mlp")
-    reward = _prompt("Reward (risk_adjusted / raw)", "risk_adjusted")
+    reward = _prompt("Reward (trade_pnl / risk_adjusted / raw)", "trade_pnl")
     timesteps = _prompt_int("Total timesteps", 50_000)
     console.print(f"[cyan]Training {algorithm.upper()} ({policy}) for {timesteps} steps…[/cyan]")
     result = tasks.train(bars_file, symbol=symbol, algorithm=algorithm, total_timesteps=timesteps, policy=policy, reward=reward)
@@ -117,7 +117,9 @@ def task_walk_forward() -> None:
     if not Path(bars_file).exists():
         console.print("[yellow]Bars file not found; run align first.[/yellow]")
         return
-    result = tasks.walk_forward(bars_file, symbol=symbol)
+    reward = _prompt("Reward (trade_pnl / risk_adjusted / raw)", "trade_pnl")
+    policy = _prompt("Policy (mlp / lstm)", "mlp")
+    result = tasks.walk_forward(bars_file, symbol=symbol, reward=reward, policy=policy)
     _render_result(result)
 
 

@@ -506,7 +506,7 @@ def train_rl(
     bars_file: str = typer.Option(..., help="Aligned bars file with decision quote / ICT columns (.csv or .parquet)"),
     algorithm: str = typer.Option("ppo", help="RL algorithm: ppo, sac, or td3"),
     policy: str = typer.Option("mlp", help="Policy network: mlp or lstm (recurrent)"),
-    reward: str = typer.Option("risk_adjusted", help="Reward type: risk_adjusted or raw"),
+    reward: str = typer.Option("trade_pnl", help="Reward type: trade_pnl, risk_adjusted, or raw"),
     total_timesteps: int = typer.Option(100_000, help="Number of training steps"),
     seed: int = typer.Option(42, help="Random seed"),
     learning_rate: float = typer.Option(3e-4, help="Learning rate"),
@@ -552,14 +552,16 @@ def walk_forward(
     step: int | None = typer.Option(None, help="Step between folds (defaults to test_window)"),
     total_timesteps: int = typer.Option(20_000, help="PPO steps per fold"),
     seed: int = typer.Option(42, help="Random seed"),
+    reward: str = typer.Option("raw", help="Reward type: raw, risk_adjusted, or trade_pnl"),
+    policy: str = typer.Option("mlp", help="Policy network: mlp or lstm"),
     symbol: str | None = typer.Option(None, help="Symbol override if the file contains multiple symbols"),
     personality_file: str = typer.Option("configs/trader_personality.yaml", help="Trader personality YAML path"),
 ) -> None:
     """Run walk-forward validation of PPO training (honest out-of-sample test).
 
     Requires the `rl` optional dependencies. Each fold trains on its train
-    window and evaluates on the test window. Prints a per-fold DataFrame and
-    an aggregate summary row.
+    window and evaluates on the test window with the SAME reward objective.
+    Prints a per-fold DataFrame and an aggregate summary row.
     """
     from slytrade.backtest.reporting import load_bars_file
     from slytrade.rl.dataset import build_rl_dataset
@@ -577,7 +579,7 @@ def walk_forward(
         embargo=embargo,
         step=step,
     )
-    table = walk_forward_validation(dataset, folds, total_timesteps=total_timesteps, seed=seed)
+    table = walk_forward_validation(dataset, folds, total_timesteps=total_timesteps, seed=seed, reward_type=reward, policy_type=policy)
     console.print(table.to_string(index=False))
 
 
@@ -1230,7 +1232,7 @@ def full_pipeline(
     algorithm: str = typer.Option("ppo", help="ppo, sac, or td3"),
     total_timesteps: int = typer.Option(50_000, help="Training steps"),
     policy: str = typer.Option("mlp", help="mlp or lstm"),
-    reward: str = typer.Option("risk_adjusted", help="risk_adjusted or raw"),
+    reward: str = typer.Option("trade_pnl", help="trade_pnl, risk_adjusted, or raw"),
     promote_stage: str = typer.Option("paper", help="Stage to promote the model to"),
 ) -> None:
     """Run the entire pipeline from scratch: collect → align → backtest → train

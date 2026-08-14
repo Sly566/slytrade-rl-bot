@@ -129,6 +129,7 @@ if gym is not None:
             self._position = 0
             self._equity = self.config.initial_balance
             self._peak_equity = self.config.initial_balance
+            self._entry_price = 0.0
 
         def reset(self, *, seed: int | None = None, options: dict | None = None):
             super().reset(seed=seed)
@@ -136,6 +137,7 @@ if gym is not None:
             self._position = 0
             self._equity = self.config.initial_balance
             self._peak_equity = self.config.initial_balance
+            self._entry_price = 0.0
             self.ledger.records.clear()
             return self._observation(), {}
 
@@ -195,6 +197,12 @@ if gym is not None:
                         drawdown_tolerance=self.config.drawdown_tolerance,
                     ),
                 )
+            elif self.config.reward_type == "trade_pnl":
+                # Sparse, trade-close reward: realized PnL when a position closes,
+                # zero while holding. This trains trade quality (win/loss size)
+                # instead of bar-to-bar mark-to-market noise, and stops the
+                # policy from churning.
+                reward = self._trade_pnl_reward(old_position, target, turnover, previous)
             else:
                 reward = equity_delta
 
@@ -202,6 +210,32 @@ if gym is not None:
                 "equity": float(self._equity),
                 "n_trades": len(self.ledger.records),
             }
+
+        def _trade_pnl_reward(self, old_position: int, target: int, turnover: int, price: float) -> float:
+            """Realized-PnL reward, paid only when exposure changes.
+
+            Opening a position costs transaction costs (small negative reward);
+            closing (or reversing) realizes PnL from the entry price to the exit
+            price. Holding (or staying flat) yields exactly zero reward.
+            """
+            cost = turnover * self.config.transaction_cost
+
+            if old_position == 0 and target != 0:
+                # Opening a new position: entry price is the decision price.
+                self._entry_price = price
+                return -cost
+
+            if old_position != 0 and target != old_position:
+                # Closing (target == 0) or reversing: realize the closed leg.
+                if self._entry_price > 0:
+                    realized = old_position * (price - self._entry_price) / self._entry_price
+                else:
+                    realized = 0.0
+                self._entry_price = price if target != 0 else 0.0
+                return realized - cost
+
+            # Holding an open position or staying flat: no reward.
+            return 0.0
 
         def _observation(self) -> np.ndarray:
             index = min(self.current_step, len(self.features) - 1)

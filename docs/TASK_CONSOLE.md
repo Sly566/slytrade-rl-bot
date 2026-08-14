@@ -15,7 +15,7 @@ The bot ships two ways to run it:
 | `collect` / `collect-all` | Gathers **bars for every timeframe** (M1, M5, M15, H1, H4, D1) **plus ticks** for the symbol in one step (MT5 live, or synthetic samples for offline smoke tests). |
 | `align` | Joins bars + ticks into one canonical dataset with ICT/SMC features, decision quotes and a quality manifest. |
 | `backtest` | Runs the persona-adaptive ICT strategy with managed SL/TP exits and full trade analytics. |
-| `train` | Trains a policy (PPO/SAC/TD3, MLP or recurrent LSTM, risk-adjusted or raw reward) and saves a deployable artifact into the model registry. |
+| `train` | Trains a policy (PPO/SAC/TD3, MLP or recurrent LSTM) and saves a deployable artifact into the model registry. Reward options: `trade_pnl` (sparse, realized PnL at trade close — default), `risk_adjusted` (drawdown/turnover-penalised), `raw` (bar-level mark-to-market). |
 | `walk-forward` | Embargoed walk-forward validation with an aggregate out-of-sample summary. |
 | `promote` | Promotes a registered model through a stage (paper → shadow → demo) — refused unless the evidence checks pass. |
 | `paper` | Runs the supervised paper-trading loop with Prometheus metrics. |

@@ -331,13 +331,20 @@ def walk_forward_validation(
     *,
     total_timesteps: int = 20_000,
     seed: int = 42,
+    reward_type: str = "raw",
+    policy_type: str = "mlp",
 ) -> pd.DataFrame:
     """Train PPO on each fold's training window, evaluate on its test window.
 
-    The scaler is re-fitted on each fold's train slice (no leakage). Returns a
-    DataFrame with one row per fold plus an AGGREGATE summary row.
+    The scaler is re-fitted on each fold's train slice (no leakage). The
+    ``reward_type`` is applied to BOTH the training and the test environments so
+    the out-of-sample metric measures the same objective the policy optimised.
+    Returns a DataFrame with one row per fold plus an AGGREGATE summary row.
     """
+    from slytrade.rl.environment import RLEnvironmentConfig
+
     rows: list[dict] = []
+    env_config = RLEnvironmentConfig(seed=seed, reward_type=reward_type)
 
     for fold in folds:
         # Fit the scaler on this fold's train window ONLY.
@@ -347,14 +354,16 @@ def walk_forward_validation(
             fold.train_end,
             seed=seed + fold.index,
             scaler_params=scaler_params,
+            config=env_config,
         )
-        model = train_ppo(train_env, total_timesteps=total_timesteps, seed=seed + fold.index)
+        model = train_ppo(train_env, total_timesteps=total_timesteps, seed=seed + fold.index, policy_type=policy_type)
 
         test_env = dataset.env_factory(
             fold.test_start,
             fold.test_end,
             seed=seed + fold.index,
             scaler_params=scaler_params,
+            config=env_config,
         )
         results = evaluate_ppo(model, test_env, episodes=3, seed=seed + fold.index)
 

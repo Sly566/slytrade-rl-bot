@@ -668,6 +668,8 @@ def walk_forward(
     validation_window: int = 2_000,
     test_window: int = 2_000,
     embargo: int = 100,
+    reward: str = "raw",
+    policy: str = "mlp",
 ) -> TaskResult:
     from slytrade.backtest.reporting import infer_symbol, load_bars_file
     from slytrade.rl.dataset import build_rl_dataset
@@ -685,7 +687,9 @@ def walk_forward(
             test_window=test_window,
             embargo=embargo,
         )
-        table = walk_forward_validation(dataset, folds, total_timesteps=total_timesteps, seed=seed)
+        table = walk_forward_validation(
+            dataset, folds, total_timesteps=total_timesteps, seed=seed, reward_type=reward, policy_type=policy
+        )
     except ImportError as exc:
         return TaskResult(False, f"RL dependencies not installed: {exc}")
     console.print(table.to_string(index=False))
@@ -744,7 +748,7 @@ def full_pipeline(
         return trained
     steps.append("train")
 
-    walk_forward(bars_file, symbol=symbol)
+    walk_forward(bars_file, symbol=symbol, reward=reward, policy=policy)
     steps.append("walk_forward")
 
     model_id = trained.data["model_id"] if trained.data else None
