@@ -1078,5 +1078,119 @@ def live() -> None:
     raise typer.Exit(code=1)
 
 
+@app.command()
+def interactive() -> None:
+    """Interactive prompt to pick common tasks.
+
+    This presents a simple numbered menu and runs the selected command.
+    It is intended for convenience in local and container workflows. Live
+    trading remains disabled unless explicitly enabled and approved.
+    """
+    actions = [
+        ("doctor", "Run health checks and dependencies"),
+        ("info", "Print project information"),
+        ("collect_recent_exness_ticks", "Collect recent Exness ticks (prompt for symbol and lookback)"),
+        ("collect_recent_bars", "Collect recent MT5 bars (prompt for symbol/timeframe)"),
+        ("collect_recent_ticks", "Collect recent MT5 ticks (prompt for symbol)"),
+        ("inspect_data", "Inspect bars/ticks data quality (prompt for paths)"),
+        ("align_dataset", "Align bars and ticks into an aligned dataset (prompt for paths)"),
+        ("run_backtest", "Run an aligned backtest (prompt for bars file and strategy)"),
+        ("run_tick_backtest", "Run a tick-aware backtest (prompt for bars and ticks files)"),
+        ("train_rl", "Train a small PPO policy (prompt for bars file, uses small defaults)"),
+        ("mt5_preflight", "Run MT5 preflight checks (prompt for symbol)"),
+        ("live", "Live trading (disabled by default)"),
+        ("quit", "Exit interactive prompt"),
+    ]
+
+    def print_menu() -> None:
+        table = Table(title="SlyTrade Interactive")
+        table.add_column("#")
+        table.add_column("Command")
+        table.add_column("Description")
+        for i, (cmd, desc) in enumerate(actions, start=1):
+            table.add_row(str(i), cmd, desc)
+        console.print(table)
+
+    while True:
+        print_menu()
+        choice = input("Select a task by number (or name): ").strip()
+        if not choice:
+            continue
+        # allow by-name selection
+        if choice.lower() in (name for name, _ in actions):
+            sel = choice.lower()
+        else:
+            try:
+                idx = int(choice)
+                if idx < 1 or idx > len(actions):
+                    console.print("[red]Invalid selection[/red]")
+                    continue
+                sel = actions[idx - 1][0]
+            except ValueError:
+                console.print("[red]Invalid input[/red]")
+                continue
+
+        try:
+            if sel == "quit":
+                console.print("Goodbye.")
+                break
+            elif sel == "doctor":
+                doctor()
+            elif sel == "info":
+                info()
+            elif sel == "collect_recent_exness_ticks":
+                sym = input("Exness symbol (e.g. XAUUSD): ").strip() or "XAUUSD"
+                look = input("Lookback (e.g. 1d, 1m) [1d]: ").strip() or "1d"
+                collect_recent_exness_ticks(symbol=sym, lookback=look)
+            elif sel == "collect_recent_bars":
+                sym = input("Symbol (e.g. XAUUSD): ").strip() or "XAUUSD"
+                tf = input("Timeframe (e.g. M1): ").strip() or "M1"
+                look = input("Lookback (e.g. 1d, 1m) [1d]: ").strip() or "1d"
+                collect_recent_bars(symbol=sym, timeframe=tf, lookback=look)
+            elif sel == "collect_recent_ticks":
+                sym = input("Symbol (e.g. XAUUSD): ").strip() or "XAUUSD"
+                look = input("Lookback (e.g. 1m, 1d) [1m]: ").strip() or "1m"
+                collect_recent_ticks(symbol=sym, lookback=look)
+            elif sel == "inspect_data":
+                bars = input("Bars file (leave empty to skip): ").strip() or None
+                ticks = input("Ticks file (leave empty to skip): ").strip() or None
+                timeframe = input("Timeframe (e.g. M1) [leave empty to auto]: ").strip() or None
+                inspect_data(bars_file=bars, ticks_file=ticks, timeframe=timeframe)  # type: ignore[arg-type]
+            elif sel == "align_dataset":
+                bars = input("Bars file: ").strip()
+                ticks = input("Ticks file: ").strip()
+                out = input("Output dir [data/processed/aligned]: ").strip() or "data/processed/aligned"
+                tf = input("Timeframe [M1]: ").strip() or "M1"
+                canonical = input("Canonical symbol (optional): ").strip() or None
+                align_dataset(bars_file=bars, ticks_file=ticks, output_dir=out, timeframe=tf, canonical_symbol=canonical)  # type: ignore[arg-type]
+            elif sel == "run_backtest":
+                bars = input("Aligned bars file: ").strip()
+                strat = input("Strategy [no-trade]: ").strip() or "no-trade"
+                run_backtest(bars_file=bars, strategy=strat)
+            elif sel == "run_tick_backtest":
+                bars = input("Bars file: ").strip()
+                ticks = input("Ticks file: ").strip()
+                strat = input("Strategy [no-trade]: ").strip() or "no-trade"
+                run_tick_backtest(bars_file=bars, ticks_file=ticks, strategy=strat)
+            elif sel == "train_rl":
+                bars = input("Aligned bars file: ").strip()
+                timesteps_raw = input("Total timesteps [128]: ").strip() or "128"
+                try:
+                    timesteps = int(timesteps_raw)
+                except ValueError:
+                    timesteps = 128
+                console.print("[yellow]Note: training can be slow; defaults use a tiny run for smoke tests.[/yellow]")
+                train_rl(bars_file=bars, total_timesteps=timesteps)
+            elif sel == "mt5_preflight":
+                sym = input("MT5 symbol to validate [XAUUSD]: ").strip() or "XAUUSD"
+                mt5_preflight(symbol=sym)
+            elif sel == "live":
+                console.print("[red]Live trading remains disabled by default. To enable you must pass SLYTRADE_ALLOW_LIVE=1 and satisfy all gates.[/red]")
+            else:
+                console.print(f"[red]Unknown selection: {sel}[/red]")
+        except Exception as exc:
+            console.print(f"[red]Task failed: {exc}[/red]")
+
+
 if __name__ == "__main__":
     app()

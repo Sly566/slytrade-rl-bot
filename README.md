@@ -90,6 +90,24 @@ ruff check .
 mypy src
 ```
 
+## Containerized execution
+
+The production image includes the data, RL, and MT5 Python extras. It remains
+fail-closed (`SLYTRADE_ALLOW_LIVE=0`) and runs as an unprivileged user:
+
+```bash
+docker compose build slytrade
+docker compose run --rm slytrade doctor
+docker compose --profile dev run --rm dev pytest
+```
+
+`data/` and `logs/` are the only writable bind mounts. Never put credentials
+in the image; use an untracked `.env` file or an orchestrator secret store.
+The MT5 terminal and Linux bridge remain external services and must be
+reachable from the container before any broker preflight. Containerization
+does not bypass reconciliation, freshness, model-governance, paper-soak, or
+manual-approval gates.
+
 ## Safety Notice
 
 This project is for research and engineering. It must not be used with real capital until:

@@ -1,11 +1,49 @@
 services:
   slytrade:
-    build: .
-    command: python -m slytrade.cli doctor
+    build:
+      context: .
+      target: production
+      args:
+        EXTRAS: data,mt5
+    image: slytrade-rl-bot:production
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,noexec,nosuid
+    command: ["doctor"]
+    environment:
+      SLYTRADE_ENV: production
+      SLYTRADE_ALLOW_LIVE: "0"
+      SLYTRADE_METRICS_PORT: "9108"
     volumes:
       - ./configs:/app/configs:ro
       - ./data:/app/data
       - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "python", "-m", "slytrade.cli", "doctor"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    restart: "no"
+
+  # Development and CI image. It is opt-in so a production compose up never
+  # mounts source or test code into the runtime container.
+  dev:
+    profiles: ["dev"]
+    build:
+      context: .
+      target: development
+      args:
+        EXTRAS: data,mt5
+    image: slytrade-rl-bot:development
+    init: true
+    command: ["doctor"]
     environment:
-      - SLYTRADE_ALLOW_LIVE=0
+      SLYTRADE_ENV: development
+      SLYTRADE_ALLOW_LIVE: "0"
+    volumes:
+      - .:/app
+      - ./data:/app/data
+      - ./logs:/app/logs
     restart: "no"
