@@ -1212,9 +1212,9 @@ def ui() -> None:
 def collect_all(
     symbol: str = typer.Option("XAUUSD", help="Symbol to collect, e.g. XAUUSD"),
     lookback: str = typer.Option("1y", help="Lookback duration, e.g. 1d, 1w, 1m, 1y"),
-    source: str = typer.Option("auto", help="auto, mt5, or samples"),
+    source: str = typer.Option("hybrid", help="hybrid (MT5 bars + Exness ticks), auto, mt5, exness, or samples"),
 ) -> None:
-    """Collect bars for every timeframe plus ticks in one step."""
+    """Collect bars (MT5) and ticks (Exness) from their designated sources."""
     from slytrade.tasks import collect_all as run_collect
 
     result = run_collect(symbol, lookback=lookback, source=source)
@@ -1226,7 +1226,7 @@ def collect_all(
 def full_pipeline(
     symbol: str = typer.Option("XAUUSD", help="Symbol to run the pipeline for"),
     lookback: str = typer.Option("1y", help="Lookback duration"),
-    source: str = typer.Option("auto", help="auto, mt5, or samples"),
+    source: str = typer.Option("hybrid", help="hybrid (MT5 bars + Exness ticks), auto, mt5, exness, or samples"),
     algorithm: str = typer.Option("ppo", help="ppo, sac, or td3"),
     total_timesteps: int = typer.Option(50_000, help="Training steps"),
     policy: str = typer.Option("mlp", help="mlp or lstm"),

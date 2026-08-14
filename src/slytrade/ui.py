@@ -68,8 +68,7 @@ def _prompt_int(prompt: str, default: int) -> int:
 def task_collect() -> None:
     symbol = _prompt("Symbol", "XAUUSD").upper()
     lookback = _prompt("Lookback (1d / 1w / 1m / 1y / 2y)", "1y")
-    use_mt5 = Confirm.ask("Use live MT5 broker data?", default=True)
-    source = "mt5" if use_mt5 else "samples"
+    source = _prompt("Source (hybrid / auto / mt5 / exness / samples)", "hybrid").lower()
     console.print(f"[cyan]Collecting {symbol} ({lookback}, source={source})…[/cyan]")
     result = tasks.collect_all(symbol, lookback=lookback, source=source)
     _render_result(result)

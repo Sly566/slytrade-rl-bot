@@ -22,6 +22,9 @@ console = Console()
 # Root directory for synthetic sample data (overridable in tests).
 SAMPLE_ROOT = "data/samples"
 
+# Root for bars derived from Exness ticks in the tick-only fallback path.
+EXNESS_DERIVED_ROOT = "data/exness_derived"
+
 # ---------------------------------------------------------------------------
 # Small result helpers
 # ---------------------------------------------------------------------------
@@ -50,19 +53,49 @@ def mt5_available() -> bool:
 # ---------------------------------------------------------------------------
 
 
-def find_collected_bars(symbol: str, timeframe: str, root: str | Path = "data/raw") -> list[Path]:
-    base = Path(root) / "mt5_bars" / f"symbol={symbol}" / f"timeframe={timeframe}"
+def _symbol_dir(root: str | Path, prefix: str, symbol: str) -> Path | None:
+    """Find a partitioned ``symbol=...`` directory for a base symbol.
+
+    MT5 stores data under the *resolved* broker symbol (e.g. ``XAUUSDm``), while
+    the CLI and Exness archive use the base symbol (``XAUUSD``). Match the exact
+    symbol first, then the shortest suffix variant (``XAUUSDm`` before
+    ``XAUUSD247m``), so collection stays autonomous.
+    """
+    base = Path(root) / prefix
     if not base.exists():
+        return None
+    exact = base / f"symbol={symbol}"
+    if exact.exists():
+        return exact
+    candidates = sorted(
+        (d for d in base.iterdir() if d.is_dir() and d.name.startswith(f"symbol={symbol}")),
+        key=lambda d: len(d.name),
+    )
+    return candidates[0] if candidates else None
+
+
+def find_collected_bars(symbol: str, timeframe: str, root: str | Path = "data/raw") -> list[Path]:
+    symbol_dir = _symbol_dir(root, "mt5_bars", symbol)
+    if symbol_dir is None:
         return []
-    files = sorted([p for p in base.rglob("*") if p.suffix.lower() in (".parquet", ".csv")])
-    return files
-
-
-def find_collected_ticks(symbol: str, root: str | Path = "data/raw") -> list[Path]:
-    base = Path(root) / "mt5_ticks" / f"symbol={symbol}"
+    base = symbol_dir / f"timeframe={timeframe}"
     if not base.exists():
         return []
     return sorted([p for p in base.rglob("*") if p.suffix.lower() in (".parquet", ".csv")])
+
+
+def find_collected_ticks(symbol: str, root: str | Path = "data/raw") -> list[Path]:
+    symbol_dir = _symbol_dir(root, "mt5_ticks", symbol)
+    if symbol_dir is None:
+        return []
+    return sorted([p for p in symbol_dir.rglob("*") if p.suffix.lower() in (".parquet", ".csv")])
+
+
+def find_exness_ticks(symbol: str, root: str | Path = "data/raw") -> list[Path]:
+    symbol_dir = _symbol_dir(root, "exness_ticks", symbol)
+    if symbol_dir is None:
+        return []
+    return sorted([p for p in symbol_dir.rglob("*") if p.suffix.lower() in (".parquet", ".csv")])
 
 
 def load_collected_bars(symbol: str, timeframe: str, root: str | Path = "data/raw") -> pd.DataFrame:
@@ -81,6 +114,18 @@ def load_collected_ticks(symbol: str, root: str | Path = "data/raw") -> pd.DataF
     frames = [pd.read_parquet(p) if p.suffix == ".parquet" else pd.read_csv(p) for p in files]
     frame = pd.concat(frames, ignore_index=True)
     return frame.drop_duplicates(subset=["time_msc"] if "time_msc" in frame.columns else None).sort_values("time_msc").reset_index(drop=True)
+
+
+def load_exness_ticks(symbol: str, root: str | Path = "data/raw") -> pd.DataFrame:
+    """Load Exness archive ticks (stored under ``exness_ticks/``)."""
+    files = find_exness_ticks(symbol, root)
+    if not files:
+        raise FileNotFoundError(f"no Exness ticks for {symbol} under {root}")
+    frames = [pd.read_parquet(p) if p.suffix == ".parquet" else pd.read_csv(p) for p in files]
+    frame = pd.concat(frames, ignore_index=True)
+    if "time_msc" in frame.columns:
+        frame = frame.drop_duplicates(subset=["time_msc"]).sort_values("time_msc")
+    return frame.reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
@@ -141,26 +186,70 @@ def collect_all(
     lookback: str = "1y",
     timeframes: list[str] | None = None,
     include_ticks: bool = True,
-    source: str = "auto",
+    source: str = "hybrid",
     root: str | Path = "data/raw",
     sample_start: str = "2025-01-01",
 ) -> TaskResult:
-    """Collect bars for every timeframe (plus ticks) in one shot.
+    """Collect bars + ticks from their designated sources in one shot.
 
-    ``source``: "mt5" forces the broker, "samples" forces synthetic data,
-    "auto" uses MT5 when available and falls back to samples otherwise.
+    SlyTrade's data model is fixed: **bars come from MT5, ticks come from the
+    Exness archive**. ``source`` selects how strictly to follow it:
+
+    * "hybrid" (default) — MT5 bars (every timeframe) + Exness archive ticks.
+    * "auto" — try hybrid first; fall back gracefully if a source is down.
+    * "mt5" — bars AND ticks from the MT5 terminal.
+    * "exness" — Exness ticks resampled to bars (no terminal; tick-only fallback).
+    * "samples" — deterministic synthetic data (offline smoke tests).
     """
     if timeframes is None:
         timeframes = ["M1", "M5", "M15", "H1", "H4", "D1"]
 
-    use_mt5 = source == "mt5" or (source == "auto" and mt5_available())
-    if use_mt5:
+    if source == "hybrid":
+        bars = _collect_bars_from_mt5(symbol, lookback=lookback, timeframes=timeframes, root=root)
+        if not bars.ok:
+            return TaskResult(False, f"MT5 bars failed (hybrid requires MT5): {bars.message}")
+        if not include_ticks:
+            return bars
+        ticks = _download_exness_ticks(symbol, lookback=lookback, root=root)
+        if not ticks.ok:
+            return TaskResult(False, f"Exness ticks failed (hybrid requires Exness): {ticks.message}")
+        return TaskResult(
+            True,
+            "hybrid collection complete (MT5 bars + Exness ticks)",
+            {"source": "hybrid", "bars": bars.data or {}, "ticks": ticks.data or {}},
+        )
+
+    if source == "auto":
+        try:
+            bars = _collect_bars_from_mt5(symbol, lookback=lookback, timeframes=timeframes, root=root)
+        except Exception as exc:  # pragma: no cover - broker dependent
+            bars = TaskResult(False, str(exc))
+        if bars.ok:
+            if include_ticks:
+                ticks = _download_exness_ticks(symbol, lookback=lookback, root=root)
+                if ticks.ok:
+                    return TaskResult(True, "hybrid collection complete (MT5 bars + Exness ticks)", {"source": "hybrid", "bars": bars.data or {}, "ticks": ticks.data or {}})
+                console.print(f"[yellow]Exness ticks unavailable ({ticks.message}); falling back to MT5 ticks.[/yellow]")
+                mt5_ticks = _collect_ticks_from_mt5(symbol, lookback=lookback, root=root)
+                if mt5_ticks.ok:
+                    return TaskResult(True, "collection complete (MT5 bars + MT5 ticks)", {"source": "mt5", "bars": bars.data or {}, "ticks": mt5_ticks.data or {}})
+            return bars
+        console.print(f"[yellow]MT5 bars unavailable ({bars.message}); falling back to Exness-only.[/yellow]")
+        exness = _collect_from_exness(symbol, lookback=lookback, timeframes=timeframes)
+        if exness.ok:
+            return exness
+        console.print(f"[yellow]Exness unavailable ({exness.message}); falling back to synthetic samples.[/yellow]")
+        files = generate_sample_dataset(symbol, start=sample_start, out_dir=SAMPLE_ROOT)
+        return TaskResult(True, "sample data generated", {"source": "samples", "files": files})
+
+    if source == "mt5":
         try:
             return _collect_from_mt5(symbol, lookback=lookback, timeframes=timeframes, include_ticks=include_ticks, root=root)
         except Exception as exc:  # pragma: no cover - broker dependent
-            if source == "mt5":
-                return TaskResult(False, f"MT5 collection failed: {exc}")
-            console.print(f"[yellow]MT5 unavailable ({exc}); falling back to synthetic samples.[/yellow]")
+            return TaskResult(False, f"MT5 collection failed: {exc}")
+
+    if source == "exness":
+        return _collect_from_exness(symbol, lookback=lookback, timeframes=timeframes)
 
     files = generate_sample_dataset(symbol, start=sample_start, out_dir=SAMPLE_ROOT)
     if include_ticks:
@@ -170,15 +259,15 @@ def collect_all(
     return TaskResult(True, "sample data generated", {"source": "samples", "files": files})
 
 
-def _collect_from_mt5(
+def _collect_bars_from_mt5(
     symbol: str,
     *,
     lookback: str,
     timeframes: list[str],
-    include_ticks: bool,
     root: str | Path,
 ) -> TaskResult:
-    from slytrade.data.mt5_collectors import MT5BarCollector, MT5TickCollector
+    """Collect MT5 bars for every timeframe (bars are always an MT5 source)."""
+    from slytrade.data.mt5_collectors import MT5BarCollector
     from slytrade.data.storage import MarketDataStorage
     from slytrade.data.time import date_range_from_lookback
 
@@ -192,13 +281,106 @@ def _collect_from_mt5(
             result = MT5BarCollector(mt5, storage).collect(symbol, timeframe, start_dt, end_dt, chunk_size="month")
             summary[f"bars_{timeframe}"] = result.rows
             console.print(f"  bars {timeframe}: {result.rows} rows in {result.file_count} files")
-        if include_ticks:
-            result = MT5TickCollector(mt5, storage).collect(symbol, start_dt, end_dt, chunk_size="day")
-            summary["ticks"] = result.rows
-            console.print(f"  ticks: {result.rows} rows in {result.file_count} files")
-        return TaskResult(True, "collection complete", {"source": "mt5", **summary})
+        return TaskResult(True, "MT5 bars collected", {"source": "mt5", **summary})
     finally:
         _shutdown_mt5(mt5)
+
+
+def _collect_ticks_from_mt5(
+    symbol: str,
+    *,
+    lookback: str,
+    root: str | Path,
+) -> TaskResult:
+    """Collect MT5 ticks (fallback when the Exness archive is unreachable)."""
+    from slytrade.data.mt5_collectors import MT5TickCollector
+    from slytrade.data.storage import MarketDataStorage
+    from slytrade.data.time import date_range_from_lookback
+
+    mt5 = _load_mt5()
+    _init_mt5(mt5)
+    storage = MarketDataStorage(Path(root))
+    start_dt, end_dt = date_range_from_lookback(lookback)
+    try:
+        result = MT5TickCollector(mt5, storage).collect(symbol, start_dt, end_dt, chunk_size="day")
+        console.print(f"  ticks: {result.rows} rows in {result.file_count} files")
+        return TaskResult(True, "MT5 ticks collected", {"source": "mt5", "ticks": result.rows})
+    finally:
+        _shutdown_mt5(mt5)
+
+
+def _download_exness_ticks(
+    symbol: str,
+    *,
+    lookback: str,
+    root: str | Path = "data/raw",
+) -> TaskResult:
+    """Download Exness archive ticks (ticks are always an Exness source)."""
+    from slytrade.data.exness_archive import ExnessArchiveDownloader, normalize_exness_symbol
+    from slytrade.data.time import date_range_from_lookback
+
+    archive_symbol = normalize_exness_symbol(symbol)
+    start_dt, end_dt = date_range_from_lookback(lookback)
+    downloader = ExnessArchiveDownloader(str(root))
+    result = downloader.collect(archive_symbol, start_dt, end_dt, continue_on_error=True)
+    if result.rows <= 0:
+        return TaskResult(False, "Exness archive returned no tick rows")
+    console.print(f"  ticks: {result.rows} rows (Exness archive) in {result.file_count} files")
+    return TaskResult(True, "Exness ticks downloaded", {"source": "exness", "ticks": result.rows})
+
+
+def _collect_from_exness(symbol: str, *, lookback: str, timeframes: list[str]) -> TaskResult:
+    """Exness-only fallback: download ticks and resample them to bars."""
+    from slytrade.data.exness_archive import normalize_exness_symbol
+    from slytrade.data.resample import resample_ticks_to_bars
+    from slytrade.data.sample_generator import write_sample_frame
+
+    archive_symbol = normalize_exness_symbol(symbol)
+    out_root = Path(EXNESS_DERIVED_ROOT) / archive_symbol
+    downloaded = _download_exness_ticks(symbol, lookback=lookback)
+    if not downloaded.ok:
+        return downloaded
+    try:
+        ticks = load_exness_ticks(archive_symbol)
+        if ticks.empty:
+            return TaskResult(False, "Exness archive returned no ticks")
+    except Exception as exc:  # pragma: no cover - network dependent
+        return TaskResult(False, f"Exness collection failed: {exc}")
+
+    files: dict[str, str] = {}
+    for timeframe in timeframes:
+        bars = resample_ticks_to_bars(ticks, timeframe, symbol=archive_symbol)
+        if bars.empty:
+            continue
+        out_root.mkdir(parents=True, exist_ok=True)
+        bars_path = out_root / f"bars_{timeframe}.parquet"
+        write_sample_frame(bars, bars_path)
+        files[f"bars_{timeframe}"] = str(bars_path)
+        console.print(f"  bars {timeframe}: {len(bars)} bars (resampled from Exness ticks)")
+    ticks_path = out_root / "ticks.parquet"
+    write_sample_frame(ticks, ticks_path)
+    files["ticks"] = str(ticks_path)
+    console.print(f"  ticks: {len(ticks)} (Exness archive)")
+    return TaskResult(True, "Exness collection complete (ticks resampled to bars)", {"source": "exness", "files": files})
+
+
+def _collect_from_mt5(
+    symbol: str,
+    *,
+    lookback: str,
+    timeframes: list[str],
+    include_ticks: bool,
+    root: str | Path,
+) -> TaskResult:
+    """MT5-only path: bars for every timeframe plus optional MT5 ticks."""
+    bars = _collect_bars_from_mt5(symbol, lookback=lookback, timeframes=timeframes, root=root)
+    if not bars.ok:
+        return bars
+    if include_ticks:
+        ticks = _collect_ticks_from_mt5(symbol, lookback=lookback, root=root)
+        if ticks.ok:
+            return TaskResult(True, "collection complete (MT5 bars + MT5 ticks)", {"source": "mt5", "bars": bars.data or {}, "ticks": ticks.data or {}})
+    return bars
 
 
 def _load_mt5() -> Any:
@@ -240,35 +422,66 @@ def align(
 ) -> TaskResult:
     from slytrade.data.alignment import align_market_data, render_manifest, save_aligned_dataset
 
-    # Resolve inputs: explicit files, or collected/sample data.
+    # Resolve inputs: explicit files, or the designated sources (MT5 bars +
+    # Exness ticks), or sample data as a last resort.
     bars = None
     ticks = None
+    bars_source = "sample_bars"
+    ticks_source = "sample_ticks"
+
     if bars_file is not None:
         bars = _load_frame(bars_file)
     else:
-        try:
-            bars = load_collected_bars(symbol, timeframe, root)
-        except FileNotFoundError:
-            pass
-        if bars is None:
-            sample = Path(SAMPLE_ROOT) / symbol / f"bars_{timeframe}.parquet"
-            if sample.exists():
-                bars = _load_frame(sample)
-                console.print(f"[yellow]Using sample bars {sample}[/yellow]")
+        for label, path in (
+            ("mt5", None),
+            ("exness_derived", Path(EXNESS_DERIVED_ROOT) / symbol / f"bars_{timeframe}.parquet"),
+            ("sample", Path(SAMPLE_ROOT) / symbol / f"bars_{timeframe}.parquet"),
+        ):
+            if label == "mt5":
+                try:
+                    bars = load_collected_bars(symbol, timeframe, root)
+                except FileNotFoundError:
+                    continue
+            else:
+                assert path is not None
+                if not path.exists():
+                    continue
+                bars = _load_frame(path)
+                console.print(f"[yellow]Using {path}[/yellow]")
+            bars_source = {"mt5": "mt5_bars", "exness_derived": "exness_derived", "sample": "sample_bars"}[label]
+            break
         if bars is None:
             return TaskResult(False, f"no bars found for {symbol} {timeframe}; run collection first")
 
     if ticks_file is not None:
         ticks = _load_frame(ticks_file)
     else:
-        try:
-            ticks = load_collected_ticks(symbol, root)
-        except FileNotFoundError:
-            ticks = None
-        if ticks is None:
-            sample = Path(SAMPLE_ROOT) / symbol / "ticks.parquet"
-            if sample.exists():
-                ticks = _load_frame(sample)
+        # Ticks prefer the Exness archive (designated tick source), then MT5
+        # ticks, then the derived/sample tick files.
+        for label, path in (
+            ("exness", None),
+            ("mt5", None),
+            ("exness_derived", Path(EXNESS_DERIVED_ROOT) / symbol / "ticks.parquet"),
+            ("sample", Path(SAMPLE_ROOT) / symbol / "ticks.parquet"),
+        ):
+            if label == "exness":
+                try:
+                    ticks = load_exness_ticks(symbol, root)
+                except FileNotFoundError:
+                    continue
+            elif label == "mt5":
+                try:
+                    ticks = load_collected_ticks(symbol, root)
+                except FileNotFoundError:
+                    continue
+            else:
+                assert path is not None
+                if not path.exists():
+                    continue
+                ticks = _load_frame(path)
+                console.print(f"[yellow]Using {path}[/yellow]")
+            ticks_source = {"exness": "exness_ticks", "mt5": "mt5_ticks", "exness_derived": "exness_ticks", "sample": "sample_ticks"}[label]
+            break
         if ticks is None:
             return TaskResult(False, f"no ticks found for {symbol}; run collection first")
 
@@ -278,8 +491,8 @@ def align(
         ticks,
         timeframe=timeframe,
         canonical_symbol=symbol,
-        bar_source="mt5_bars" if find_collected_bars(symbol, timeframe, root) else "sample_bars",
-        tick_source="mt5_ticks" if find_collected_ticks(symbol, root) else "sample_ticks",
+        bar_source=bars_source,
+        tick_source=ticks_source,
         include_ict_features=True,
         include_tick_features=True,
         require_fresh_quotes=False,

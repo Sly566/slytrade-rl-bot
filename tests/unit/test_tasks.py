@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pandas as pd
+
 from slytrade import tasks
 from slytrade.rl.environment import RLEnvironmentConfig
 
@@ -42,3 +44,114 @@ def test_default_point_value() -> None:
     assert tasks.default_point_value("XAUUSD") == 100.0
     assert tasks.default_point_value("XAGUSD") == 100.0
     assert tasks.default_point_value("EURUSD") == 1.0
+
+
+def test_symbol_dir_finds_broker_suffix(tmp_path: Path) -> None:
+    from slytrade.data.schemas import BAR_COLUMNS
+
+    # MT5 stores bars under the RESOLVED symbol (XAUUSDm).
+    base = tmp_path / "mt5_bars" / "symbol=XAUUSDm" / "timeframe=M1" / "year=2026"
+    base.mkdir(parents=True)
+    bars = pd.DataFrame(
+        {
+            "time": pd.date_range("2026-01-01", periods=5, freq="min", tz="UTC"),
+            "symbol": "XAUUSDm",
+            "timeframe": "M1",
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.5,
+            "tick_volume": 10.0,
+            "spread": 20.0,
+            "real_volume": 0.0,
+        }
+    )[BAR_COLUMNS]
+    bars.to_parquet(base / "day=01.parquet", index=False)
+
+    # Base-symbol lookup must find the suffix variant.
+    assert len(tasks.find_collected_bars("XAUUSD", "M1", root=tmp_path)) == 1
+    loaded = tasks.load_collected_bars("XAUUSD", "M1", root=tmp_path)
+    assert len(loaded) == 5
+
+
+def test_symbol_dir_prefers_shortest_suffix(tmp_path: Path) -> None:
+    from slytrade.data.schemas import BAR_COLUMNS
+
+    for resolved in ("XAUUSDm", "XAUUSD247m"):
+        base = tmp_path / "mt5_bars" / f"symbol={resolved}" / "timeframe=M1" / "y=2026"
+        base.mkdir(parents=True)
+        bars = pd.DataFrame(
+            {
+                "time": pd.date_range("2026-01-01", periods=3, freq="min", tz="UTC"),
+                "symbol": resolved,
+                "timeframe": "M1",
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.0,
+                "close": 100.5,
+                "tick_volume": 10.0,
+                "spread": 20.0,
+                "real_volume": 0.0,
+            }
+        )[BAR_COLUMNS]
+        bars.to_parquet(base / "d.parquet", index=False)
+
+    # XAUUSDm (shorter) is preferred over XAUUSD247m.
+    files = tasks.find_collected_bars("XAUUSD", "M1", root=tmp_path)
+    assert len(files) == 1
+    assert "XAUUSDm" in str(files[0])
+
+
+def test_align_hybrid_mt5_bars_exness_ticks(tmp_path: Path, monkeypatch) -> None:
+    from slytrade.data.schemas import BAR_COLUMNS, TICK_COLUMNS
+
+    # MT5 bars under resolved symbol.
+    bar_dir = tmp_path / "mt5_bars" / "symbol=XAUUSDm" / "timeframe=M1" / "y=2026"
+    bar_dir.mkdir(parents=True)
+    bar_times = pd.date_range("2026-01-01", periods=120, freq="min", tz="UTC")
+    bars = pd.DataFrame(
+        {
+            "time": bar_times,
+            "symbol": "XAUUSDm",
+            "timeframe": "M1",
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.5,
+            "tick_volume": 10.0,
+            "spread": 20.0,
+            "real_volume": 0.0,
+        }
+    )[BAR_COLUMNS]
+    bars.to_parquet(bar_dir / "d.parquet", index=False)
+
+    # Exness ticks under base symbol (canonical Exness layout).
+    tick_dir = tmp_path / "exness_ticks" / "symbol=XAUUSD" / "year=2026" / "month=01"
+    tick_dir.mkdir(parents=True)
+    tick_times = pd.date_range("2026-01-01", periods=1200, freq="6s", tz="UTC")
+    mid = 100.0 + pd.Series(range(1200), dtype=float) * 0.0001
+    ticks = pd.DataFrame(
+        {
+            "time_msc": tick_times,
+            "time": tick_times.floor("s"),
+            "symbol": "XAUUSD",
+            "bid": (mid - 0.01).round(3),
+            "ask": (mid + 0.01).round(3),
+            "last": 0.0,
+            "volume": 1.0,
+            "volume_real": 0.0,
+            "flags": 0.0,
+            "spread": 0.02,
+            "mid": mid,
+        }
+    )[TICK_COLUMNS]
+    ticks.to_parquet(tick_dir / "period=2026-01.parquet", index=False)
+
+    monkeypatch.setattr(tasks, "SAMPLE_ROOT", str(tmp_path / "samples"))
+    monkeypatch.setattr(tasks, "EXNESS_DERIVED_ROOT", str(tmp_path / "exness_derived"))
+    monkeypatch.chdir(tmp_path)
+
+    result = tasks.align("XAUUSD", timeframe="M1", root=str(tmp_path))
+    assert result.ok, result.message
+    # Hybrid alignment: canonical symbol XAUUSD, MT5 bars + Exness ticks.
+    assert result.data is not None

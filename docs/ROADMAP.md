@@ -143,6 +143,9 @@
 
 ## Phase 10: Outstanding (not yet done)
 
+- [x] Designated-source collection: bars from MT5 + ticks from Exness (hybrid), autonomous
+- [x] Suffix-aware symbol discovery (XAUUSD → XAUUSDm) so hybrid collection aligns automatically
+- [x] Offline tick→bar resampling (Exness-only fallback, no MT5 terminal)
 - [ ] Swap/margin/holiday handling in the live adapter
 - [ ] PVC-backed durable state for Kubernetes
 - [ ] Multi-symbol paper portfolio (parallel loops)

@@ -26,8 +26,8 @@ The bot ships two ways to run it:
 ## From scratch to a deployable model
 
 ```bash
-# One-shot full pipeline (use --source mt5 when your MT5 bridge is running)
-slytrade full-pipeline --symbol XAUUSD --source auto
+# One-shot full pipeline — bars from MT5, ticks from the Exness archive
+slytrade full-pipeline --symbol XAUUSD --source hybrid
 
 # Or step through the GUI
 slytrade ui
@@ -36,7 +36,7 @@ slytrade ui
 The `full-pipeline` flow:
 
 ```text
-collect (bars all timeframes + ticks)
+collect (MT5 bars all timeframes + Exness archive ticks)
   → align (ICT features + decision quotes + manifest)
   → backtest (persona-adaptive, managed exits)
   → train (artifact + registry)
@@ -44,12 +44,28 @@ collect (bars all timeframes + ticks)
   → promote (paper stage)
 ```
 
-## Sample mode
+## Data sources (designated-source collection)
 
-Without an MT5 terminal, pass `--source samples` (or choose "No" for live MT5 in
-the UI). This generates deterministic synthetic bars/ticks so the whole pipeline
-can be smoke-tested end-to-end on any machine. Synthetic data has no real edge —
-use MT5/Exness data for any evidence-based decision.
+SlyTrade's data model is fixed and autonomous: **bars always come from MT5,
+ticks always come from the Exness archive.** Collection pulls each from its
+designated source and stitches them together for the pipeline.
+
+| Source | Bars from | Ticks from | Needs MT5? |
+|---|---|---|---|
+| **hybrid** (default) | MT5 terminal (all timeframes) | Exness archive | ✅ |
+| auto | MT5 → Exness → samples (graceful fallback) | Exness → MT5 → samples | optional |
+| mt5 | MT5 | MT5 | ✅ |
+| exness | resampled from Exness ticks | Exness archive | ❌ |
+| samples | synthetic | synthetic | ❌ |
+
+```bash
+slytrade collect-all --symbol XAUUSD --source hybrid --lookback 1y
+```
+
+The alignment layer resolves the broker suffix automatically (`XAUUSDm` bars +
+`XAUUSD` archive ticks → canonical `XAUUSD` dataset). `--source exness` remains
+as a terminal-free fallback (resamples real Exness ticks to bars). Synthetic
+data has no real edge — use it only to verify the machinery.
 
 ## Trained model → trading
 
