@@ -108,14 +108,25 @@ must be reachable from the container before any broker preflight.
 Containerization does not bypass reconciliation, freshness, model-governance,
 paper-soak, or manual-approval gates.
 
+## Task console (GUI) & full pipeline
+
+```bash
+slytrade ui                                  # interactive Rich task menu
+slytrade full-pipeline --symbol XAUUSD       # collect → align → backtest → train → walk-forward → promote
+slytrade collect-all --symbol XAUUSD         # bars (all timeframes) + ticks in one step
+```
+
+See `docs/TASK_CONSOLE.md` for the full task list.
+
 ## Paper trading & observability (production runtime)
 
 ```bash
 slytrade paper                              # live quotes via the MT5 bridge
 slytrade paper --replay-ticks data/ticks.parquet   # deterministic replay
+slytrade demo                               # guarded LIVE demo-account loop (SLYTRADE_ALLOW_LIVE=1 + stage=demo)
 slytrade serve                              # Prometheus metrics + /healthz + /readyz
 slytrade reconcile --symbol XAUUSD          # scheduled broker reconciliation (exit 0/2)
-slytrade train-rl --algorithm ppo|sac|td3   # RL training (PPO/SAC/TD3 + optional MLflow)
+slytrade train-rl --algorithm ppo|sac|td3 --policy mlp|lstm --reward risk_adjusted|raw
 ```
 
 - Orders flow through the full guarded path: strategy → guardrails → OMS → paper

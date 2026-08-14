@@ -192,7 +192,31 @@ kubectl apply -k deploy/kubernetes
 
 ---
 
-## 8. Bottom line
+## 8. RL suite — completeness matrix (final pass)
+
+| Aspect | Status |
+|---|---|
+| PPO / SAC / TD3 training | ✅ `train_policy` + `resolve_algorithm` |
+| Recurrent policy (regime memory) | ✅ `--policy lstm` (MlpLstmPolicy) |
+| Risk-adjusted reward (drawdown/turnover-penalised) | ✅ wired into the environment (`reward_type`) |
+| Walk-forward with embargo + per-fold scaler | ✅ |
+| Optuna hyperparameter sweep | ✅ (`optimize_ppo`) |
+| Multi-seed / cost-stress / lockbox governance | ✅ (`rl.governance`) |
+| Model artifact packaging (weights + scaler + features + config + hash) | ✅ `rl.deployment` |
+| Hash-chained registry + evidence-gated promotion | ✅ `ModelRegistry` / `promote_artifact` |
+| Inference strategy (saved model → orders) | ✅ `rl.inference.RLPolicyStrategy` |
+| MLflow tracking (opt-in) | ✅ `rl.tracking` |
+
+## 9. Task console & live demo (final pass)
+
+- `slytrade ui` — Rich interactive task menu (collect / align / backtest / train /
+  walk-forward / promote / paper / demo / reconcile / doctor).
+- `slytrade collect-all` — bars for every timeframe + ticks in one step.
+- `slytrade full-pipeline` — collect → align → backtest → train → walk-forward → promote.
+- `slytrade demo` — guarded live demo-account loop (real demo orders via the MT5
+  adapter, broker symbol-spec sizing, reconciliation-gated).
+
+## 10. Bottom line
 
 This is now a **production-shaped** system: the research layers were already strong, and
 the missing operational runtime (paper loop, observability, circuit breakers,

@@ -16,6 +16,8 @@ data/journal/
 logs/
 state/
 reports/
+models/
+mlruns/
 *.parquet
 *.npy
 *.npz

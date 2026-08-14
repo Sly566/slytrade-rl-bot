@@ -108,5 +108,12 @@ access to the MT5 bridge.
 3. Complete every check in `slytrade.monitoring.gates.DEFAULT_DEMO_GATE`
    (tests, lint, type check, historical validation, cost stress, seed stability,
    lockbox, paper stability, MT5 reconciliation, rollback verification, manual approval).
-4. Only then consider `SLYTRADE_STAGE=demo` with real (demo) broker account and
-   `SLYTRADE_ALLOW_LIVE=1`.
+4. Then run **demo** trading on a demo account:
+
+```bash
+SLYTRADE_ALLOW_LIVE=1 SLYTRADE_STAGE=demo slytrade demo
+```
+
+The demo loop refuses to start without both flags, reconciles broker state
+before the first order, sizes positions from the broker's symbol spec, and
+attaches server-side SL/TP to every entry. It never blocks risk-reducing exits.

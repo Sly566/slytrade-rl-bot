@@ -505,6 +505,8 @@ def persona_backtest(
 def train_rl(
     bars_file: str = typer.Option(..., help="Aligned bars file with decision quote / ICT columns (.csv or .parquet)"),
     algorithm: str = typer.Option("ppo", help="RL algorithm: ppo, sac, or td3"),
+    policy: str = typer.Option("mlp", help="Policy network: mlp or lstm (recurrent)"),
+    reward: str = typer.Option("risk_adjusted", help="Reward type: risk_adjusted or raw"),
     total_timesteps: int = typer.Option(100_000, help="Number of training steps"),
     seed: int = typer.Option(42, help="Random seed"),
     learning_rate: float = typer.Option(3e-4, help="Learning rate"),
@@ -524,78 +526,20 @@ def train_rl(
     scaler fitted on the training slice. If MLflow is installed the run is
     recorded as an experiment.
     """
-    from slytrade.backtest.reporting import load_bars_file
-    from slytrade.rl.dataset import build_rl_dataset
-    from slytrade.rl.tracking import maybe_end_run, maybe_log_metrics, maybe_log_params, maybe_start_run
-    from slytrade.rl.walkforward import (
-        evaluate_policy,
-        resolve_algorithm,
-        train_policy,
-        train_ppo,
+    from slytrade.tasks import train as train_task
+
+    result = train_task(
+        bars_file,
+        symbol=symbol,
+        algorithm=algorithm,
+        total_timesteps=total_timesteps,
+        seed=seed,
+        policy=policy,
+        reward=reward,
+        artifacts_dir=model_dir,
     )
-
-    algorithm = resolve_algorithm(algorithm)
-
-    bars = load_bars_file(Path(bars_file))
-    resolved_symbol = infer_symbol(bars, symbol)
-    bars = bars[bars["symbol"] == resolved_symbol].copy()
-    dataset = build_rl_dataset(bars)
-    scaler_params = dataset.fit_scaler(0, len(dataset.bars))
-    env = dataset.env_factory(0, len(dataset.bars), seed=seed, scaler_params=scaler_params)
-
-    run = maybe_start_run("slytrade-rl", run_name=f"{algorithm}-{resolved_symbol}-{seed}")
-    maybe_log_params(
-        run,
-        {
-            "algorithm": algorithm,
-            "symbol": resolved_symbol,
-            "seed": seed,
-            "total_timesteps": total_timesteps,
-            "learning_rate": learning_rate,
-            "gamma": gamma,
-            "bars": len(dataset.bars),
-        },
-    )
-    try:
-        if algorithm == "ppo":
-            model = train_ppo(
-                env,
-                total_timesteps=total_timesteps,
-                seed=seed,
-                learning_rate=learning_rate,
-                n_steps=n_steps,
-                batch_size=batch_size,
-                n_epochs=n_epochs,
-                gamma=gamma,
-                gae_lambda=gae_lambda,
-                model_dir=model_dir,
-            )
-        else:
-            model = train_policy(
-                algorithm,
-                env,
-                total_timesteps=total_timesteps,
-                seed=seed,
-                model_dir=model_dir,
-                policy_kwargs={"learning_rate": learning_rate, "gamma": gamma},
-            )
-
-        results = evaluate_policy(model, env, episodes=3, seed=seed)
-        maybe_log_metrics(
-            run,
-            {
-                "mean_total_return": float(results["mean_total_return"]),
-                "mean_max_drawdown": float(results["mean_max_drawdown"]),
-                "mean_n_trades": float(results["mean_n_trades"]),
-            },
-        )
-    finally:
-        maybe_end_run(run)
-
-    console.print(f"[green]Trained {algorithm.upper()} policy saved to {model_dir}.zip[/green]")
-    console.print(f"Mean total return: {results['mean_total_return']:.4f}")
-    console.print(f"Mean max drawdown: {results['mean_max_drawdown']:.4f}")
-    console.print(f"Mean trades per episode: {results['mean_n_trades']:.1f}")
+    if not result.ok:
+        raise typer.Exit(code=1)
 
 
 @app.command()
@@ -1257,12 +1201,88 @@ def reconcile(
 
 
 @app.command()
+def ui() -> None:
+    """Launch the interactive Rich console (task-based GUI)."""
+    from slytrade.ui import run_ui
+
+    run_ui()
+
+
+@app.command()
+def collect_all(
+    symbol: str = typer.Option("XAUUSD", help="Symbol to collect, e.g. XAUUSD"),
+    lookback: str = typer.Option("1y", help="Lookback duration, e.g. 1d, 1w, 1m, 1y"),
+    source: str = typer.Option("auto", help="auto, mt5, or samples"),
+) -> None:
+    """Collect bars for every timeframe plus ticks in one step."""
+    from slytrade.tasks import collect_all as run_collect
+
+    result = run_collect(symbol, lookback=lookback, source=source)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def full_pipeline(
+    symbol: str = typer.Option("XAUUSD", help="Symbol to run the pipeline for"),
+    lookback: str = typer.Option("1y", help="Lookback duration"),
+    source: str = typer.Option("auto", help="auto, mt5, or samples"),
+    algorithm: str = typer.Option("ppo", help="ppo, sac, or td3"),
+    total_timesteps: int = typer.Option(50_000, help="Training steps"),
+    policy: str = typer.Option("mlp", help="mlp or lstm"),
+    reward: str = typer.Option("risk_adjusted", help="risk_adjusted or raw"),
+    promote_stage: str = typer.Option("paper", help="Stage to promote the model to"),
+) -> None:
+    """Run the entire pipeline from scratch: collect → align → backtest → train
+    → walk-forward → promote."""
+    from slytrade.tasks import full_pipeline as run_pipeline
+
+    result = run_pipeline(
+        symbol,
+        lookback=lookback,
+        source=source,
+        algorithm=algorithm,
+        total_timesteps=total_timesteps,
+        policy=policy,
+        reward=reward,
+        promote_stage=promote_stage,
+    )
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def demo() -> None:
+    """Run the guarded live demo-account trading loop.
+
+    Requires SLYTRADE_ALLOW_LIVE=1 and SLYTRADE_STAGE=demo. Real orders are
+    placed on the demo account through the MT5 adapter after reconciliation.
+    """
+    from slytrade.runtime.demo_loop import DemoTradingLoop
+    from slytrade.runtime.settings import RuntimeSettings
+
+    settings = RuntimeSettings()
+    if not settings.allow_live or settings.stage.value != "demo":
+        console.print("[bold red]Demo trading is disabled.[/bold red]")
+        console.print("Set SLYTRADE_ALLOW_LIVE=1 and SLYTRADE_STAGE=demo in your environment first.")
+        raise typer.Exit(code=1)
+
+    loop = DemoTradingLoop(settings, load_mt5())
+    console.print("[bold red]LIVE DEMO TRADING — real orders on the demo account.[/bold red]")
+    try:
+        loop.run()
+    except KeyboardInterrupt:
+        console.print("[yellow]Demo loop stopped.[/yellow]")
+
+
+@app.command()
 def live() -> None:
     """Live trading entry point (fail-closed by design).
 
     Live trading stays disabled until the deployment gate in
     ``slytrade.monitoring.gates`` is satisfied AND ``SLYTRADE_ALLOW_LIVE=1`` is
-    set. Use ``slytrade paper`` for supervised paper trading first.
+    set. Use ``slytrade paper`` for supervised paper trading first, then
+    ``slytrade demo`` for live demo-account testing.
     """
     from slytrade.runtime.settings import RuntimeSettings
 
@@ -1270,7 +1290,7 @@ def live() -> None:
     if not settings.allow_live:
         console.print("[bold red]Live trading is disabled.[/bold red]")
         console.print("Set SLYTRADE_ALLOW_LIVE=1 only after the deployment gate is approved.")
-        console.print("Run `slytrade paper` for supervised paper trading.")
+        console.print("Run `slytrade paper` for supervised paper trading, then `slytrade demo`.")
         raise typer.Exit(code=1)
     console.print("[bold yellow]Live trading requires the approved deployment gate.[/bold yellow]")
     raise typer.Exit(code=1)

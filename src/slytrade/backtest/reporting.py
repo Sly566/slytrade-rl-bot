@@ -116,6 +116,7 @@ def build_strategy(
     slow_window: int = 20,
     min_mtf_score: int = 2,
     require_mtf_bias_alignment: bool = True,
+    point_value: float = 1.0,
 ) -> BarStrategy:
     if strategy_name == "no-trade":
         return NoTradeStrategy()
@@ -138,7 +139,13 @@ def build_strategy(
             volume=volume,
         )
     if strategy_name == "persona-adaptive":
-        return PersonalityAdaptiveStrategy(symbol=symbol, volume=volume)
+        from slytrade.strategies.personality_adaptive import PersonalityAdaptiveConfig
+
+        return PersonalityAdaptiveStrategy(
+            symbol=symbol,
+            volume=volume,
+            config=PersonalityAdaptiveConfig(point_value=point_value),
+        )
     raise ValueError(f"Unknown strategy '{strategy_name}'. Valid strategies: {', '.join(VALID_STRATEGIES)}")
 
 
@@ -201,6 +208,7 @@ def run_managed_aligned_backtest_from_bars(
     slow_window: int = 20,
     min_mtf_score: int = 2,
     require_mtf_bias_alignment: bool = True,
+    point_value: float = 1.0,
     config: BacktestConfig | None = None,
     trade_config: TradeManagementConfig | None = None,
 ) -> BacktestResult:
@@ -212,6 +220,7 @@ def run_managed_aligned_backtest_from_bars(
         volume=volume,
         fast_window=fast_window,
         slow_window=slow_window,
+        point_value=point_value,
     )
     engine = ManagedAlignedBacktestEngine(config, trade_config)
     return engine.run(prepared_bars, strategy)

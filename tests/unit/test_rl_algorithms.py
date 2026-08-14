@@ -24,3 +24,15 @@ def test_train_policy_rejects_unknown_without_imports() -> None:
     # Unknown algorithms fail fast (before any stable-baselines3 import).
     with pytest.raises(ValueError):
         train_policy("dqn", object())
+
+
+def test_policy_class_resolution() -> None:
+    from slytrade.rl.walkforward import _policy_class
+
+    assert _policy_class("mlp") == "MlpPolicy"
+    assert _policy_class("lstm") == "MlpLstmPolicy"
+    assert _policy_class("recurrent") == "MlpLstmPolicy"
+    import pytest
+
+    with pytest.raises(ValueError):
+        _policy_class("transformer")

@@ -89,6 +89,10 @@ class RLEnvironmentConfig:
     max_position_volume: float = 10.0
     risk_per_trade: float = 0.005
     seed: int = 42
+    # "raw" = plain equity delta; "risk_adjusted" = drawdown/turnover-penalised
+    # reward from slytrade.rl.rewards (recommended for production training).
+    reward_type: str = "raw"
+    drawdown_tolerance: float = 0.05
 
 
 if gym is not None:
@@ -124,12 +128,14 @@ if gym is not None:
             self.current_step = 0
             self._position = 0
             self._equity = self.config.initial_balance
+            self._peak_equity = self.config.initial_balance
 
         def reset(self, *, seed: int | None = None, options: dict | None = None):
             super().reset(seed=seed)
             self.current_step = 0
             self._position = 0
             self._equity = self.config.initial_balance
+            self._peak_equity = self.config.initial_balance
             self.ledger.records.clear()
             return self._observation(), {}
 
@@ -139,6 +145,7 @@ if gym is not None:
             if self.current_step >= len(self.bars):
                 raise RuntimeError("step() called past the end of the episode; call reset()")
             previous = float(self.bars.iloc[self.current_step]["close"])
+            old_position = self._position
             target = self._position
             if action == 1:
                 target = 1
@@ -146,7 +153,7 @@ if gym is not None:
                 target = -1
             elif action == 3:
                 target = 0
-            turnover = abs(target - self._position)
+            turnover = abs(target - old_position)
             if turnover and target:
                 intent = OrderIntent(
                     symbol=str(self.bars.iloc[self.current_step]["symbol"]),
@@ -164,11 +171,33 @@ if gym is not None:
                 )
             self.current_step += 1
             current = float(self.bars.iloc[min(self.current_step, len(self.bars) - 1)]["close"])
-            reward = self._equity * (target * (current - previous) / max(previous, 1e-12))
-            reward -= self._equity * turnover * self.config.transaction_cost
-            self._equity += reward
+            previous_equity = self._equity
+            equity_delta = previous_equity * (target * (current - previous) / max(previous, 1e-12))
+            equity_delta -= previous_equity * turnover * self.config.transaction_cost
+            self._equity = previous_equity + equity_delta
+            self._peak_equity = max(self._peak_equity, self._equity)
             self._position = target
             terminated = self.current_step >= len(self.bars) - 1 or self._equity <= 0
+
+            if self.config.reward_type == "risk_adjusted":
+                from slytrade.rl.rewards import RewardConfig, shaped_reward
+
+                # The raw delta already includes transaction costs, so the shaper's
+                # cost term is disabled to avoid double counting.
+                reward = shaped_reward(
+                    previous_equity=previous_equity,
+                    equity=self._equity,
+                    position=old_position,
+                    target_position=target,
+                    peak_equity=self._peak_equity,
+                    config=RewardConfig(
+                        transaction_cost=0.0,
+                        drawdown_tolerance=self.config.drawdown_tolerance,
+                    ),
+                )
+            else:
+                reward = equity_delta
+
             return self._observation(), float(reward), terminated, False, {
                 "equity": float(self._equity),
                 "n_trades": len(self.ledger.records),

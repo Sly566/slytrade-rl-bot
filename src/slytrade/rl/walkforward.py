@@ -119,18 +119,21 @@ def train_ppo(
     gamma: float = 0.99,
     gae_lambda: float = 0.95,
     policy_kwargs: dict | None = None,
+    policy_type: str = "mlp",
     model_dir: str | None = None,
     verbose: int = 0,
 ):
-    """Train a PPO policy on the environment. Returns (model, fitted history_len).
+    """Train a PPO policy on the environment. Returns the trained model.
 
-    All stable-baselines3 imports happen here so importing this module never
-    requires torch/SB3 to be installed.
+    ``policy_type`` selects the network: "mlp" (default) or "lstm" (recurrent,
+    for regime memory). All stable-baselines3 imports happen here so importing
+    this module never requires torch/SB3 to be installed.
     """
     from stable_baselines3 import PPO
 
+    policy = _policy_class(policy_type)
     model = PPO(
-        "MlpPolicy",
+        policy,
         env,
         learning_rate=learning_rate,
         n_steps=n_steps,
@@ -146,6 +149,15 @@ def train_ppo(
     if model_dir:
         model.save(model_dir)
     return model
+
+
+def _policy_class(policy_type: str) -> str:
+    normalized = policy_type.strip().lower()
+    if normalized in ("mlp", "mlppolicy"):
+        return "MlpPolicy"
+    if normalized in ("lstm", "recurrent", "mlplstm"):
+        return "MlpLstmPolicy"
+    raise ValueError(f"unsupported policy_type {policy_type!r}; use 'mlp' or 'lstm'")
 
 
 SUPPORTED_ALGORITHMS: tuple[str, ...] = ("ppo", "sac", "td3")
@@ -183,6 +195,7 @@ def train_policy(
     seed: int = 42,
     model_dir: str | None = None,
     policy_kwargs: dict | None = None,
+    policy_type: str = "mlp",
     verbose: int = 0,
 ):
     """Train a policy with any supported algorithm (PPO/SAC/TD3).
@@ -192,7 +205,8 @@ def train_policy(
     ``policy_kwargs`` (the caller decides what makes sense for the algorithm).
     """
     cls = _sb3_class(algorithm)
-    model = cls("MlpPolicy", env, seed=seed, policy_kwargs=policy_kwargs or {}, verbose=verbose)
+    policy = _policy_class(policy_type) if algorithm == "ppo" else "MlpPolicy"
+    model = cls(policy, env, seed=seed, policy_kwargs=policy_kwargs or {}, verbose=verbose)
     model.learn(total_timesteps=total_timesteps)
     if model_dir:
         model.save(model_dir)
@@ -230,7 +244,7 @@ def evaluate_ppo(
     for episode in range(episodes):
         obs, _ = env.reset(seed=seed + episode)
         episode_return = 0.0
-        equity_curve = [env.initial_balance]
+        equity_curve = [env.config.initial_balance]
         done = False
         truncated = False
         while not done and not truncated:

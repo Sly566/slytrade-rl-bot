@@ -124,9 +124,25 @@
 - [x] Economic-calendar / news gate for red-folder avoidance
 - [x] Webhook + Telegram alerting on kill-switch, soak and broker errors
 
-## Phase 8: Outstanding (not yet done)
+## Phase 8: RL suite completion
 
-- [ ] Recurrent policy for regime memory
+- [x] Risk-adjusted reward shaping wired into the RL environment (`reward_type`)
+- [x] Recurrent policy (MlpLstmPolicy) for regime memory (`--policy lstm`)
+- [x] Model artifact packaging: weights + scaler + feature columns + config + hash
+- [x] Artifact registration in the hash-chained model registry
+- [x] Evidence-gated promotion helper (`promote_artifact`)
+- [x] Inference strategy (RLPolicyStrategy) so a saved artifact can trade
+
+## Phase 9: Task-based CLI / GUI and live demo
+
+- [x] `slytrade ui` — Rich interactive task menu (no flags to memorise)
+- [x] `slytrade collect-all` — bars for every timeframe + ticks in one step
+- [x] `slytrade full-pipeline` — collect → align → backtest → train → walk-forward → promote
+- [x] `slytrade demo` — guarded live demo-account trading loop (real demo orders)
+- [x] Broker symbol-spec point-value resolution for realistic demo sizing
+
+## Phase 10: Outstanding (not yet done)
+
 - [ ] Swap/margin/holiday handling in the live adapter
 - [ ] PVC-backed durable state for Kubernetes
 - [ ] Multi-symbol paper portfolio (parallel loops)
