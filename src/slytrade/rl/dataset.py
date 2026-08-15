@@ -177,18 +177,25 @@ def build_rl_dataset(bars: pd.DataFrame, personality: TraderPersonality | None =
 
     feature_columns = rl_feature_columns(bars)
     adopted = [column for column in feature_columns if column in bars.columns and column not in ml_features.columns]
-    features = ml_features.reset_index(drop=True)
-    for column in adopted:
-        features[column] = pd.to_numeric(bars[column].reset_index(drop=True), errors="coerce")
 
     # Persona + regime conditioning channel (the "professional trader" wiring).
     from slytrade.rl.mode_vector import build_mode_matrix
 
     mode = build_mode_matrix(bars, personality).reset_index(drop=True)
-    for column in mode.columns:
-        features[column] = mode[column].to_numpy()
 
+    # Build the feature frame in one shot with concat: per-column assignment
+    # fragments the DataFrame and emits a PerformanceWarning for every column
+    # (the aligned bars carry ~200 adopted columns). Single-shot concat keeps
+    # the frame contiguous and the console clean.
+    frames = [ml_features.reset_index(drop=True)]
+    if adopted:
+        adopted_frame = bars[adopted].reset_index(drop=True)
+        adopted_frame = adopted_frame.apply(pd.to_numeric, errors="coerce")
+        frames.append(adopted_frame)
+    frames.append(mode)
+    features = pd.concat(frames, axis=1)
     features = features.fillna(0.0)
+
     return RLDataset(
         bars=bars,
         features=features,

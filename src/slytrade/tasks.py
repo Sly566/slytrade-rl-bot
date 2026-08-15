@@ -1015,7 +1015,17 @@ def train(
          f"(SL {env.config.stop_loss_atr}×ATR, TP {env.config.take_profit_atr}×ATR) | "
          f"episode length: {env.config.episode_length_bars} bars")
 
-    run = maybe_start_run("slytrade-rl", run_name=f"{algorithm}-{resolved}-{seed}")
+    # Model ids are unique per training run: the registry is append-only and
+    # refuses duplicates, so a deterministic id would collide on every re-run
+    # (exactly what broke the second pipeline run).
+    from datetime import UTC, datetime
+
+    # Microsecond resolution makes collisions between successive runs
+    # effectively impossible.
+    run_stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%f")
+    model_id = f"{algorithm}-{resolved}-{seed}-{run_stamp}"
+
+    run = maybe_start_run("slytrade-rl", run_name=model_id)
     maybe_log_params(run, {"algorithm": algorithm, "symbol": resolved, "seed": seed, "timesteps": total_timesteps, "policy": policy, "reward": reward, "features": len(dataset.features.columns)})
     try:
         if algorithm == "ppo":
@@ -1029,7 +1039,7 @@ def train(
 
     record = save_model_artifact(
         model,
-        model_id=f"{algorithm}-{resolved}-{seed}",
+        model_id=model_id,
         algorithm=algorithm,
         symbol=resolved,
         feature_columns=list(dataset.features.columns),
