@@ -1,6 +1,16 @@
 services:
   # Production paper-trading service (default). Runs the supervised loop with
   # Prometheus metrics on :9108. Fail-closed: live trading stays disabled.
+  #
+  # IMPORTANT — host directory ownership:
+  # The container runs as YOUR host user (UID/GID passthrough below), NOT as a
+  # fixed container uid. Without this, files written into the ./data ./logs
+  # ./state bind mounts end up owned by the container's uid (10001) on the
+  # host, which then breaks native runs with "Permission denied".
+  #
+  # Docker also creates MISSING bind-mount directories as root. So before the
+  # first `docker compose up`, run once from the project root:
+  #     mkdir -p data logs state
   slytrade:
     build:
       context: .
@@ -8,6 +18,7 @@ services:
       args:
         EXTRAS: data,mt5
     image: slytrade-rl-bot:production
+    user: "${UID:-1000}:${GID:-1000}"
     init: true
     read_only: true
     tmpfs:
@@ -46,6 +57,7 @@ services:
       args:
         EXTRAS: data,mt5
     image: slytrade-rl-bot:development
+    user: "${UID:-1000}:${GID:-1000}"
     init: true
     command: ["doctor"]
     environment:

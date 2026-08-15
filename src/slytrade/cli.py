@@ -181,6 +181,21 @@ def doctor() -> None:
     ]:
         table.add_row(f"file:{path}", "OK" if Path(path).exists() else "MISSING")
 
+    # Data/output directories: report whether they exist and are writable, and
+    # who owns the nearest existing ancestor when they are not.
+    for path in ["data/raw", "data/processed", "data/exness_derived", "data/samples", "models", "logs", "state"]:
+        candidate = Path(path)
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            probe = candidate / ".write_probe"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink()
+            table.add_row(f"dir:{path}", "[green]OK (writable)[/green]")
+        except PermissionError:
+            table.add_row(f"dir:{path}", "[red]PERMISSION DENIED — run: sudo chown -R \"$USER\":\"$USER\" .[/red]")
+        except OSError as exc:
+            table.add_row(f"dir:{path}", f"[red]ERROR: {exc}[/red]")
+
     console.print(table)
 
 

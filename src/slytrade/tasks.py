@@ -8,7 +8,9 @@ flags by hand. They return small result dicts the UI can render.
 
 from __future__ import annotations
 
+import getpass
 import importlib.util
+import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -295,13 +297,33 @@ def collect_all(
     return TaskResult(True, "sample data generated", {"source": "samples", "files": files})
 
 
+def _nearest_existing_owner(path: Path) -> tuple[Path, str]:
+    """Find the nearest existing ancestor of `path` and who owns it."""
+    ancestor = path
+    while not ancestor.exists() and ancestor.parent != ancestor:
+        ancestor = ancestor.parent
+    owner = "unknown"
+    try:
+        stat = ancestor.stat()
+        try:
+            import pwd
+
+            owner = f"{pwd.getpwuid(stat.st_uid).pw_name} (uid {stat.st_uid})"
+        except (ImportError, KeyError):  # pragma: no cover - uid without passwd entry
+            owner = f"uid {stat.st_uid}"
+    except OSError:  # pragma: no cover
+        pass
+    return ancestor, owner
+
+
 def _ensure_writable_root(root: str | Path) -> TaskResult | None:
     """Create (or re-create) a data path and verify it is writable.
 
     The path is created if missing — so a folder the operator deleted is
-    recreated automatically. A friendly error is returned only when creation
-    genuinely fails (the usual cause: the parent is owned by root from sudo or
-    a Docker bind mount, or the drive is exFAT/NTFS).
+    recreated automatically. A friendly, self-diagnosing error is returned only
+    when creation genuinely fails (the usual causes: a parent owned by root
+    from sudo/Docker, or an external drive with a filesystem that ignores Unix
+    ownership such as exFAT/NTFS).
     """
     root_path = Path(root)
     try:
@@ -310,14 +332,22 @@ def _ensure_writable_root(root: str | Path) -> TaskResult | None:
         probe.write_text("ok", encoding="utf-8")
         probe.unlink()
     except PermissionError:
+        ancestor, owner = _nearest_existing_owner(root_path)
+        try:
+            current = f"{getpass.getuser()} (uid {os.getuid()})"
+        except Exception:  # pragma: no cover
+            current = f"uid {os.getuid()}"
         return TaskResult(
             False,
-            f"cannot create or write to '{root_path}' (permission denied). "
-            "The folder may have been deleted and could not be recreated, or a parent "
-            "is owned by another user (e.g. root from sudo or a Docker bind mount). Fix with:\n"
+            f"cannot create or write to '{root_path}' (permission denied).\n"
+            f"  you are running as: {current}\n"
+            f"  nearest existing path '{ancestor}' is owned by: {owner}\n"
+            "If that path is owned by root (Docker creates host bind dirs as root), fix with:\n"
             f"  sudo chown -R \"$USER\":\"$USER\" \"{root_path}\"\n"
-            "If chown reports 'Operation not permitted', the drive is likely exFAT/NTFS; "
-            "check its mount options instead.",
+            "If chown reports 'Operation not permitted', the drive is exFAT/NTFS and "
+            "ignores Unix ownership. Easiest fix: move the project to your home drive:\n"
+            f"  mv \"{Path.cwd()}\" ~/\n"
+            "or re-mount the external drive with your uid/gid.",
         )
     except OSError as exc:  # pragma: no cover - filesystem dependent
         return TaskResult(False, f"cannot create or write to '{root_path}': {exc}")
@@ -812,6 +842,12 @@ def train(
     from slytrade.rl.tracking import maybe_end_run, maybe_log_metrics, maybe_log_params, maybe_start_run
     from slytrade.rl.walkforward import evaluate_policy, resolve_algorithm, train_policy, train_ppo
 
+    # The model artifact and registry live under models/ — make sure that tree
+    # exists and is writable before a long training run starts.
+    dir_error = _ensure_writable_root(Path(artifacts_dir).parent) or _ensure_writable_root(Path(registry_path).parent)
+    if dir_error is not None:
+        return dir_error
+
     algorithm = resolve_algorithm(algorithm)
     bars, load_error = _load_bars_or_error(bars_file)
     if load_error is not None:
@@ -940,6 +976,10 @@ def walk_forward(
 
 def promote(model_id: str, *, stage: str = "paper", registry_path: str | Path = "models/registry.jsonl") -> TaskResult:
     from slytrade.rl.deployment import promote_artifact
+
+    dir_error = _ensure_writable_root(Path(registry_path).parent)
+    if dir_error is not None:
+        return dir_error
 
     record = promote_artifact(model_id, stage=stage, registry_path=registry_path)
     console.print(f"[green]Promoted {model_id} to stage '{stage}'.[/green]")
