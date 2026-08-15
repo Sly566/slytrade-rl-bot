@@ -42,6 +42,7 @@ dist/
 
 # Temporary patch files
 *.patch
+.sh
 
 # Transport scripts (one-time deploy helpers, never committed)
 /apply_and_commit.sh
