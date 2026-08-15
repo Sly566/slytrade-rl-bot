@@ -97,7 +97,10 @@ def test_mode_vector_consistent_shape():
         "mtf_bias": 1.0,
     }
     vector = build_mode_vector(personality, context)
-    assert vector.shape[0] == 3 + 3 + 6 + 3
+    # 3 vol + 3 trend + 6 session + 3 scalars + the 18 persona traits.
+    from slytrade.rl.mode_vector import PERSONA_TRAIT_NAMES
+
+    assert vector.shape[0] == 3 + 3 + 6 + 3 + len(PERSONA_TRAIT_NAMES)
 
 
 def test_walk_forward_folds_correct_boundaries():

@@ -153,12 +153,14 @@ class RLDataset:
         )
 
 
-def build_rl_dataset(bars: pd.DataFrame) -> RLDataset:
+def build_rl_dataset(bars: pd.DataFrame, personality: TraderPersonality | None = None) -> RLDataset:
     """Build a raw (unscaled) dataset from validated bars sorted by time.
 
     The bars must be the pipeline's aligned output: canonical OHLCV plus the
     validated feature columns. ML features are computed on top; the ICT/tick/
-    MTF/session features already present in the bars are adopted verbatim.
+    MTF/session features already present in the bars are adopted verbatim; and
+    the persona + market-regime mode matrix is appended so the policy is
+    conditioned on *who it is* and *what the market is doing*.
     """
     if bars.empty:
         raise ValueError("bars frame is empty")
@@ -167,6 +169,7 @@ def build_rl_dataset(bars: pd.DataFrame) -> RLDataset:
     if missing:
         raise ValueError(f"bars missing required columns: {sorted(missing)}")
 
+    personality = personality or TraderPersonality.from_yaml()
     bars = bars.sort_values("time").reset_index(drop=True)
     ml_features = compute_ml_features(bars)
     if ml_features.empty or len(ml_features) != len(bars):
@@ -177,6 +180,13 @@ def build_rl_dataset(bars: pd.DataFrame) -> RLDataset:
     features = ml_features.reset_index(drop=True)
     for column in adopted:
         features[column] = pd.to_numeric(bars[column].reset_index(drop=True), errors="coerce")
+
+    # Persona + regime conditioning channel (the "professional trader" wiring).
+    from slytrade.rl.mode_vector import build_mode_matrix
+
+    mode = build_mode_matrix(bars, personality).reset_index(drop=True)
+    for column in mode.columns:
+        features[column] = mode[column].to_numpy()
 
     features = features.fillna(0.0)
     return RLDataset(
