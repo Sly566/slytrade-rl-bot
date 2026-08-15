@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib.util
+import io
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -15,6 +17,10 @@ from slytrade.data.time import ensure_utc
 
 EXNESS_TICK_BASE_URL = "https://ticks.ex2archive.com/ticks"
 UrlOpen = Callable[[str], object]
+
+
+def parquet_available() -> bool:
+    return importlib.util.find_spec("pyarrow") is not None and importlib.util.find_spec("pyarrow.parquet") is not None
 
 
 @dataclass(frozen=True)
@@ -79,7 +85,17 @@ def normalize_exness_tick_csv(csv_bytes: bytes, symbol: str) -> pd.DataFrame:
     raw = pd.read_csv(BytesIO(csv_bytes))
     if raw.empty:
         return pd.DataFrame(columns=TICK_COLUMNS)
+    frame = _exness_chunk_to_canonical(raw, symbol)
+    return frame.sort_values("time_msc").reset_index(drop=True)
 
+
+def _exness_chunk_to_canonical(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    """Normalize one chunk of Exness CSV rows into canonical tick columns.
+
+    Kept separate from the full-frame normalizer so the streaming download can
+    process chunks with the same column logic (and no sort, since chunks stream
+    in chronological order).
+    """
     lower_map = {column.lower().strip(): column for column in raw.columns}
     timestamp_column = lower_map.get("timestamp") or lower_map.get("time") or lower_map.get("time_msc")
     bid_column = lower_map.get("bid")
@@ -104,7 +120,7 @@ def normalize_exness_tick_csv(csv_bytes: bytes, symbol: str) -> pd.DataFrame:
     frame = frame.dropna(subset=["time_msc", "bid", "ask"])
     frame["spread"] = frame["ask"] - frame["bid"]
     frame["mid"] = (frame["bid"] + frame["ask"]) / 2.0
-    return frame[TICK_COLUMNS].sort_values("time_msc").reset_index(drop=True)
+    return frame[TICK_COLUMNS]
 
 
 class ExnessArchiveDownloader:
@@ -149,6 +165,74 @@ class ExnessArchiveDownloader:
             with archive.open(csv_names[0]) as csv_file:
                 return normalize_exness_tick_csv(csv_file.read(), archive_symbol)
 
+    def download_month_stream(
+        self,
+        symbol: str,
+        month_start: datetime,
+        *,
+        timeout: int = 60,
+        chunksize: int = 1_000_000,
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> ExnessArchiveFile:
+        """Download one archive month and write it to parquet in streaming chunks.
+
+        A month CSV is ~400MB uncompressed (millions of ticks). Reading it fully
+        into a DataFrame OOMs long lookbacks. This streams the CSV from the zip
+        in ``chunksize``-row blocks, normalises each block to the canonical tick
+        schema and appends it to a single parquet file via pyarrow row groups.
+        Peak memory is O(one chunk), not O(one month).
+        """
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        archive_symbol = normalize_exness_symbol(symbol)
+        url = build_exness_month_url(archive_symbol, month_start.year, month_start.month, base_url=self.base_url)
+        zip_bytes = self._download_zip_bytes(url, timeout=timeout)
+        path = self.month_path(symbol, month_start)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        total = 0
+        writer: pq.ParquetWriter | None = None
+        try:
+            with ZipFile(BytesIO(zip_bytes)) as archive:
+                csv_names = [name for name in archive.namelist() if name.lower().endswith(".csv")]
+                if not csv_names:
+                    raise ValueError(f"No CSV file found inside Exness archive: {url}")
+                with archive.open(csv_names[0]) as raw_csv:
+                    text_csv = io.TextIOWrapper(raw_csv, encoding="utf-8")
+                    for chunk in pd.read_csv(text_csv, chunksize=chunksize):
+                        frame = _exness_chunk_to_canonical(chunk, archive_symbol)
+                        if start is not None and end is not None:
+                            frame = frame[(frame["time_msc"] >= start) & (frame["time_msc"] < end)]
+                        if frame.empty:
+                            continue
+                        table = pa.Table.from_pandas(frame, preserve_index=False)
+                        if writer is None:
+                            writer = pq.ParquetWriter(path, table.schema)
+                        writer.write_table(table)
+                        total += len(frame)
+        except Exception:
+            if writer is not None:
+                try:
+                    writer.close()
+                except Exception:  # pragma: no cover
+                    pass
+            if path.exists():
+                path.unlink(missing_ok=True)
+            raise
+        if writer is not None:
+            writer.close()
+        if total == 0:
+            if path.exists():
+                path.unlink(missing_ok=True)
+        return ExnessArchiveFile(
+            path=path,
+            rows=total,
+            format="parquet",
+            period=f"{month_start.year:04d}-{month_start.month:02d}",
+        )
+
     def collect(
         self,
         symbol: str,
@@ -171,12 +255,27 @@ class ExnessArchiveDownloader:
         for month_start in iter_month_starts(start, end):
             months_attempted += 1
             try:
-                frame = self.download_month(archive_symbol, month_start, timeout=timeout)
-                frame = frame[(frame["time_msc"] >= start) & (frame["time_msc"] < end)].copy()
-                if frame.empty:
-                    empty_months += 1
-                    continue
-                written = self.write_month(archive_symbol, month_start, frame)
+                if parquet_available():
+                    # Memory-bounded: stream the CSV from the zip in chunks and
+                    # write the month's parquet via pyarrow row groups. Falls
+                    # back to the full-frame path only when pyarrow is missing.
+                    written = self.download_month_stream(
+                        archive_symbol,
+                        month_start,
+                        timeout=timeout,
+                        start=start,
+                        end=end,
+                    )
+                    if written.rows == 0:
+                        empty_months += 1
+                        continue
+                else:
+                    frame = self.download_month(archive_symbol, month_start, timeout=timeout)
+                    frame = frame[(frame["time_msc"] >= start) & (frame["time_msc"] < end)].copy()
+                    if frame.empty:
+                        empty_months += 1
+                        continue
+                    written = self.write_month(archive_symbol, month_start, frame)
                 rows += written.rows
                 files.append(written)
             except Exception as exc:

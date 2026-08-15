@@ -158,22 +158,19 @@ def test_align_hybrid_mt5_bars_exness_ticks(tmp_path: Path, monkeypatch) -> None
 
 
 def test_merge_tick_sources_writes_merged_set(tmp_path: Path, monkeypatch) -> None:
-    """Exness history + MT5 recent ticks merge into one deduplicated tick set."""
+    """Exness history + MT5 recent ticks merge into one deduplicated tick set.
+
+    The new merge is streaming: it discovers Exness tick FILES on disk and folds
+    the recent MT5 ticks into the last month, so the test writes real files.
+    """
     from slytrade.data.schemas import TICK_COLUMNS
 
     monkeypatch.setattr(tasks, "SAMPLE_ROOT", str(tmp_path / "samples"))
     monkeypatch.setattr(tasks, "EXNESS_DERIVED_ROOT", str(tmp_path / "exness_derived"))
 
-    def fake_download(symbol, *, lookback, root):
-        return tasks.TaskResult(True, "ok", {"ticks": 2})
-
-    monkeypatch.setattr(tasks, "_download_exness_ticks", fake_download)
-
-    def fake_mt5_ticks(symbol, *, lookback, root):
-        return tasks.TaskResult(True, "ok", {"ticks": 1})
-
-    monkeypatch.setattr(tasks, "_collect_ticks_from_mt5", fake_mt5_ticks)
-
+    # Real Exness month file under data/raw/exness_ticks/symbol=XAUUSD/...
+    exness_dir = tmp_path / "exness_ticks" / "symbol=XAUUSD" / "year=2026" / "month=08"
+    exness_dir.mkdir(parents=True)
     exness = pd.DataFrame(
         {
             "time_msc": pd.date_range("2026-08-10", periods=3, freq="s", tz="UTC"),
@@ -189,6 +186,18 @@ def test_merge_tick_sources_writes_merged_set(tmp_path: Path, monkeypatch) -> No
             "mid": 100.01,
         }
     )[TICK_COLUMNS]
+    exness.to_parquet(exness_dir / "period=2026-08.parquet", index=False)
+
+    def fake_download(symbol, *, lookback, root):
+        return tasks.TaskResult(True, "ok", {"ticks": 3})
+
+    monkeypatch.setattr(tasks, "_download_exness_ticks", fake_download)
+
+    def fake_mt5_ticks(symbol, *, lookback, root):
+        return tasks.TaskResult(True, "ok", {"ticks": 2})
+
+    monkeypatch.setattr(tasks, "_collect_ticks_from_mt5", fake_mt5_ticks)
+
     recent = pd.DataFrame(
         {
             "time_msc": pd.date_range("2026-08-14", periods=2, freq="s", tz="UTC"),
@@ -204,15 +213,14 @@ def test_merge_tick_sources_writes_merged_set(tmp_path: Path, monkeypatch) -> No
             "mid": 101.01,
         }
     )[TICK_COLUMNS]
-
-    monkeypatch.setattr(tasks, "load_exness_ticks", lambda symbol, root=None: exness.copy())
     monkeypatch.setattr(tasks, "load_collected_ticks", lambda symbol, root=None: recent.copy())
 
     result = tasks._merge_tick_sources("XAUUSD", lookback="1m", root=tmp_path, recent_days=3)
     assert result.ok, result.message
-    assert result.data["ticks"] == 5  # 3 exness + 2 recent, no dup
+    assert result.data["ticks"] == 5  # 3 exness + 2 recent, no overlap
     merged = tasks.load_merged_ticks("XAUUSD", root=tmp_path)
     assert len(merged) == 5
+    assert set(merged["symbol"].unique()) == {"XAUUSD"}
     # All relabeled to the canonical base symbol.
     assert set(merged["symbol"].unique()) == {"XAUUSD"}
 

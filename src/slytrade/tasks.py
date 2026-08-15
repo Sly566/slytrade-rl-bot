@@ -478,41 +478,44 @@ def _merge_tick_sources(
 ) -> TaskResult:
     """Merge Exness archive ticks (history) with MT5 ticks (recent window).
 
-    Writes the combined, de-duplicated tick set to ``merged_ticks/`` under
-    ``root``, which ``align()`` prefers over either single source.
+    Streams the Exness month files one at a time (memory O(one month)), folding
+    the recent MT5 ticks into the last month, and writes ``merged_ticks/`` which
+    ``align()`` prefers. This stays within memory bounds for any lookback.
     """
     from slytrade.data.exness_archive import normalize_exness_symbol
+    from slytrade.data.tick_stream import merge_tick_sources_streaming
 
     canonical = normalize_exness_symbol(symbol)
     exness = _download_exness_ticks(symbol, lookback=lookback, root=root)
     if not exness.ok:
         return exness
-    try:
-        exness_ticks = load_exness_ticks(canonical, root=root)
-    except FileNotFoundError:
-        return TaskResult(False, "Exness ticks downloaded but could not be loaded")
+    exness_files = find_exness_ticks(canonical, root=root)
+    if not exness_files:
+        return TaskResult(False, "Exness ticks downloaded but could not be found")
 
-    frames = [exness_ticks.copy()]
+    recent = pd.DataFrame()
     mt5_res = _collect_ticks_from_mt5(symbol, lookback=f"{recent_days}d", root=root)
     if mt5_res.ok:
         try:
-            mt5_ticks = load_collected_ticks(symbol, root=root)
-            frames.append(mt5_ticks.copy())
-            console.print(f"  recent MT5 ticks: {len(mt5_ticks)} rows (merged on top of Exness)")
+            recent = load_collected_ticks(symbol, root=root)
+            console.print(f"  recent MT5 ticks: {len(recent)} rows (merged on top of Exness)")
         except FileNotFoundError:  # pragma: no cover - broker dependent
             console.print("[yellow]Recent MT5 ticks unavailable; using Exness-only ticks.[/yellow]")
     else:  # pragma: no cover - broker dependent
         console.print(f"[yellow]Recent MT5 ticks unavailable ({mt5_res.message}); using Exness-only ticks.[/yellow]")
 
-    merged = pd.concat(frames, ignore_index=True)
-    merged["symbol"] = canonical
-    if "time_msc" in merged.columns:
-        merged = merged.drop_duplicates(subset=["time_msc"], keep="first").sort_values("time_msc")
-    merged = merged.reset_index(drop=True)
+    try:
+        total_rows = merge_tick_sources_streaming(
+            exness_files,
+            recent,
+            out_root=Path(root) / "merged_ticks",
+            symbol=canonical,
+        )
+    except Exception as exc:  # pragma: no cover - io dependent
+        return TaskResult(False, f"tick merge failed: {exc}")
 
-    _write_merged_ticks(canonical, merged, root=root)
-    console.print(f"  merged ticks: {len(merged)} rows -> {Path(root) / 'merged_ticks'}")
-    return TaskResult(True, "merged ticks written", {"source": "merged", "ticks": len(merged)})
+    console.print(f"  merged ticks: {total_rows} rows -> {Path(root) / 'merged_ticks'}")
+    return TaskResult(True, "merged ticks written", {"source": "merged", "ticks": total_rows})
 
 
 def _write_merged_ticks(symbol: str, ticks: pd.DataFrame, *, root: str | Path = "data/raw") -> None:
@@ -533,24 +536,21 @@ def _write_merged_ticks(symbol: str, ticks: pd.DataFrame, *, root: str | Path = 
 def _collect_from_exness(symbol: str, *, lookback: str, timeframes: list[str]) -> TaskResult:
     """Exness-only fallback: download ticks and resample them to bars."""
     from slytrade.data.exness_archive import normalize_exness_symbol
-    from slytrade.data.resample import resample_ticks_to_bars
     from slytrade.data.sample_generator import write_sample_frame
+    from slytrade.data.tick_stream import resample_ticks_to_bars_streaming
 
     archive_symbol = normalize_exness_symbol(symbol)
     out_root = Path(EXNESS_DERIVED_ROOT) / archive_symbol
     downloaded = _download_exness_ticks(symbol, lookback=lookback)
     if not downloaded.ok:
         return downloaded
-    try:
-        ticks = load_exness_ticks(archive_symbol)
-        if ticks.empty:
-            return TaskResult(False, "Exness archive returned no ticks")
-    except Exception as exc:  # pragma: no cover - network dependent
-        return TaskResult(False, f"Exness collection failed: {exc}")
+    tick_files = find_exness_ticks(archive_symbol)
+    if not tick_files:
+        return TaskResult(False, "Exness ticks downloaded but could not be found")
 
     files: dict[str, str] = {}
     for timeframe in timeframes:
-        bars = resample_ticks_to_bars(ticks, timeframe, symbol=archive_symbol)
+        bars = resample_ticks_to_bars_streaming(tick_files, timeframe, symbol=archive_symbol)
         if bars.empty:
             continue
         out_root.mkdir(parents=True, exist_ok=True)
@@ -558,10 +558,10 @@ def _collect_from_exness(symbol: str, *, lookback: str, timeframes: list[str]) -
         write_sample_frame(bars, bars_path)
         files[f"bars_{timeframe}"] = str(bars_path)
         console.print(f"  bars {timeframe}: {len(bars)} bars (resampled from Exness ticks)")
-    ticks_path = out_root / "ticks.parquet"
-    write_sample_frame(ticks, ticks_path)
+    # Reference the raw Exness ticks rather than copying the full set.
+    ticks_path = tick_files[0]
     files["ticks"] = str(ticks_path)
-    console.print(f"  ticks: {len(ticks)} (Exness archive)")
+    console.print(f"  ticks: {len(tick_files)} files (Exness archive, streaming)")
     return TaskResult(True, "Exness collection complete (ticks resampled to bars)", {"source": "exness", "files": files})
 
 
@@ -612,6 +612,14 @@ def _shutdown_mt5(mt5: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _tick_symbol_dir(files: list[Path]) -> str:
+    """Return the symbol=… ancestor directory of the first tick file."""
+    directory = files[0].parent
+    while directory.name and not directory.name.startswith("symbol="):
+        directory = directory.parent
+    return str(directory)
+
+
 def align(
     symbol: str,
     *,
@@ -622,6 +630,7 @@ def align(
     out_dir: str | Path | None = None,
 ) -> TaskResult:
     from slytrade.data.alignment import align_market_data, render_manifest, save_aligned_dataset
+    from slytrade.data.tick_stream import align_market_data_streaming
 
     output = Path(out_dir) if out_dir else Path("data/processed/aligned") / symbol
     # Recreate any deleted data directories and ensure the output path is
@@ -633,9 +642,7 @@ def align(
     # Resolve inputs: explicit files, or the designated sources (MT5 bars +
     # Exness ticks), or sample data as a last resort.
     bars = None
-    ticks = None
     bars_source = "sample_bars"
-    ticks_source = "sample_ticks"
 
     if bars_file is not None:
         bars = _load_frame(bars_file)
@@ -661,62 +668,81 @@ def align(
         if bars is None:
             return TaskResult(False, f"no bars found for {symbol} {timeframe}; run collection first")
 
+    # Tick discovery returns either partitioned FILES (streaming, memory-bounded)
+    # or a single explicit/sample file (in-memory, small).
+    tick_files: list[Path] | None = None
+    ticks = None
+    ticks_source = "sample_ticks"
+    tick_file_dir: str | None = None
+
     if ticks_file is not None:
         ticks = _load_frame(ticks_file)
     else:
-        # Ticks prefer the merged set (Exness history + MT5 recent), then the
-        # Exness archive, then MT5 ticks, then derived/sample tick files.
-        for label, path in (
-            ("merged", None),
-            ("exness", None),
-            ("mt5", None),
-            ("exness_derived", Path(EXNESS_DERIVED_ROOT) / symbol / "ticks.parquet"),
-            ("sample", Path(SAMPLE_ROOT) / symbol / "ticks.parquet"),
+        for label, finder in (
+            ("merged", find_merged_ticks),
+            ("exness", find_exness_ticks),
+            ("mt5", find_collected_ticks),
         ):
-            if label == "merged":
-                try:
-                    ticks = load_merged_ticks(symbol, root)
-                except FileNotFoundError:
-                    continue
-            elif label == "exness":
-                try:
-                    ticks = load_exness_ticks(symbol, root)
-                except FileNotFoundError:
-                    continue
-            elif label == "mt5":
-                try:
-                    ticks = load_collected_ticks(symbol, root)
-                except FileNotFoundError:
-                    continue
-            else:
-                assert path is not None
-                if not path.exists():
-                    continue
-                ticks = _load_frame(path)
-                console.print(f"[yellow]Using {path}[/yellow]")
-            ticks_source = {
-                "merged": "merged_ticks",
-                "exness": "exness_ticks",
-                "mt5": "mt5_ticks",
-                "exness_derived": "exness_ticks",
-                "sample": "sample_ticks",
-            }[label]
-            break
-        if ticks is None:
-            return TaskResult(False, f"no ticks found for {symbol}; run collection first")
+            found = finder(symbol, root)
+            if found:
+                tick_files = found
+                ticks_source = {"merged": "merged_ticks", "exness": "exness_ticks", "mt5": "mt5_ticks"}[label]
+                tick_file_dir = _tick_symbol_dir(found)
+                console.print(f"[green]Streaming {len(found)} tick files ({label})[/green]")
+                break
+        if tick_files is None:
+            for label, path in (
+                ("exness_derived", Path(EXNESS_DERIVED_ROOT) / symbol / "ticks.parquet"),
+                ("sample", Path(SAMPLE_ROOT) / symbol / "ticks.parquet"),
+            ):
+                if path.exists():
+                    ticks = _load_frame(path)
+                    ticks_source = {"exness_derived": "exness_ticks", "sample": "sample_ticks"}[label]
+                    console.print(f"[yellow]Using {path}[/yellow]")
+                    break
+            if ticks is None and tick_files is None:
+                return TaskResult(False, f"no ticks found for {symbol}; run collection first")
 
-    dataset = align_market_data(
-        bars,
-        ticks,
-        timeframe=timeframe,
-        canonical_symbol=symbol,
-        bar_source=bars_source,
-        tick_source=ticks_source,
-        include_ict_features=True,
-        include_tick_features=True,
-        require_fresh_quotes=False,
-    )
-    manifest = save_aligned_dataset(dataset, output, source_bars_file=bars_file, source_ticks_file=ticks_file, copy_ticks=False)
+    if tick_files is not None:
+        try:
+            dataset = align_market_data_streaming(
+                bars,
+                tick_files,
+                timeframe=timeframe,
+                canonical_symbol=symbol,
+                bar_source=bars_source,
+                tick_source=ticks_source,
+                max_quote_age_seconds=5.0,
+                min_fresh_coverage=0.95,
+                include_ict_features=True,
+                require_fresh_quotes=False,
+            )
+            # Ticks are already on disk under their source tree; reference them
+            # instead of copying (avoids a multi-GB copy for long lookbacks).
+            manifest = save_aligned_dataset(
+                dataset,
+                output,
+                source_bars_file=bars_file,
+                source_ticks_file=tick_file_dir,
+                copy_ticks=False,
+            )
+        except Exception as exc:
+            return TaskResult(False, f"streaming alignment failed: {exc}")
+    else:
+        assert ticks is not None
+        dataset = align_market_data(
+            bars,
+            ticks,
+            timeframe=timeframe,
+            canonical_symbol=symbol,
+            bar_source=bars_source,
+            tick_source=ticks_source,
+            include_ict_features=True,
+            include_tick_features=True,
+            require_fresh_quotes=False,
+        )
+        manifest = save_aligned_dataset(dataset, output, source_bars_file=bars_file, source_ticks_file=ticks_file, copy_ticks=False)
+
     render_manifest(manifest, console=console)
     return TaskResult(True, f"aligned dataset ready at {output}", {"bars_file": manifest.files["bars"], "rows": len(dataset.bars)})
 
