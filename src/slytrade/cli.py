@@ -25,6 +25,18 @@ def module_available(name: str) -> bool:
     return importlib.util.find_spec(name) is not None
 
 
+def _hint_if_bridge(message: str) -> None:
+    """Append an actionable hint when a failure looks like an MT5 bridge issue."""
+    lowered = message.lower()
+    if "mt5" in lowered and ("connect" in lowered or "refused" in lowered or "bridge" in lowered or "initialize" in lowered):
+        console.print(
+            "[yellow]Hint:[/yellow] the MT5 bridge may not be running. Start it with:\n"
+            "  bash start_mt5_bridge.sh\n"
+            "then verify with:\n"
+            "  python -m slytrade.cli mt5-info"
+        )
+
+
 def infer_symbol(bars: pd.DataFrame, symbol: str | None = None) -> str:
     """Resolve the trading symbol for a bars frame."""
     if symbol:
@@ -539,6 +551,8 @@ def train_rl(
         artifacts_dir=model_dir,
     )
     if not result.ok:
+        console.print(f"[red]{result.message}[/red]")
+        _hint_if_bridge(result.message)
         raise typer.Exit(code=1)
 
 
@@ -1234,6 +1248,8 @@ def collect_all(
 
     result = run_collect(symbol, lookback=lookback, source=source)
     if not result.ok:
+        console.print(f"[red]{result.message}[/red]")
+        _hint_if_bridge(result.message)
         raise typer.Exit(code=1)
 
 
@@ -1263,6 +1279,8 @@ def full_pipeline(
         promote_stage=promote_stage,
     )
     if not result.ok:
+        console.print(f"[red]{result.message}[/red]")
+        _hint_if_bridge(result.message)
         raise typer.Exit(code=1)
 
 

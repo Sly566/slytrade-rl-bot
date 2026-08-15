@@ -698,6 +698,29 @@ def _load_frame(path: str | Path) -> pd.DataFrame:
     return pd.read_csv(p)
 
 
+def _load_bars_or_error(bars_file: str | Path) -> tuple[pd.DataFrame | None, TaskResult | None]:
+    """Load a bars file, returning a friendly TaskResult when it is missing.
+
+    Prevents a raw FileNotFoundError traceback when the user runs a training/
+    backtest command before the collection+alignment step has produced the
+    aligned bars file.
+    """
+    from slytrade.backtest.reporting import load_bars_file
+
+    path = Path(bars_file)
+    if not path.exists():
+        return None, TaskResult(
+            False,
+            f"bars file not found: {path}.\n"
+            "Run the pipeline first to create it:\n"
+            "  slytrade full-pipeline --symbol XAUUSD --source hybrid --lookback 1y",
+        )
+    try:
+        return load_bars_file(path), None
+    except Exception as exc:
+        return None, TaskResult(False, f"failed to load bars file {path}: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Task: backtest (persona-adaptive, managed exits)
 # ---------------------------------------------------------------------------
@@ -729,12 +752,14 @@ def backtest(
     from slytrade.backtest.engine import BacktestConfig
     from slytrade.backtest.reporting import (
         infer_symbol,
-        load_bars_file,
         render_backtest_report,
         run_managed_aligned_backtest_from_bars,
     )
 
-    bars = load_bars_file(Path(bars_file))
+    bars, load_error = _load_bars_or_error(bars_file)
+    if load_error is not None:
+        return load_error
+    assert bars is not None
     resolved = infer_symbol(bars, symbol)
     point_value = point_value if point_value is not None else default_point_value(resolved)
     result = run_managed_aligned_backtest_from_bars(
@@ -781,14 +806,17 @@ def train(
     artifacts_dir: str | Path = "models/artifacts",
     registry_path: str | Path = "models/registry.jsonl",
 ) -> TaskResult:
-    from slytrade.backtest.reporting import infer_symbol, load_bars_file
+    from slytrade.backtest.reporting import infer_symbol
     from slytrade.rl.dataset import build_rl_dataset
     from slytrade.rl.deployment import save_model_artifact
     from slytrade.rl.tracking import maybe_end_run, maybe_log_metrics, maybe_log_params, maybe_start_run
     from slytrade.rl.walkforward import evaluate_policy, resolve_algorithm, train_policy, train_ppo
 
     algorithm = resolve_algorithm(algorithm)
-    bars = load_bars_file(Path(bars_file))
+    bars, load_error = _load_bars_or_error(bars_file)
+    if load_error is not None:
+        return load_error
+    assert bars is not None
     resolved = infer_symbol(bars, symbol)
     bars = bars[bars["symbol"] == resolved].copy()
     try:
@@ -864,11 +892,14 @@ def walk_forward(
     reward: str = "raw",
     policy: str = "mlp",
 ) -> TaskResult:
-    from slytrade.backtest.reporting import infer_symbol, load_bars_file
+    from slytrade.backtest.reporting import infer_symbol
     from slytrade.rl.dataset import build_rl_dataset
     from slytrade.rl.walkforward import make_walk_forward_folds, resolve_fold_windows, walk_forward_validation
 
-    bars = load_bars_file(Path(bars_file))
+    bars, load_error = _load_bars_or_error(bars_file)
+    if load_error is not None:
+        return load_error
+    assert bars is not None
     resolved = infer_symbol(bars, symbol)
     bars = bars[bars["symbol"] == resolved].copy()
     try:
