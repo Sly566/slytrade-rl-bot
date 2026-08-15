@@ -32,7 +32,7 @@ def test_collect_all_samples(tmp_path: Path, monkeypatch) -> None:
 def test_align_and_backtest_on_samples(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(tasks, "SAMPLE_ROOT", str(tmp_path))
     tasks.generate_sample_dataset("XAUUSD", start="2025-01-01", bar_periods=400, tick_periods=2_000, out_dir=tmp_path)
-    aligned = tasks.align("XAUUSD", timeframe="M1")
+    aligned = tasks.align("XAUUSD", timeframe="M1", out_dir=str(tmp_path / "aligned"))
     assert aligned.ok, aligned.message
     bars_file = aligned.data["bars_file"]
     result = tasks.backtest(bars_file, strategy="persona-adaptive", symbol="XAUUSD")
@@ -285,3 +285,31 @@ def test_with_reward_rejects_unknown() -> None:
 
     with pytest.raises(ValueError, match="unknown reward type"):
         tasks._with_reward(RLEnvironmentConfig(), "bogus")
+
+
+def test_samples_source_does_not_require_data_raw(tmp_path: Path, monkeypatch) -> None:
+    """The samples source writes to SAMPLE_ROOT, so it must not require the
+    broker data root (data/raw) to exist — e.g. after the operator deleted it."""
+    checked: list[str] = []
+
+    def spy(root):
+        checked.append(str(root))
+        return None
+
+    monkeypatch.setattr(tasks, "SAMPLE_ROOT", str(tmp_path / "samples"))
+    monkeypatch.setattr(tasks, "_ensure_writable_root", spy)
+    monkeypatch.setattr(tasks, "_ensure_standard_dirs", lambda: None)
+
+    result = tasks.collect_all("XAUUSD", source="samples", sample_start="2025-01-01")
+    assert result.ok
+    assert all("data/raw" not in c for c in checked)
+    assert any(str(tmp_path / "samples") in c for c in checked)
+
+
+def test_ensure_standard_dirs_recreates_deleted_tree(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    assert not (tmp_path / "data").exists()
+    error = tasks._ensure_standard_dirs()
+    assert error is None
+    for rel in ("data/raw", "data/processed", "data/exness_derived", "data/samples", "models", "logs", "state"):
+        assert (tmp_path / rel).is_dir(), rel

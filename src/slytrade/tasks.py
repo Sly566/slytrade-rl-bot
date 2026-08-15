@@ -226,6 +226,16 @@ def collect_all(
     if timeframes is None:
         timeframes = ["M1", "M5", "M15", "H1", "H4", "D1"]
 
+    # Recreate any deleted data directories, then verify the path this source
+    # actually writes to is writable. The `samples` source writes to SAMPLE_ROOT,
+    # not to `root`, so it must not require data/raw to exist.
+    if source == "samples":
+        writable_error = _ensure_writable_root(SAMPLE_ROOT)
+    else:
+        writable_error = _ensure_standard_dirs() or _ensure_writable_root(root)
+    if writable_error is not None:
+        return writable_error
+
     if source == "hybrid":
         bars = _collect_bars_from_mt5(symbol, lookback=lookback, timeframes=timeframes, root=root)
         if not bars.ok:
@@ -285,6 +295,56 @@ def collect_all(
     return TaskResult(True, "sample data generated", {"source": "samples", "files": files})
 
 
+def _ensure_writable_root(root: str | Path) -> TaskResult | None:
+    """Create (or re-create) a data path and verify it is writable.
+
+    The path is created if missing — so a folder the operator deleted is
+    recreated automatically. A friendly error is returned only when creation
+    genuinely fails (the usual cause: the parent is owned by root from sudo or
+    a Docker bind mount, or the drive is exFAT/NTFS).
+    """
+    root_path = Path(root)
+    try:
+        root_path.mkdir(parents=True, exist_ok=True)
+        probe = root_path / ".write_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+    except PermissionError:
+        return TaskResult(
+            False,
+            f"cannot create or write to '{root_path}' (permission denied). "
+            "The folder may have been deleted and could not be recreated, or a parent "
+            "is owned by another user (e.g. root from sudo or a Docker bind mount). Fix with:\n"
+            f"  sudo chown -R \"$USER\":\"$USER\" \"{root_path}\"\n"
+            "If chown reports 'Operation not permitted', the drive is likely exFAT/NTFS; "
+            "check its mount options instead.",
+        )
+    except OSError as exc:  # pragma: no cover - filesystem dependent
+        return TaskResult(False, f"cannot create or write to '{root_path}': {exc}")
+    return None
+
+
+def _ensure_standard_dirs() -> TaskResult | None:
+    """Recreate the standard data/output directory tree if any of it is missing.
+
+    Called at the start of the pipeline tasks so a deleted ``data/``, ``models/``,
+    ``logs/`` or ``state/`` folder is restored without manual intervention.
+    """
+    for directory in (
+        Path("data") / "raw",
+        Path("data") / "processed",
+        Path("data") / "exness_derived",
+        Path("data") / "samples",
+        Path("models"),
+        Path("logs"),
+        Path("state"),
+    ):
+        error = _ensure_writable_root(directory)
+        if error is not None:
+            return error
+    return None
+
+
 def _collect_bars_from_mt5(
     symbol: str,
     *,
@@ -297,8 +357,11 @@ def _collect_bars_from_mt5(
     from slytrade.data.storage import MarketDataStorage
     from slytrade.data.time import date_range_from_lookback
 
-    mt5 = _load_mt5()
-    _init_mt5(mt5)
+    try:
+        mt5 = _load_mt5()
+        _init_mt5(mt5)
+    except Exception as exc:  # pragma: no cover - broker dependent
+        return TaskResult(False, f"could not connect to MT5: {exc}")
     storage = MarketDataStorage(Path(root))
     start_dt, end_dt = date_range_from_lookback(lookback)
     try:
@@ -308,6 +371,10 @@ def _collect_bars_from_mt5(
             summary[f"bars_{timeframe}"] = result.rows
             console.print(f"  bars {timeframe}: {result.rows} rows in {result.file_count} files")
         return TaskResult(True, "MT5 bars collected", {"source": "mt5", **summary})
+    except PermissionError:
+        return TaskResult(False, f"permission denied writing bars under {root}; see the data-root check above")
+    except Exception as exc:  # pragma: no cover - broker dependent
+        return TaskResult(False, f"MT5 bar collection failed: {exc}")
     finally:
         _shutdown_mt5(mt5)
 
@@ -323,14 +390,21 @@ def _collect_ticks_from_mt5(
     from slytrade.data.storage import MarketDataStorage
     from slytrade.data.time import date_range_from_lookback
 
-    mt5 = _load_mt5()
-    _init_mt5(mt5)
+    try:
+        mt5 = _load_mt5()
+        _init_mt5(mt5)
+    except Exception as exc:  # pragma: no cover - broker dependent
+        return TaskResult(False, f"could not connect to MT5: {exc}")
     storage = MarketDataStorage(Path(root))
     start_dt, end_dt = date_range_from_lookback(lookback)
     try:
         result = MT5TickCollector(mt5, storage).collect(symbol, start_dt, end_dt, chunk_size="day")
         console.print(f"  ticks: {result.rows} rows in {result.file_count} files")
         return TaskResult(True, "MT5 ticks collected", {"source": "mt5", "ticks": result.rows})
+    except PermissionError:
+        return TaskResult(False, f"permission denied writing ticks under {root}; see the data-root check above")
+    except Exception as exc:  # pragma: no cover - broker dependent
+        return TaskResult(False, f"MT5 tick collection failed: {exc}")
     finally:
         _shutdown_mt5(mt5)
 
@@ -347,8 +421,13 @@ def _download_exness_ticks(
 
     archive_symbol = normalize_exness_symbol(symbol)
     start_dt, end_dt = date_range_from_lookback(lookback)
-    downloader = ExnessArchiveDownloader(str(root))
-    result = downloader.collect(archive_symbol, start_dt, end_dt, continue_on_error=True)
+    try:
+        downloader = ExnessArchiveDownloader(str(root))
+        result = downloader.collect(archive_symbol, start_dt, end_dt, continue_on_error=True)
+    except PermissionError:
+        return TaskResult(False, f"permission denied writing Exness ticks under {root}; see the data-root check above")
+    except Exception as exc:  # pragma: no cover - network dependent
+        return TaskResult(False, f"Exness download failed: {exc}")
     if result.rows <= 0:
         return TaskResult(False, "Exness archive returned no tick rows")
     console.print(f"  ticks: {result.rows} rows (Exness archive) in {result.file_count} files")
@@ -514,6 +593,13 @@ def align(
 ) -> TaskResult:
     from slytrade.data.alignment import align_market_data, render_manifest, save_aligned_dataset
 
+    output = Path(out_dir) if out_dir else Path("data/processed/aligned") / symbol
+    # Recreate any deleted data directories and ensure the output path is
+    # writable (self-heals a deleted data/processed tree).
+    writable_error = _ensure_writable_root(output.parent)
+    if writable_error is not None:
+        return writable_error
+
     # Resolve inputs: explicit files, or the designated sources (MT5 bars +
     # Exness ticks), or sample data as a last resort.
     bars = None
@@ -589,7 +675,6 @@ def align(
         if ticks is None:
             return TaskResult(False, f"no ticks found for {symbol}; run collection first")
 
-    output = Path(out_dir) if out_dir else Path("data/processed/aligned") / symbol
     dataset = align_market_data(
         bars,
         ticks,
