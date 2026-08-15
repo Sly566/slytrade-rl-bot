@@ -20,13 +20,14 @@ import signal
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from typing import Any
 
 import pandas as pd
 
 from slytrade.backtest.execution import Quote
 from slytrade.core.config import load_config
+from slytrade.currency import CurrencyConverter, load_converter
 from slytrade.execution.models import OrderIntent, OrderStatus, Side
 from slytrade.execution.oms import OrderManagementSystem
 from slytrade.monitoring.gates import DeploymentStage
@@ -37,7 +38,7 @@ from slytrade.runtime.alerting import AlertManager
 from slytrade.runtime.circuit_breaker import LossCircuitBreaker, limits_from_config
 from slytrade.runtime.logs import setup_logging
 from slytrade.runtime.metrics_server import TradingMetrics
-from slytrade.runtime.news_gate import NewsGate, load_news_gate
+from slytrade.runtime.news_gate import NewsGate
 from slytrade.runtime.paper_loop import BarBuilder
 from slytrade.runtime.settings import RuntimeSettings, TradingStage
 from slytrade.runtime.trading_window import TradingWindow, window_from_settings
@@ -81,6 +82,7 @@ class DemoTradingLoop:
     _kill_switch_alerted: bool = field(default=False, init=False)
     _side: str = field(default="flat", init=False)
     _point_value: float = field(default=1.0, init=False)
+    _converter: CurrencyConverter = field(default_factory=lambda: CurrencyConverter(1.0), init=False)
 
     def __post_init__(self) -> None:
         self.logger = setup_logging(self.settings.log_level, self.settings.log_dir, self.settings.json_logs)
@@ -95,11 +97,14 @@ class DemoTradingLoop:
 
         config = load_config(self.settings.config_dir)
         risk_cfg = config.risk
+        self._converter = load_converter(risk_cfg)
         limits = limits_from_config(risk_cfg)
         self.breaker = LossCircuitBreaker(limits)
         self.window = window_from_settings(self.settings.trading_days, self.settings.trading_start_utc, self.settings.trading_end_utc)
         self.alerter = AlertManager.from_settings(self.settings, self.logger)
-        self.news_gate = load_news_gate(self.settings.news_config_file, year=datetime.now(UTC).year) if self.settings.news_enabled else NewsGate(enabled=False)
+        from slytrade.runtime.calendar import build_news_gate_from_settings
+
+        self.news_gate = build_news_gate_from_settings(self.settings)
 
         self.guardrails = TradingGuardrails(
             GuardrailConfig(
@@ -161,6 +166,15 @@ class DemoTradingLoop:
                     break
                 if max_bars is not None and self._bar_index >= max_bars:
                     break
+
+                # Periodic broker reconciliation (GAP-7): re-verify broker state
+                # every 5 minutes instead of only once at startup.
+                if self._bar_index > 0 and self._bar_index % 300 == 0:
+                    self.adapter.expected_positions = self._current_positions(resolved)
+                    check = self.adapter.reconcile()
+                    if not check.reconciled:
+                        self.alerter.alert("critical", "reconciliation drift", check.detail)
+                    self.logger.info("periodic reconciliation", extra={"event": "reconcile", "status": "ok" if check.reconciled else "drift"})
 
                 try:
                     quote = self.adapter.quote(resolved)
@@ -249,7 +263,9 @@ class DemoTradingLoop:
     def _sized_intent(self, intent: OrderIntent, bar: pd.Series, quote: Quote) -> OrderIntent:
         atr = float(bar.get("atr", 0.0) or 0.0)
         stop_distance = max(atr, 0.10)
-        equity = self._equity()
+        # Convert account equity to USD before risk sizing (GAP-3): a ZAR
+        # account's raw equity would otherwise undersize/oversize positions.
+        equity = self._equity_usd()
         volume = risk_based_volume(
             equity,
             stop_distance,
@@ -259,6 +275,14 @@ class DemoTradingLoop:
         )
         if volume <= 0:
             volume = intent.volume
+        # Margin guard (GAP-7): never enter a position the account cannot
+        # comfortably margin.
+        if not self._margin_ok(intent.symbol, volume):
+            self.alerter.alert("warning", "insufficient margin", f"{intent.symbol} vol={volume}")
+            self.logger.warning("margin rejected", extra={"event": "margin_reject", "symbol": intent.symbol})
+            return OrderIntent(
+                symbol=intent.symbol, side=intent.side, volume=0.0, reason=intent.reason
+            )
         sl = round(quote.mid - stop_distance, 5) if intent.side == Side.BUY else round(quote.mid + stop_distance, 5)
         tp = round(quote.mid + 2 * stop_distance, 5) if intent.side == Side.BUY else round(quote.mid - 2 * stop_distance, 5)
         return OrderIntent(
@@ -269,6 +293,37 @@ class DemoTradingLoop:
             take_profit=tp,
             reason=intent.reason,
         )
+
+    def _account_currency(self) -> str:
+        try:
+            info = self.adapter.account_info()
+            return str(getattr(info, "currency", "USD") or "USD")
+        except Exception:  # pragma: no cover - broker dependent
+            return "USD"
+
+    def _equity_usd(self) -> float:
+        equity = self._equity()
+        try:
+            return self._converter.to_usd(equity, self.mt5, self._account_currency())
+        except Exception:  # pragma: no cover - broker dependent
+            return equity
+
+    def _margin_ok(self, symbol: str, volume: float, safety: float = 2.0) -> bool:
+        """Require free margin ≥ safety × required margin for the order."""
+        if volume <= 0:
+            return False
+        try:
+            info = self.adapter.account_info()
+            margin_free = float(getattr(info, "margin_free", 0.0) or 0.0)
+            spec = self.adapter.symbol_spec(symbol)
+            contract = float(getattr(spec, "trade_contract_size", 0.0) or 0.0)
+            margin_initial = float(getattr(spec, "margin_initial", 0.0) or 0.0)
+            if contract <= 0 or margin_initial <= 0:
+                return True  # cannot compute → do not block on missing data
+            required = margin_initial * volume * contract
+            return margin_free >= safety * required
+        except Exception:  # pragma: no cover - broker dependent
+            return True
 
     def _equity(self) -> float:
         try:

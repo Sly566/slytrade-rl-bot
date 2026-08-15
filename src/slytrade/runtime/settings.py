@@ -90,6 +90,10 @@ class RuntimeSettings(BaseSettings):
     # --- Red-folder news gate ---------------------------------------------------
     news_config_file: str = "configs/news.yaml"
     news_enabled: bool = False
+    # Economic-calendar feed (GAP-4): optional JSON/CSV file or JSON URL. When
+    # set and news_enabled, the red-folder gate is built from this feed.
+    calendar_path: str = ""
+    calendar_url: str = ""
 
     def fail_closed_checks(self) -> list[str]:
         """Return a list of configuration problems that must block startup.

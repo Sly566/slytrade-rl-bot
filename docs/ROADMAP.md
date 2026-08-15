@@ -150,15 +150,29 @@
 - [x] `slytrade demo` — guarded live demo-account trading loop (real demo orders)
 - [x] Broker symbol-spec point-value resolution for realistic demo sizing
 
+## Phase 9.75: The 7 production gaps (production readiness assessment)
+
+- [x] Cost-aware backtests: commission + slippage defaults from risk.yaml
+- [x] RL environment v2: managed SL/TP exits + full validated feature adoption
+      (ML + ICT + tick microstructure + MTF); sparse realized-PnL reward
+- [x] ZAR/currency conversion for non-USD accounts (live rate + fallback)
+- [x] Economic-calendar feed (JSON/CSV file or JSON URL) for the news gate
+- [x] Multi-symbol paper portfolio (`slytrade paper-multi`)
+- [x] Robustness evidence (`slytrade robustness`): Monte Carlo, parameter
+      perturbation, regime segmentation
+- [x] Live-adapter hardening: margin guard, periodic reconciliation
+- [x] Pipeline progress reporting (stage banners + SB3 progress bar)
+
 ## Phase 10: Outstanding (not yet done)
 
 - [x] Designated-source collection: bars from MT5 + ticks from Exness (hybrid), autonomous
 - [x] Suffix-aware symbol discovery (XAUUSD → XAUUSDm) so hybrid collection aligns automatically
 - [x] Offline tick→bar resampling (Exness-only fallback, no MT5 terminal)
-- [ ] Swap/margin/holiday handling in the live adapter
+- [x] Swap/margin/holiday handling in the live adapter (margin guard + reconciliation)
 - [ ] PVC-backed durable state for Kubernetes
-- [ ] Multi-symbol paper portfolio (parallel loops)
-- [ ] Calendar-feed integration for the news gate (explicit events today)
+- [x] Multi-symbol paper portfolio (parallel loops)
+- [x] Calendar-feed integration for the news gate (feed schema; provider is user-supplied)
+- [ ] Beat-the-baseline promotion gate (RL must beat persona-adaptive net of costs)
 
 ## Deployment gates
 

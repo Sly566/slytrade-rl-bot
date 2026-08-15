@@ -63,7 +63,13 @@ def test_trade_pnl_penalizes_losing_round_trip() -> None:
         {"time": times, "symbol": "XAUUSD", "open": close, "high": close + 0.1, "low": close - 0.1, "close": close}
     )
     features = pd.DataFrame({"f1": np.zeros(200, dtype=float)})
-    env = SlyTradeRLEnvironment(features=features, bars=bars, config=RLEnvironmentConfig(reward_type="trade_pnl"))
+    env = SlyTradeRLEnvironment(
+        features=features,
+        bars=bars,
+        # Managed exits disabled so the test isolates the action-driven
+        # flatten path (the managed SL path is covered in test_rl_managed_exits).
+        config=RLEnvironmentConfig(reward_type="trade_pnl", use_managed_exits=False),
+    )
     env.reset()
     env.step(1)  # long into a falling market
     for _ in range(10):

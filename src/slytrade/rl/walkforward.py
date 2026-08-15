@@ -163,6 +163,7 @@ def train_ppo(
     policy_type: str = "mlp",
     model_dir: str | None = None,
     verbose: int = 0,
+    progress_bar: bool = False,
 ):
     """Train a PPO policy on the environment. Returns the trained model.
 
@@ -209,7 +210,7 @@ def train_ppo(
             policy_kwargs=policy_kwargs or {},
             verbose=verbose,
         )
-    model.learn(total_timesteps=total_timesteps)
+    model.learn(total_timesteps=total_timesteps, progress_bar=progress_bar)
     if model_dir:
         model.save(model_dir)
     return model
@@ -261,6 +262,7 @@ def train_policy(
     policy_kwargs: dict | None = None,
     policy_type: str = "mlp",
     verbose: int = 0,
+    progress_bar: bool = False,
 ):
     """Train a policy with any supported algorithm (PPO/SAC/TD3).
 
@@ -272,7 +274,7 @@ def train_policy(
         raise ValueError("LSTM/recurrent policies are only supported for PPO; use train_ppo with policy_type='lstm'")
     cls = _sb3_class(algorithm)
     model = cls("MlpPolicy", env, seed=seed, policy_kwargs=policy_kwargs or {}, verbose=verbose)
-    model.learn(total_timesteps=total_timesteps)
+    model.learn(total_timesteps=total_timesteps, progress_bar=progress_bar)
     if model_dir:
         model.save(model_dir)
     return model
@@ -403,6 +405,8 @@ def walk_forward_validation(
     seed: int = 42,
     reward_type: str = "raw",
     policy_type: str = "mlp",
+    progress: bool = False,
+    progress_bar: bool = False,
 ) -> pd.DataFrame:
     """Train PPO on each fold's training window, evaluate on its test window.
 
@@ -416,7 +420,11 @@ def walk_forward_validation(
     rows: list[dict] = []
     env_config = RLEnvironmentConfig(seed=seed, reward_type=reward_type)
 
-    for fold in folds:
+    for index, fold in enumerate(folds):
+        if progress:
+            from slytrade.progress import progress as _progress
+
+            _progress(index + 1, len(folds), f"fold {fold.index}: train [{fold.train_start}, {fold.train_end}) → test [{fold.test_start}, {fold.test_end})")
         # Fit the scaler on this fold's train window ONLY.
         scaler_params = dataset.fit_scaler(fold.train_start, fold.train_end)
         train_env = dataset.env_factory(
@@ -426,7 +434,7 @@ def walk_forward_validation(
             scaler_params=scaler_params,
             config=env_config,
         )
-        model = train_ppo(train_env, total_timesteps=total_timesteps, seed=seed + fold.index, policy_type=policy_type)
+        model = train_ppo(train_env, total_timesteps=total_timesteps, seed=seed + fold.index, policy_type=policy_type, progress_bar=progress_bar)
 
         test_env = dataset.env_factory(
             fold.test_start,

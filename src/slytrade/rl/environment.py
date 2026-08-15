@@ -98,6 +98,14 @@ class RLEnvironmentConfig:
     # which is why the first models churned tens of thousands of trades and
     # blew up the account before ever seeing a reward signal resolve.
     episode_length_bars: int = 1000
+    # Route RL entries through the SAME managed-exit engine as the backtests:
+    # ATR stop-loss / take-profit (and optional trailing). With this on, the
+    # agent's reward is realized PnL at real exits instead of mark-to-market
+    # noise, so it learns trade management exactly like the persona strategy.
+    use_managed_exits: bool = True
+    stop_loss_atr: float = 1.0
+    take_profit_atr: float = 2.0
+    trailing_stop_atr: float | None = None
 
 
 if gym is not None:
@@ -135,7 +143,10 @@ if gym is not None:
             self._equity = self.config.initial_balance
             self._peak_equity = self.config.initial_balance
             self._entry_price = 0.0
+            self._stop_loss = 0.0
+            self._take_profit = 0.0
             self._episode_step = 0
+            self._last_exit_price = 0.0
 
         def reset(self, *, seed: int | None = None, options: dict | None = None):
             super().reset(seed=seed)
@@ -144,7 +155,10 @@ if gym is not None:
             self._equity = self.config.initial_balance
             self._peak_equity = self.config.initial_balance
             self._entry_price = 0.0
+            self._stop_loss = 0.0
+            self._take_profit = 0.0
             self._episode_step = 0
+            self._last_exit_price = 0.0
             self.ledger.records.clear()
             return self._observation(), {}
 
@@ -154,7 +168,8 @@ if gym is not None:
             if self.current_step >= len(self.bars):
                 raise RuntimeError("step() called past the end of the episode; call reset()")
             episode_start = self.current_step == 0
-            previous = float(self.bars.iloc[self.current_step]["close"])
+            decision_bar = self.bars.iloc[self.current_step]
+            previous = float(decision_bar["close"])
             old_position = self._position
             target = self._position
             if action == 1:
@@ -164,41 +179,73 @@ if gym is not None:
             elif action == 3:
                 target = 0
             turnover = abs(target - old_position)
-            if turnover and target:
-                intent = OrderIntent(
-                    symbol=str(self.bars.iloc[self.current_step]["symbol"]),
-                    side=Side.BUY if target > 0 else Side.SELL,
-                    volume=min(self.config.max_position_volume, self.config.risk_per_trade),
-                    reason="rl_entry",
-                )
-                self.ledger.record_fill(
-                    intent,
-                    volume=intent.volume,
-                    price=previous,
-                    commission=self.config.transaction_cost * intent.volume,
-                    realized_pnl=0.0,
-                    event_time=pd.Timestamp(self.bars.iloc[self.current_step]["time"]).to_pydatetime(),
-                )
-            self.current_step += 1
-            current = float(self.bars.iloc[min(self.current_step, len(self.bars) - 1)]["close"])
+
             previous_equity = self._equity
-            equity_delta = previous_equity * (target * (current - previous) / max(previous, 1e-12))
-            equity_delta -= previous_equity * turnover * self.config.transaction_cost
-            self._equity = previous_equity + equity_delta
-            self._peak_equity = max(self._peak_equity, self._equity)
-            self._position = target
+            cost_fraction = self.config.transaction_cost
+            extra_closes = 0
+
+            # --- 1) Action-driven leg closure (flatten / reverse) at the
+            # decision price ------------------------------------------------
+            action_realized = 0.0
+            if old_position != 0 and target != old_position:
+                action_realized = self._realize_return(old_position, previous)
+
+            # --- 2) Open a new leg (entry or the reversal leg) -------------
+            if target != 0 and (old_position == 0 or target != old_position):
+                self._open_leg(target, previous, decision_bar)
+                if old_position == 0:
+                    self._record_entry(target, previous, decision_bar)
+
+            self.current_step += 1
+            current_bar = self.bars.iloc[min(self.current_step, len(self.bars) - 1)]
+            current_close = float(current_bar["close"])
+
+            # --- 3) Managed exit (SL/TP/trailing) on the held leg ----------
+            managed_realized = 0.0
+            exit_price_for_equity: float | None = None
+            if (
+                self.config.use_managed_exits
+                and self._position != 0
+                and self._position == target
+                and self.current_step < len(self.bars)
+            ):
+                managed_realized, exit_price = self._check_managed_exit(current_bar)
+                if managed_realized != 0.0 or exit_price is not None:
+                    extra_closes += 1
+                    exit_price_for_equity = exit_price
+
+            # --- 4) Episode end: force-flatten an open position ------------
             self._episode_step += 1
             terminated = self.current_step >= len(self.bars) - 1 or self._equity <= 0
             truncated = (
                 self.config.episode_length_bars > 0
                 and self._episode_step >= self.config.episode_length_bars
             )
+            end_realized = 0.0
+            if (terminated or truncated) and self._position != 0:
+                end_realized = self._realize_return(self._position, current_close)
+                self._position = 0
+                extra_closes += 1
+                exit_price_for_equity = current_close
 
+            # --- 5) Equity update (realized PnL + floating mark) -----------
+            realized_frac = action_realized + managed_realized + end_realized
+            equity_change = previous_equity * realized_frac
+            equity_change -= previous_equity * (turnover + extra_closes) * cost_fraction
+            if self._position != 0 and exit_price_for_equity is None:
+                # Still holding: mark-to-market over this bar (not rewarded in
+                # the sparse modes; it only keeps equity/termination honest).
+                equity_change += previous_equity * self._position * (current_close - previous) / max(previous, 1e-12)
+            elif self._position != 0 and exit_price_for_equity is not None:
+                # Reversal case where the new leg stays open: mark from entry.
+                equity_change += previous_equity * self._position * (current_close - previous) / max(previous, 1e-12)
+            self._equity = previous_equity + equity_change
+            self._peak_equity = max(self._peak_equity, self._equity)
+
+            # --- 6) Reward -------------------------------------------------
             if self.config.reward_type == "risk_adjusted":
                 from slytrade.rl.rewards import RewardConfig, shaped_reward
 
-                # The raw delta already includes transaction costs, so the shaper's
-                # cost term is disabled to avoid double counting.
                 reward = shaped_reward(
                     previous_equity=previous_equity,
                     equity=self._equity,
@@ -211,13 +258,9 @@ if gym is not None:
                     ),
                 )
             elif self.config.reward_type == "trade_pnl":
-                # Sparse, trade-close reward: realized PnL when a position closes,
-                # zero while holding. This trains trade quality (win/loss size)
-                # instead of bar-to-bar mark-to-market noise, and stops the
-                # policy from churning.
-                reward = self._trade_pnl_reward(old_position, target, turnover, previous)
+                reward = realized_frac - (turnover + extra_closes) * cost_fraction
             else:
-                reward = equity_delta
+                reward = equity_change / max(previous_equity, 1e-12)
 
             return self._observation(), float(reward), terminated, truncated, {
                 "equity": float(self._equity),
@@ -225,31 +268,77 @@ if gym is not None:
                 "episode_start": episode_start,
             }
 
-        def _trade_pnl_reward(self, old_position: int, target: int, turnover: int, price: float) -> float:
-            """Realized-PnL reward, paid only when exposure changes.
+        # --- trade-management helpers ---------------------------------------
+        def _open_leg(self, direction: int, price: float, bar: pd.Series) -> None:
+            self._position = direction
+            self._entry_price = price
+            atr = float(bar.get("atr", 0.0) or 0.0)
+            if atr <= 0:
+                high = float(bar.get("high", price))
+                low = float(bar.get("low", price))
+                atr = max(high - low, price * 0.0005)
+            stop_dist = max(atr * self.config.stop_loss_atr, price * 0.0002)
+            target_dist = atr * self.config.take_profit_atr
+            if direction > 0:
+                self._stop_loss = price - stop_dist
+                self._take_profit = price + target_dist
+            else:
+                self._stop_loss = price + stop_dist
+                self._take_profit = price - target_dist
 
-            Opening a position costs transaction costs (small negative reward);
-            closing (or reversing) realizes PnL from the entry price to the exit
-            price. Holding (or staying flat) yields exactly zero reward.
-            """
-            cost = turnover * self.config.transaction_cost
+        def _realize_return(self, direction: int, exit_price: float) -> float:
+            if self._entry_price > 0:
+                realized = direction * (exit_price - self._entry_price) / self._entry_price
+            else:
+                realized = 0.0
+            self._entry_price = 0.0
+            self._stop_loss = 0.0
+            self._take_profit = 0.0
+            return realized
 
-            if old_position == 0 and target != 0:
-                # Opening a new position: entry price is the decision price.
-                self._entry_price = price
-                return -cost
+        def _check_managed_exit(self, bar: pd.Series) -> tuple[float, float | None]:
+            """Return (realized_return, exit_price) if SL/TP was hit this bar."""
+            high = float(bar.get("tick_mid_high", bar.get("high", 0.0)) or 0.0)
+            low = float(bar.get("tick_mid_low", bar.get("low", 0.0)) or 0.0)
+            if high <= 0 or low <= 0:
+                return 0.0, None
+            direction = self._position
+            if direction > 0:
+                sl_hit = low <= self._stop_loss
+                tp_hit = high >= self._take_profit
+            else:
+                sl_hit = high >= self._stop_loss
+                tp_hit = low <= self._take_profit
 
-            if old_position != 0 and target != old_position:
-                # Closing (target == 0) or reversing: realize the closed leg.
-                if self._entry_price > 0:
-                    realized = old_position * (price - self._entry_price) / self._entry_price
-                else:
-                    realized = 0.0
-                self._entry_price = price if target != 0 else 0.0
-                return realized - cost
+            if not sl_hit and not tp_hit:
+                return 0.0, None
 
-            # Holding an open position or staying flat: no reward.
-            return 0.0
+            # Conservative same-bar rule (mirrors the backtest engine): if both
+            # are touched, the stop-loss wins.
+            if sl_hit:
+                exit_price = self._stop_loss
+            else:
+                exit_price = self._take_profit
+            realized = self._realize_return(direction, exit_price)
+            self._position = 0
+            self._last_exit_price = exit_price
+            return realized, exit_price
+
+        def _record_entry(self, direction: int, price: float, bar: pd.Series) -> None:
+            intent = OrderIntent(
+                symbol=str(bar["symbol"]),
+                side=Side.BUY if direction > 0 else Side.SELL,
+                volume=min(self.config.max_position_volume, self.config.risk_per_trade),
+                reason="rl_entry",
+            )
+            self.ledger.record_fill(
+                intent,
+                volume=intent.volume,
+                price=price,
+                commission=self.config.transaction_cost * intent.volume,
+                realized_pnl=0.0,
+                event_time=pd.Timestamp(bar["time"]).to_pydatetime(),
+            )
 
         def _observation(self) -> np.ndarray:
             index = min(self.current_step, len(self.features) - 1)

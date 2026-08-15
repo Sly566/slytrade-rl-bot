@@ -1286,6 +1286,53 @@ def clean() -> None:
 
 
 @app.command()
+def robustness(
+    bars_file: str = typer.Option(..., help="Aligned bars file (.parquet or .csv)"),
+    strategy: str = typer.Option("persona-adaptive", help="Strategy to stress-test"),
+    symbol: str | None = typer.Option(None, help="Symbol override"),
+    n_simulations: int = typer.Option(2000, help="Monte Carlo resamples"),
+) -> None:
+    """Produce robustness evidence: Monte Carlo, parameter perturbation, regime
+    segmentation of the strategy's realized PnL."""
+    from slytrade.tasks import robustness as run_robustness
+
+    result = run_robustness(bars_file, strategy=strategy, symbol=symbol, n_simulations=n_simulations)
+    if not result.ok:
+        console.print(f"[red]{result.message}[/red]")
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def paper_multi(
+    symbols: str = typer.Option("XAUUSD", help="Comma-separated symbols, e.g. XAUUSD,EURUSD"),
+) -> None:
+    """Run the supervised paper loop across multiple symbols in parallel."""
+    from slytrade.runtime.metrics_server import MetricsServer
+    from slytrade.runtime.portfolio_loop import PaperPortfolio
+    from slytrade.runtime.settings import RuntimeSettings
+
+    settings = RuntimeSettings()
+    symbol_list = [symbol.strip().upper() for symbol in symbols.split(",") if symbol.strip()]
+    portfolio = PaperPortfolio(symbol_list, settings)
+    server = MetricsServer(port=settings.metrics_port, bind=settings.metrics_bind, metrics=portfolio.metrics) if settings.metrics_enabled else None
+    if server:
+        server.start()
+        console.print(f"[green]Metrics on :{settings.metrics_port}[/green] (Ctrl+C to stop)")
+    try:
+        import time as _time
+
+        portfolio.start(load_mt5())
+        while True:
+            _time.sleep(3600)
+    except KeyboardInterrupt:
+        console.print("[yellow]Stopping portfolio…[/yellow]")
+    finally:
+        portfolio.stop()
+        if server:
+            server.stop()
+
+
+@app.command()
 def full_pipeline(
     symbol: str = typer.Option("XAUUSD", help="Symbol to run the pipeline for"),
     lookback: str = typer.Option("1y", help="Lookback duration"),

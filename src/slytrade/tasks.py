@@ -229,6 +229,9 @@ def collect_all(
     if timeframes is None:
         timeframes = ["M1", "M5", "M15", "H1", "H4", "D1"]
 
+    from slytrade.progress import stage
+
+    stage(f"Collect {symbol} ({lookback}) — bars from MT5, ticks from Exness")
     if clean:
         cleaned = clean_all()
         if not cleaned.ok:
@@ -684,7 +687,9 @@ def align(
 ) -> TaskResult:
     from slytrade.data.alignment import align_market_data, render_manifest, save_aligned_dataset
     from slytrade.data.tick_stream import align_market_data_streaming
+    from slytrade.progress import stage
 
+    stage(f"Align {symbol} {timeframe} — ticks → features → decision quotes → MTF")
     output = Path(out_dir) if out_dir else Path("data/processed/aligned") / symbol
     # Recreate any deleted data directories and ensure the output path is
     # writable (self-heals a deleted data/processed tree).
@@ -898,7 +903,8 @@ def backtest(
     initial_balance: float = 100_000.0,
     point_size: float = 0.01,
     point_value: float | None = None,
-    commission: float = 0.0,
+    commission: float | None = None,
+    slippage_points: float | None = None,
 ) -> TaskResult:
     from slytrade.backtest.engine import BacktestConfig
     from slytrade.backtest.reporting import (
@@ -906,13 +912,28 @@ def backtest(
         render_backtest_report,
         run_managed_aligned_backtest_from_bars,
     )
+    from slytrade.progress import stage
 
+    stage("Backtest (persona-adaptive, managed exits)")
     bars, load_error = _load_bars_or_error(bars_file)
     if load_error is not None:
         return load_error
     assert bars is not None
     resolved = infer_symbol(bars, symbol)
     point_value = point_value if point_value is not None else default_point_value(resolved)
+
+    # Cost-aware defaults from configs/risk.yaml so the reported edge is NET of
+    # commission + slippage (GAP-1). Explicit CLI values always win.
+    if commission is None or slippage_points is None:
+        from slytrade.core.config import load_config as _load_config
+
+        risk_cfg = _load_config("configs").risk
+        costs = risk_cfg.get("costs", {})
+        if commission is None:
+            commission = float(costs.get("commission_per_volume", 0.0) or 0.0)
+        if slippage_points is None:
+            slippage_points = float(costs.get("slippage_points", 0.0) or 0.0)
+
     result = run_managed_aligned_backtest_from_bars(
         bars,
         strategy_name=strategy,
@@ -924,18 +945,21 @@ def backtest(
             point_size=point_size,
             point_value=point_value,
             commission_per_volume=commission,
+            slippage_points=slippage_points,
         ),
     )
     render_backtest_report(result, strategy_name=strategy, console=console)
     return TaskResult(
         True,
-        "backtest complete",
+        "backtest complete (net of costs)",
         {
             "total_return": result.metrics.total_return,
             "max_drawdown": result.metrics.max_drawdown,
             "sharpe_like": result.metrics.sharpe_like,
             "trades": result.metrics.trades,
             "final_equity": result.metrics.final_equity,
+            "commission_per_volume": commission,
+            "slippage_points": slippage_points,
         },
     )
 
@@ -953,16 +977,18 @@ def train(
     total_timesteps: int = 50_000,
     seed: int = 42,
     policy: str = "mlp",
-    reward: str = "risk_adjusted",
+    reward: str = "trade_pnl",
     artifacts_dir: str | Path = "models/artifacts",
     registry_path: str | Path = "models/registry.jsonl",
 ) -> TaskResult:
     from slytrade.backtest.reporting import infer_symbol
+    from slytrade.progress import info, stage
     from slytrade.rl.dataset import build_rl_dataset
     from slytrade.rl.deployment import save_model_artifact
     from slytrade.rl.tracking import maybe_end_run, maybe_log_metrics, maybe_log_params, maybe_start_run
     from slytrade.rl.walkforward import evaluate_policy, resolve_algorithm, train_policy, train_ppo
 
+    stage("Train RL policy (adopts the validated feature stack)")
     # The model artifact and registry live under models/ — make sure that tree
     # exists and is writable before a long training run starts.
     dir_error = _ensure_writable_root(Path(artifacts_dir).parent) or _ensure_writable_root(Path(registry_path).parent)
@@ -978,19 +1004,24 @@ def train(
     bars = bars[bars["symbol"] == resolved].copy()
     try:
         dataset = build_rl_dataset(bars)
+        info(f"dataset: {len(dataset.bars):,} bars × {len(dataset.features.columns)} features "
+             f"(ML + ICT + tick microstructure + MTF)")
         scaler_params = dataset.fit_scaler(0, len(dataset.bars))
         env = dataset.env_factory(0, len(dataset.bars), seed=seed, scaler_params=scaler_params)
     except ImportError as exc:
         return TaskResult(False, f"RL dependencies not installed: {exc}")
     env.config = _with_reward(env.config, reward)
+    info(f"reward: {reward} | managed exits: {env.config.use_managed_exits} "
+         f"(SL {env.config.stop_loss_atr}×ATR, TP {env.config.take_profit_atr}×ATR) | "
+         f"episode length: {env.config.episode_length_bars} bars")
 
     run = maybe_start_run("slytrade-rl", run_name=f"{algorithm}-{resolved}-{seed}")
-    maybe_log_params(run, {"algorithm": algorithm, "symbol": resolved, "seed": seed, "timesteps": total_timesteps, "policy": policy, "reward": reward})
+    maybe_log_params(run, {"algorithm": algorithm, "symbol": resolved, "seed": seed, "timesteps": total_timesteps, "policy": policy, "reward": reward, "features": len(dataset.features.columns)})
     try:
         if algorithm == "ppo":
-            model = train_ppo(env, total_timesteps=total_timesteps, seed=seed, policy_type=policy)
+            model = train_ppo(env, total_timesteps=total_timesteps, seed=seed, policy_type=policy, progress_bar=True)
         else:
-            model = train_policy(algorithm, env, total_timesteps=total_timesteps, seed=seed, policy_type=policy)
+            model = train_policy(algorithm, env, total_timesteps=total_timesteps, seed=seed, policy_type=policy, progress_bar=True)
         results = evaluate_policy(model, env, episodes=3, seed=seed)
         maybe_log_metrics(run, {f"mean_{key}": float(value) for key, value in results.items() if isinstance(value, (int, float))})
     finally:
@@ -1008,6 +1039,8 @@ def train(
             "policy": policy,
             "seed": seed,
             "total_timesteps": total_timesteps,
+            "use_managed_exits": env.config.use_managed_exits,
+            "n_features": len(dataset.features.columns),
         },
         metrics={f"mean_{key}": float(value) for key, value in results.items() if isinstance(value, (int, float))},
         artifacts_dir=artifacts_dir,
@@ -1050,9 +1083,11 @@ def walk_forward(
     policy: str = "mlp",
 ) -> TaskResult:
     from slytrade.backtest.reporting import infer_symbol
+    from slytrade.progress import info, stage
     from slytrade.rl.dataset import build_rl_dataset
     from slytrade.rl.walkforward import make_walk_forward_folds, resolve_fold_windows, walk_forward_validation
 
+    stage("Walk-forward validation (embargoed out-of-sample)")
     bars, load_error = _load_bars_or_error(bars_file)
     if load_error is not None:
         return load_error
@@ -1081,8 +1116,10 @@ def walk_forward(
             embargo=windows.embargo,
             step=windows.step,
         )
+        info(f"{len(folds)} folds · reward={reward} · policy={policy} · {total_timesteps} steps/fold")
         table = walk_forward_validation(
-            dataset, folds, total_timesteps=total_timesteps, seed=seed, reward_type=reward, policy_type=policy
+            dataset, folds, total_timesteps=total_timesteps, seed=seed, reward_type=reward, policy_type=policy,
+            progress=True, progress_bar=True,
         )
     except ImportError as exc:
         return TaskResult(False, f"RL dependencies not installed: {exc}")
@@ -1129,7 +1166,10 @@ def full_pipeline(
     With ``clean=True`` the derived data tree is wiped first so no stale files
     from a previous run can leak into this one.
     """
+    from slytrade.progress import stage
+
     steps: list[str] = []
+    stage(f"Full pipeline — {symbol} · lookback={lookback} · source={source}")
     if clean:
         cleaned = clean_all()
         if not cleaned.ok:
@@ -1222,3 +1262,102 @@ def clean_all() -> TaskResult:
         return dir_error
     console.print(f"[green]Cleaned {removed} items; data tree is fresh.[/green]")
     return TaskResult(True, "clean complete", {"removed": removed})
+
+
+# ---------------------------------------------------------------------------
+# Task: robustness evidence (Monte Carlo + perturbation + regime segmentation)
+# ---------------------------------------------------------------------------
+
+
+def robustness(
+    bars_file: str,
+    *,
+    strategy: str = "persona-adaptive",
+    symbol: str | None = None,
+    n_simulations: int = 2000,
+) -> TaskResult:
+    """Produce robustness evidence for a strategy on an aligned dataset.
+
+    * Trade-sequence Monte Carlo of the realized-PnL sequence.
+    * Parameter perturbation of the key risk knobs (SL/TP ATR multiples).
+    * Regime segmentation of realized PnL (volatility/trend/session).
+    """
+    from slytrade.backtest.reporting import infer_symbol, load_bars_file
+    from slytrade.progress import info, stage
+    from slytrade.rl.robustness import (
+        RobustnessReport,
+        monte_carlo_trades,
+        perturbation_sweep,
+        regime_segmentation,
+    )
+
+    stage("Robustness evidence (Monte Carlo + perturbation + regime)")
+    bars = load_bars_file(Path(bars_file))
+    resolved = infer_symbol(bars, symbol)
+    bars = bars[bars["symbol"] == resolved].copy()
+
+    # Baseline backtest + its realized-PnL sequence.
+    result = _run_backtest_for_pnls(bars, strategy, resolved)
+    pnls = [float(record.realized_pnl) for record in result.trades if record.reason.startswith("managed_")]
+
+    if not pnls:
+        return TaskResult(False, "no closed trades to analyse; the strategy found no entries in this window")
+
+    mc = monte_carlo_trades(pnls, n_simulations=n_simulations)
+    info(f"observed total PnL {mc.observed_total:,.2f} across {len(pnls)} trades")
+    info(f"Monte Carlo ({mc.n_simulations} resamples): mean {mc.mean_total:,.2f}, "
+         f"95% CI [{mc.ci_95_low:,.2f}, {mc.ci_95_high:,.2f}], P(loss) {mc.prob_loss:.1%}")
+
+    # Perturbation: re-run the same backtest with SL/TP ATR multiples shifted.
+    base = {"stop_loss_atr": 1.0, "take_profit_atr": 2.0}
+
+    def score(params):
+        score_result = _run_backtest_for_pnls(bars, strategy, resolved, **params)
+        return float(sum(float(record.realized_pnl) for record in score_result.trades if record.reason.startswith("managed_")))
+
+    perturbations = perturbation_sweep(
+        score,
+        base,
+        deltas={"stop_loss_atr": (-0.5, 0.0, 0.5), "take_profit_atr": (-0.5, 0.0, 0.5)},
+    )
+    for perturbation in perturbations:
+        flag = "[yellow]SENSITIVE[/yellow]" if perturbation.sensitive else "[green]stable[/green]"
+        info(f"perturb {perturbation.param}: scores {[round(s, 1) for s in perturbation.scores]} → {flag}")
+
+    segments = regime_segmentation(pd.DataFrame(result.trades), bars)
+    for segment in segments:
+        info(f"regime '{segment.label}': {segment.trades} trades, total {segment.total_pnl:,.2f}, "
+             f"win {segment.win_rate:.0%}")
+
+    report = RobustnessReport(monte_carlo=mc, perturbations=perturbations, regimes=segments)
+    console.print("[green]Robustness report ready[/green]")
+    return TaskResult(True, "robustness complete", report.as_dict())
+
+
+def _run_backtest_for_pnls(
+    bars: pd.DataFrame,
+    strategy: str,
+    symbol: str,
+    *,
+    stop_loss_atr: float = 1.0,
+    take_profit_atr: float = 2.0,
+):
+    """Run a managed backtest and return the BacktestResult (for robustness)."""
+    from slytrade.backtest.engine import BacktestConfig
+    from slytrade.backtest.reporting import run_managed_aligned_backtest_from_bars
+    from slytrade.backtest.trade_management import TradeManagementConfig
+
+    return run_managed_aligned_backtest_from_bars(
+        bars,
+        strategy_name=strategy,
+        symbol=symbol,
+        volume=0.1,
+        point_value=default_point_value(symbol),
+        config=BacktestConfig(
+            initial_balance=100_000.0,
+            point_size=0.01,
+            point_value=default_point_value(symbol),
+            commission_per_volume=0.0,
+        ),
+        trade_config=TradeManagementConfig(stop_loss_atr=stop_loss_atr, take_profit_atr=take_profit_atr),
+    )

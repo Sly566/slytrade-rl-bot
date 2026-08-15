@@ -5,6 +5,16 @@ max_position_volume: 1.0
 max_open_positions: 1
 max_consecutive_losses: 3
 
+# Trading costs used by cost-aware backtests (net-of-cost edge measurement).
+# commission_per_volume: USD charged per 1.0 lot per side (Exness gold ~$3.5).
+# slippage_points: adverse slippage in instrument points applied to every fill.
+costs:
+  commission_per_volume: 3.5
+  slippage_points: 5
+  # Base-currency conversion fallback when the live terminal cannot provide a
+  # rate (used only for non-USD accounts). 1 USD = this many account units.
+  currency_rate_to_usd: 18.0
+
 ict:
   sl_atr_mult: 1.0
   trailing_atr_mult: 2.0

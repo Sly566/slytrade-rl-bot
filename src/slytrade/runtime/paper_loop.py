@@ -56,7 +56,7 @@ from slytrade.runtime.alerting import AlertManager
 from slytrade.runtime.circuit_breaker import LossCircuitBreaker, limits_from_config
 from slytrade.runtime.logs import setup_logging
 from slytrade.runtime.metrics_server import TradingMetrics
-from slytrade.runtime.news_gate import NewsGate, load_news_gate
+from slytrade.runtime.news_gate import NewsGate
 from slytrade.runtime.settings import RuntimeSettings
 from slytrade.runtime.trading_window import TradingWindow, window_from_settings
 from slytrade.strategies.personality_adaptive import PersonalityAdaptiveStrategy
@@ -278,11 +278,9 @@ class PaperTradingLoop:
             self.settings.trading_end_utc,
         )
         self.alerter = AlertManager.from_settings(self.settings, self.logger)
-        self.news_gate = (
-            load_news_gate(self.settings.news_config_file, year=datetime.now(UTC).year)
-            if self.settings.news_enabled
-            else NewsGate(enabled=False)
-        )
+        from slytrade.runtime.calendar import build_news_gate_from_settings
+
+        self.news_gate = build_news_gate_from_settings(self.settings)
 
         self.guardrails = TradingGuardrails(
             GuardrailConfig(
