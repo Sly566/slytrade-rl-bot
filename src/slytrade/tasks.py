@@ -210,6 +210,7 @@ def collect_all(
     source: str = "hybrid",
     root: str | Path = "data/raw",
     sample_start: str = "2025-01-01",
+    clean: bool = False,
 ) -> TaskResult:
     """Collect bars + ticks from their designated sources in one shot.
 
@@ -227,6 +228,11 @@ def collect_all(
     """
     if timeframes is None:
         timeframes = ["M1", "M5", "M15", "H1", "H4", "D1"]
+
+    if clean:
+        cleaned = clean_all()
+        if not cleaned.ok:
+            return cleaned
 
     # Recreate any deleted data directories, then verify the path this source
     # actually writes to is writable. The `samples` source writes to SAMPLE_ROOT,
@@ -767,15 +773,7 @@ def align(
                 # the archive are trimmed, never trained on).
                 require_fresh_quotes=True,
             )
-            # Ticks are already on disk under their source tree; reference them
-            # instead of copying (avoids a multi-GB copy for long lookbacks).
-            manifest = save_aligned_dataset(
-                dataset,
-                output,
-                source_bars_file=bars_file,
-                source_ticks_file=tick_file_dir,
-                copy_ticks=False,
-            )
+            source_ticks_file = tick_file_dir
         except Exception as exc:
             return TaskResult(False, f"streaming alignment failed: {exc}")
     else:
@@ -791,10 +789,57 @@ def align(
             include_tick_features=True,
             require_fresh_quotes=False,
         )
-        manifest = save_aligned_dataset(dataset, output, source_bars_file=bars_file, source_ticks_file=ticks_file, copy_ticks=False)
+        source_ticks_file = ticks_file
 
+    # Inject the higher-timeframe (MTF) features from the collected M5/M15/
+    # H1/H4/D1 bars. This is the "always watching every timeframe" layer: the
+    # persona strategy and the RL mode vector read mtf_bias /
+    # mtf_confluence_score / htf_* columns straight off these bars.
+    dataset = _inject_mtf_features(dataset, symbol, timeframe, root)
+
+    manifest = save_aligned_dataset(
+        dataset,
+        output,
+        source_bars_file=bars_file,
+        source_ticks_file=source_ticks_file,
+        copy_ticks=False,
+    )
     render_manifest(manifest, console=console)
     return TaskResult(True, f"aligned dataset ready at {output}", {"bars_file": manifest.files["bars"], "rows": len(dataset.bars)})
+
+
+def _inject_mtf_features(dataset, symbol: str, timeframe: str, root: str | Path):
+    """Merge higher-timeframe ICT features into the aligned M1 bars.
+
+    Loads the collected higher-timeframe bars (M5, M15, H1, H4, D1) from MT5
+    storage and computes per-bar MTF context (htf_* features, mtf_bias,
+    mtf_confluence_score) causally aligned to the execution timeframe. If no
+    higher-timeframe bars are available, the dataset is returned unchanged.
+    """
+    from dataclasses import replace
+
+    from slytrade.config.mtf import get_higher_timeframes
+    from slytrade.features.mtf import compute_mtf_ict_features
+
+    higher: dict[str, pd.DataFrame] = {}
+    for tf in get_higher_timeframes(timeframe):
+        if tf == timeframe:
+            continue
+        try:
+            higher[tf] = load_collected_bars(symbol, tf, root)
+        except FileNotFoundError:
+            continue
+    if not higher:
+        console.print("[yellow]No higher-timeframe bars found; skipping MTF feature injection.[/yellow]")
+        return dataset
+
+    try:
+        mtf_bars = compute_mtf_ict_features(dataset.bars, higher)
+    except Exception as exc:  # pragma: no cover - data dependent
+        console.print(f"[yellow]MTF feature injection failed ({exc}); keeping single-timeframe bars.[/yellow]")
+        return dataset
+    console.print(f"[green]Injected MTF features from {', '.join(sorted(higher))} ({len(mtf_bars)} bars)[/green]")
+    return replace(dataset, bars=mtf_bars)
 
 
 def _load_frame(path: str | Path) -> pd.DataFrame:
@@ -1077,9 +1122,19 @@ def full_pipeline(
     policy: str = "mlp",
     reward: str = "risk_adjusted",
     promote_stage: str = "paper",
+    clean: bool = False,
 ) -> TaskResult:
-    """Run collection → alignment → backtest → train → walk-forward → promote."""
+    """Run collection → alignment → backtest → train → walk-forward → promote.
+
+    With ``clean=True`` the derived data tree is wiped first so no stale files
+    from a previous run can leak into this one.
+    """
     steps: list[str] = []
+    if clean:
+        cleaned = clean_all()
+        if not cleaned.ok:
+            return cleaned
+        steps.append("clean")
     collected = collect_all(symbol, lookback=lookback, source=source)
     if not collected.ok:
         return collected
@@ -1111,3 +1166,59 @@ def full_pipeline(
 
     console.print(f"[bold green]Full pipeline complete: {' → '.join(steps)}[/bold green]")
     return TaskResult(True, "full pipeline complete", {"steps": steps, "model_id": model_id})
+
+
+# ---------------------------------------------------------------------------
+# Task: clean (reset derived data without touching directory ownership)
+# ---------------------------------------------------------------------------
+
+# Derived directories whose CONTENTS are wiped by clean_all(). The directories
+# themselves are kept (and recreated) so their owner stays the current user —
+# this is what makes repeated pipeline runs safe without sudo.
+CLEANABLE_DIRS = (
+    "data/raw",
+    "data/processed",
+    "data/exness_derived",
+    "data/samples",
+    "models",
+    "logs",
+    "state",
+)
+
+
+def clean_all() -> TaskResult:
+    """Delete derived data from previous runs, keeping the directories.
+
+    Removes the *contents* of the data/output directories so a fresh pipeline
+    run never mixes stale files with new ones, but keeps the directories
+    themselves owned by the current user (the root-cause fix for the
+    "data is owned by root" permission loop caused by `sudo rm -rf data`).
+    """
+    import shutil
+
+    removed = 0
+    errors: list[str] = []
+    for directory in CLEANABLE_DIRS:
+        path = Path(directory)
+        if not path.exists():
+            continue
+        try:
+            for child in path.iterdir():
+                if child.is_dir() and not child.is_symlink():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+                removed += 1
+        except PermissionError:
+            errors.append(f"'{path}' is owned by another user (e.g. root); run: sudo rm -rf \"{path}\"")
+        except OSError as exc:  # pragma: no cover
+            errors.append(f"'{path}': {exc}")
+    if errors:
+        return TaskResult(False, "some directories could not be cleaned:\n" + "\n".join(errors))
+
+    # Recreate the standard tree (owned by the current user).
+    dir_error = _ensure_standard_dirs()
+    if dir_error is not None:
+        return dir_error
+    console.print(f"[green]Cleaned {removed} items; data tree is fresh.[/green]")
+    return TaskResult(True, "clean complete", {"removed": removed})

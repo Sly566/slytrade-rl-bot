@@ -1257,14 +1257,31 @@ def collect_all(
     symbol: str = typer.Option("XAUUSD", help="Symbol to collect, e.g. XAUUSD"),
     lookback: str = typer.Option("1y", help="Lookback duration, e.g. 1d, 1w, 1m, 1y"),
     source: str = typer.Option("hybrid", help="hybrid (MT5 bars + Exness ticks), auto, mt5, exness, or samples"),
+    clean: bool = typer.Option(False, "--clean", help="Wipe previous derived data before collecting"),
 ) -> None:
     """Collect bars (MT5) and ticks (Exness) from their designated sources."""
     from slytrade.tasks import collect_all as run_collect
 
-    result = run_collect(symbol, lookback=lookback, source=source)
+    result = run_collect(symbol, lookback=lookback, source=source, clean=clean)
     if not result.ok:
         console.print(f"[red]{result.message}[/red]")
         _hint_if_bridge(result.message)
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def clean() -> None:
+    """Delete derived data from previous runs (keeps directory ownership).
+
+    Safer than `rm -rf data`: it wipes the contents of data/{raw,processed,
+    exness_derived,samples} + models/logs/state but keeps the directories, so a
+    fresh pipeline run never mixes stale files and never needs sudo again.
+    """
+    from slytrade.tasks import clean_all
+
+    result = clean_all()
+    if not result.ok:
+        console.print(f"[red]{result.message}[/red]")
         raise typer.Exit(code=1)
 
 
@@ -1278,6 +1295,7 @@ def full_pipeline(
     policy: str = typer.Option("mlp", help="mlp or lstm"),
     reward: str = typer.Option("trade_pnl", help="trade_pnl, risk_adjusted, or raw"),
     promote_stage: str = typer.Option("paper", help="Stage to promote the model to"),
+    clean: bool = typer.Option(False, "--clean", help="Wipe previous derived data before the run"),
 ) -> None:
     """Run the entire pipeline from scratch: collect → align → backtest → train
     → walk-forward → promote."""
@@ -1292,6 +1310,7 @@ def full_pipeline(
         policy=policy,
         reward=reward,
         promote_stage=promote_stage,
+        clean=clean,
     )
     if not result.ok:
         console.print(f"[red]{result.message}[/red]")
