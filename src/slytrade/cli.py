@@ -574,9 +574,9 @@ def train_rl(
 @app.command()
 def walk_forward(
     bars_file: str = typer.Option(..., help="Aligned bars file with decision quote / ICT columns (.csv or .parquet)"),
-    train_window: int = typer.Option(200_000, help="Walk-forward train window (bars)"),
-    validation_window: int = typer.Option(50_000, help="Walk-forward validation window (bars)"),
-    test_window: int = typer.Option(50_000, help="Walk-forward test window (bars)"),
+    train_window: int = typer.Option(60_000, help="Walk-forward train window (bars)"),
+    validation_window: int = typer.Option(15_000, help="Walk-forward validation window (bars)"),
+    test_window: int = typer.Option(15_000, help="Walk-forward test window (bars)"),
     embargo: int = typer.Option(500, help="Embargo gap between train/val/test (bars)"),
     step: int | None = typer.Option(None, help="Step between folds (defaults to test_window)"),
     total_timesteps: int = typer.Option(20_000, help="PPO steps per fold"),

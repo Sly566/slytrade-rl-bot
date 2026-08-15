@@ -1131,10 +1131,68 @@ def walk_forward(
             dataset, folds, total_timesteps=total_timesteps, seed=seed, reward_type=reward, policy_type=policy,
             progress=True, progress_bar=True,
         )
+        if len(folds) < 2:
+            console.print(
+                "[yellow]Only one fold — this is a statistically weak read. Re-run with smaller windows "
+                "(e.g. --train-window 60000 --validation-window 15000 --test-window 15000) to get multiple folds.[/yellow]"
+            )
+        table = _add_champion_comparison(table, dataset, folds, resolved)
     except ImportError as exc:
         return TaskResult(False, f"RL dependencies not installed: {exc}")
     console.print(table.to_string(index=False))
     return TaskResult(True, "walk-forward validation complete", {"folds": len(folds)})
+
+
+def _add_champion_comparison(table: pd.DataFrame, dataset, folds, symbol: str) -> pd.DataFrame:
+    """Append the persona-adaptive (rule-based champion) return per fold.
+
+    The RL only earns a place in deployment if it beats the champion on the
+    SAME out-of-sample windows. This puts that comparison in the report.
+    """
+    from slytrade.backtest.engine import BacktestConfig
+    from slytrade.backtest.reporting import run_managed_aligned_backtest_from_bars
+    from slytrade.backtest.trade_management import TradeManagementConfig
+
+    persona_returns: list[float | None] = []
+    for fold in folds:
+        test_bars = dataset.bars.iloc[fold.test_start:fold.test_end].reset_index(drop=True)
+        try:
+            result = run_managed_aligned_backtest_from_bars(
+                test_bars,
+                strategy_name="persona-adaptive",
+                symbol=symbol,
+                volume=0.1,
+                point_value=default_point_value(symbol),
+                config=BacktestConfig(
+                    initial_balance=100_000.0,
+                    point_size=0.01,
+                    point_value=default_point_value(symbol),
+                    commission_per_volume=0.0,
+                ),
+                trade_config=TradeManagementConfig(stop_loss_atr=1.0, take_profit_atr=2.0),
+            )
+            realized = sum(float(record.realized_pnl) for record in result.trades if record.reason.startswith("managed_"))
+            persona_returns.append(realized / 100_000.0)
+        except Exception:  # pragma: no cover - data dependent
+            persona_returns.append(None)
+
+    valid = [value for value in persona_returns if value is not None]
+    aggregate_persona = sum(valid) / len(valid) if valid else float("nan")
+
+    rl_returns = table["test_mean_total_return"].tolist()
+    n_folds = len(folds)
+    rl_fold = rl_returns[:n_folds]
+    rl_minus = [
+        rl_fold[i] - (persona_returns[i] if persona_returns[i] is not None else float("nan"))
+        for i in range(n_folds)
+    ]
+    valid_diff = [value for value in rl_minus if value == value]
+    aggregate_diff = sum(valid_diff) / len(valid_diff) if valid_diff else float("nan")
+
+    table = table.copy()
+    table["persona_return"] = persona_returns + [aggregate_persona]
+    table["rl_minus_persona"] = rl_minus + [aggregate_diff]
+    return table
 
 
 # ---------------------------------------------------------------------------
