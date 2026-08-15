@@ -93,6 +93,11 @@ class RLEnvironmentConfig:
     # reward from slytrade.rl.rewards (recommended for production training).
     reward_type: str = "raw"
     drawdown_tolerance: float = 0.05
+    # Episodes are truncated after this many bars (0 = run to the end of the
+    # slice). Without a bound, a 1y M1 dataset is a single 350k-step episode,
+    # which is why the first models churned tens of thousands of trades and
+    # blew up the account before ever seeing a reward signal resolve.
+    episode_length_bars: int = 1000
 
 
 if gym is not None:
@@ -130,6 +135,7 @@ if gym is not None:
             self._equity = self.config.initial_balance
             self._peak_equity = self.config.initial_balance
             self._entry_price = 0.0
+            self._episode_step = 0
 
         def reset(self, *, seed: int | None = None, options: dict | None = None):
             super().reset(seed=seed)
@@ -138,6 +144,7 @@ if gym is not None:
             self._equity = self.config.initial_balance
             self._peak_equity = self.config.initial_balance
             self._entry_price = 0.0
+            self._episode_step = 0
             self.ledger.records.clear()
             return self._observation(), {}
 
@@ -180,7 +187,12 @@ if gym is not None:
             self._equity = previous_equity + equity_delta
             self._peak_equity = max(self._peak_equity, self._equity)
             self._position = target
+            self._episode_step += 1
             terminated = self.current_step >= len(self.bars) - 1 or self._equity <= 0
+            truncated = (
+                self.config.episode_length_bars > 0
+                and self._episode_step >= self.config.episode_length_bars
+            )
 
             if self.config.reward_type == "risk_adjusted":
                 from slytrade.rl.rewards import RewardConfig, shaped_reward
@@ -207,7 +219,7 @@ if gym is not None:
             else:
                 reward = equity_delta
 
-            return self._observation(), float(reward), terminated, False, {
+            return self._observation(), float(reward), terminated, truncated, {
                 "equity": float(self._equity),
                 "n_trades": len(self.ledger.records),
                 "episode_start": episode_start,

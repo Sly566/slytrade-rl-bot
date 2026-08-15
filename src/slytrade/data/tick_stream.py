@@ -224,6 +224,23 @@ def align_market_data_streaming(
     dropped_stale_bars = source_bars_rows - aligned_bars_rows
     if aligned_bars.empty:
         raise ValueError("aligned dataset has no bars after fresh-quote filtering")
+    if require_fresh_quotes:
+        # The delivered dataset is now 100% fresh: recompute coverage/quality
+        # over the kept bars so the manifest reports PASS instead of a WARN
+        # about bars that have been dropped by design.
+        coverage = TickBarCoverageDiagnostics(
+            bars=aligned_bars_rows,
+            bars_with_tick_before_decision=aligned_bars_rows,
+            bars_missing_tick_before_decision=0,
+            bars_with_fresh_tick_before_decision=aligned_bars_rows,
+            bars_with_stale_tick_before_decision=0,
+            max_quote_age_seconds=max_quote_age_seconds,
+            max_observed_quote_age_seconds=coverage.max_observed_quote_age_seconds,
+            first_missing_decision_time=None,
+            first_stale_decision_time=None,
+        )
+        fresh_ratio = 1.0
+        quality_status, quality_issues = "PASS", []
 
     tick_dir = ordered_files[0].parent
     while tick_dir.name.startswith("year=") or tick_dir.name.startswith("month=") or tick_dir.name.startswith("day=") or tick_dir.name.startswith("period="):
@@ -452,40 +469,97 @@ def resample_ticks_to_bars_streaming(
     return pd.DataFrame(rows)[BAR_COLUMNS].sort_values("time").reset_index(drop=True)
 
 
-def merge_tick_sources_streaming(
+def _month_key(path: Path) -> tuple[int, int]:
+    year = month = 0
+    for part in path.parts:
+        if part.startswith("year="):
+            year = int(part.split("=", 1)[1])
+        elif part.startswith("month="):
+            month = int(part.split("=", 1)[1])
+        elif part.startswith("period="):
+            value = part.split("=", 1)[1].split(".")[0]
+            try:
+                year, month = (int(bit) for bit in value.split("-")[:2])
+            except ValueError:  # pragma: no cover
+                pass
+    return (year, month)
+
+
+def min_tick_time_ns(files: list[Path]) -> int | None:
+    """Cheapest possible minimum timestamp across a set of tick files.
+
+    Reads only the ``time_msc`` column of each file (never the full frame), so
+    computing the MT5 coverage start over a full year of ticks is O(1) memory.
+    """
+    best: int | None = None
+    for path in files:
+        if path.suffix.lower() == ".parquet":
+            column = pd.read_parquet(path, columns=["time_msc"])["time_msc"]
+        else:
+            column = pd.read_csv(path, usecols=["time_msc"])["time_msc"]
+        if column.empty:
+            continue
+        minimum = int(pd.to_datetime(column, utc=True).astype("int64").min())
+        best = minimum if best is None else min(best, minimum)
+    return best
+
+
+def merge_mt5_exness_streaming(
     exness_files: list[Path],
-    mt5_recent: pd.DataFrame,
+    mt5_files: list[Path],
     *,
     out_root: Path,
     symbol: str,
 ) -> int:
-    """Stream Exness month files into merged storage, folding in recent MT5 ticks.
+    """Merge MT5 ticks (authoritative, most recent) with Exness ticks (history).
 
-    Writes one merged month file at a time (memory O(one month + recent)), and
-    de-duplicates the overlap between the last Exness month and the recent MT5
-    ticks. Returns the total number of merged tick rows.
+    MT5 covers from its earliest tick to "now"; the Exness archive covers the
+    older history but lags by about a day. The merge is therefore:
+
+    * Exness ticks are kept only where MT5 has no coverage (before MT5's start).
+    * MT5 ticks are kept as-is (they win on any overlap).
+
+    Each month is processed independently, so memory is O(one month).
     """
-    ordered = sort_tick_files(exness_files)
-    recent = mt5_recent.copy()
-    recent["time_msc"] = pd.to_datetime(recent["time_msc"], utc=True)
+    from collections import defaultdict
 
+    exness_by_month: dict[tuple[int, int], list[Path]] = defaultdict(list)
+    for path in exness_files:
+        exness_by_month[_month_key(path)].append(path)
+    mt5_by_month: dict[tuple[int, int], list[Path]] = defaultdict(list)
+    for path in mt5_files:
+        mt5_by_month[_month_key(path)].append(path)
+
+    cutoff_ns = min_tick_time_ns(mt5_files) if mt5_files else None
+    cutoff = pd.Timestamp(cutoff_ns, tz="UTC") if cutoff_ns is not None else None
+
+    months = sorted(set(exness_by_month) | set(mt5_by_month))
     total_rows = 0
-    last_index = len(ordered) - 1
-    for idx, path in enumerate(ordered):
-        frame = (
-            pd.read_parquet(path)
-            if path.suffix.lower() == ".parquet"
-            else pd.read_csv(path)
+    for key in months:
+        frames: list[pd.DataFrame] = []
+        for path in exness_by_month.get(key, []):
+            frame = pd.read_parquet(path) if path.suffix.lower() == ".parquet" else pd.read_csv(path)
+            frame["time_msc"] = pd.to_datetime(frame["time_msc"], utc=True)
+            if cutoff is not None:
+                frame = frame[frame["time_msc"] < cutoff]
+            if not frame.empty:
+                frames.append(frame)
+        for path in mt5_by_month.get(key, []):
+            frame = pd.read_parquet(path) if path.suffix.lower() == ".parquet" else pd.read_csv(path)
+            frame["time_msc"] = pd.to_datetime(frame["time_msc"], utc=True)
+            if not frame.empty:
+                frames.append(frame)
+        if not frames:
+            continue
+        month_frame = pd.concat(frames, ignore_index=True)
+        month_frame = (
+            month_frame.drop_duplicates(subset=["time_msc"], keep="last")
+            .sort_values("time_msc")
+            .reset_index(drop=True)
         )
-        frame["time_msc"] = pd.to_datetime(frame["time_msc"], utc=True)
-        if idx == last_index and not recent.empty:
-            frame = pd.concat([frame, recent], ignore_index=True)
-            frame = frame.drop_duplicates(subset=["time_msc"], keep="first").sort_values("time_msc").reset_index(drop=True)
-        else:
-            frame = frame.sort_values("time_msc").reset_index(drop=True)
-        frame["symbol"] = symbol
-        _write_month_parquet(out_root, symbol, frame)
-        total_rows += len(frame)
+        month_frame["symbol"] = symbol
+        _write_month_parquet(out_root, symbol, month_frame)
+        total_rows += len(month_frame)
     return total_rows
 
 

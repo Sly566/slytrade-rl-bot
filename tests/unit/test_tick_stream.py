@@ -15,7 +15,7 @@ import pandas as pd
 from slytrade.data.alignment import TICK_BAR_FEATURE_COLUMNS, align_market_data
 from slytrade.data.tick_stream import (
     align_market_data_streaming,
-    merge_tick_sources_streaming,
+    merge_mt5_exness_streaming,
     resample_ticks_to_bars_streaming,
     sort_tick_files,
     tick_file_metadata,
@@ -134,16 +134,52 @@ def test_resample_streaming_matches_in_memory(tmp_path: Path) -> None:
     pd.testing.assert_frame_equal(inmem, streamed)
 
 
-def test_merge_streaming_dedups_recent(tmp_path: Path) -> None:
-    f1 = write_tick_month(tmp_path, "XAUUSD", 2026, 1, 1, 60)
-    # Recent MT5 ticks overlap the tail of month 1.
-    recent = pd.read_parquet(f1).tail(10).copy()
-    recent["symbol"] = "XAUUSDm"
+def test_merge_mt5_exness_streaming(tmp_path: Path) -> None:
+    """MT5 is authoritative: Exness ticks before MT5 coverage are kept, MT5
+    wins on overlap, and the merged set has no duplicates or gaps."""
+    exness_file = write_tick_month(tmp_path / "ex", "XAUUSD", 2025, 12, 1, 60)
+    mt5_file = write_tick_month(tmp_path / "mt5", "XAUUSD", 2026, 1, 1, 40)
     out = tmp_path / "merged"
-    total = merge_tick_sources_streaming([f1], recent, out_root=out, symbol="XAUUSD")
-    # 60 exness ticks + 0 new recent (all duplicated) -> dedup to 60.
-    assert total == 60
+    total = merge_mt5_exness_streaming([exness_file], [mt5_file], out_root=out, symbol="XAUUSD")
+    # Disjoint months: 60 (Dec 2025 Exness) + 40 (Jan 2026 MT5) = 100.
+    assert total == 100
     merged_files = list(out.rglob("*.parquet"))
     merged = pd.concat([pd.read_parquet(p) for p in merged_files], ignore_index=True)
-    assert len(merged) == 60
+    assert len(merged) == 100
     assert set(merged["symbol"].unique()) == {"XAUUSD"}
+
+
+def test_merge_mt5_wins_on_overlap(tmp_path: Path) -> None:
+    """When MT5 and Exness cover the same month, MT5 ticks win and Exness
+    ticks before MT5's start are preserved."""
+    exness_file = write_tick_month(tmp_path / "ex", "XAUUSD", 2026, 1, 1, 60)
+    # MT5 covers the second half of the same month.
+    mt5_times = pd.date_range("2026-01-01 00:00:30", periods=30, freq="6s", tz="UTC")
+    mid = 101.0 + pd.Series(range(30), dtype=float) * 0.001
+    mt5_file = tmp_path / "mt5" / "symbol=XAUUSDm" / "year=2026" / "month=01" / "ticks.parquet"
+    mt5_file.parent.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "time_msc": mt5_times,
+            "time": mt5_times.floor("s"),
+            "symbol": "XAUUSDm",
+            "bid": (mid - 0.01).round(3),
+            "ask": (mid + 0.01).round(3),
+            "last": 0.0,
+            "volume": 1.0,
+            "volume_real": 0.0,
+            "flags": 0.0,
+            "spread": 0.02,
+            "mid": mid,
+        }
+    ).to_parquet(mt5_file, index=False)
+
+    out = tmp_path / "merged"
+    total = merge_mt5_exness_streaming([exness_file], [mt5_file], out_root=out, symbol="XAUUSD")
+    merged_files = list(out.rglob("*.parquet"))
+    merged = pd.concat([pd.read_parquet(p) for p in merged_files], ignore_index=True)
+    # Exness ticks before MT5 start (00:00:30) are kept; MT5 ticks kept; the
+    # Exness ticks at/after 00:00:30 are dropped (MT5 wins). No duplicates.
+    assert len(merged) == total
+    assert merged["time_msc"].is_unique
+    assert merged["time_msc"].max() == mt5_times[-1]

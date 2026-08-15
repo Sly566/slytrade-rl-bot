@@ -79,6 +79,10 @@ class MarketContextEngine:
             elif macro_score == 0:
                 macro_strength = "weak"
         context["macro_strength"] = macro_strength
+        # Explicitly track whether higher-timeframe data was supplied. When it
+        # was not, downstream alignment gates must treat "no evidence" as
+        # neutral, NOT as a weak/misaligned macro structure.
+        context["has_htf"] = bool(higher_tf_data)
 
         # Aggregate MTF bias alignment if the execution frame already carries it
         if "mtf_bias" in bars.columns:

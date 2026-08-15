@@ -133,7 +133,11 @@ class PersonalityAdaptiveStrategy:
             if context["session"] not in self.personality.session_preferences:
                 return None
 
-        if self.config.require_mtf_alignment and alignment < self.config.alignment_threshold:
+        # Only enforce the MTF alignment gate when higher-timeframe data was
+        # actually supplied. On a single-timeframe dataset there is nothing to
+        # align against, so requiring a threshold there silently blocks almost
+        # every entry (the original "10 trades in a year" behaviour).
+        if self.config.require_mtf_alignment and context.get("has_htf", False) and alignment < self.config.alignment_threshold:
             return None
 
         # Personality-adaptive threshold -------------------------------

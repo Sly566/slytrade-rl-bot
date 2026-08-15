@@ -464,6 +464,40 @@ def _download_exness_ticks(
     return TaskResult(True, "Exness ticks downloaded", {"source": "exness", "ticks": result.rows})
 
 
+def _download_exness_ticks_before(
+    symbol: str,
+    *,
+    lookback: str,
+    root: str | Path = "data/raw",
+    end_override: pd.Timestamp,
+) -> TaskResult:
+    """Download Exness ticks only up to ``end_override`` (MT5 coverage start).
+
+    MT5 already covers [end_override, now], so downloading the Exness archive
+    beyond that point wastes bandwidth and CPU on data that will be discarded.
+    """
+    from slytrade.data.exness_archive import ExnessArchiveDownloader, normalize_exness_symbol
+    from slytrade.data.time import date_range_from_lookback
+
+    archive_symbol = normalize_exness_symbol(symbol)
+    start_dt, _ = date_range_from_lookback(lookback)
+    end_dt = end_override.to_pydatetime()
+    if end_dt <= start_dt:
+        console.print("  Exness: MT5 already covers the whole lookback; skipping archive download.")
+        return TaskResult(True, "Exness not needed (MT5 covers the full lookback)", {"source": "exness", "ticks": 0})
+    try:
+        downloader = ExnessArchiveDownloader(str(root))
+        result = downloader.collect(archive_symbol, start_dt, end_dt, continue_on_error=True)
+    except PermissionError:
+        return TaskResult(False, f"permission denied writing Exness ticks under {root}; see the data-root check above")
+    except Exception as exc:  # pragma: no cover - network dependent
+        return TaskResult(False, f"Exness download failed: {exc}")
+    if result.rows <= 0:
+        return TaskResult(False, "Exness archive returned no tick rows")
+    console.print(f"  ticks: {result.rows} rows (Exness archive, before MT5 coverage)")
+    return TaskResult(True, "Exness ticks downloaded", {"source": "exness", "ticks": result.rows})
+
+
 # Recent MT5 tick window (days) merged on top of the Exness history so the
 # freshest bars never carry a stale quote from the archive's ~1-day lag.
 RECENT_MT5_TICK_DAYS = 3
@@ -476,38 +510,51 @@ def _merge_tick_sources(
     root: str | Path = "data/raw",
     recent_days: int = RECENT_MT5_TICK_DAYS,
 ) -> TaskResult:
-    """Merge Exness archive ticks (history) with MT5 ticks (recent window).
+    """Merge MT5 ticks (authoritative) with Exness ticks (older history).
 
-    Streams the Exness month files one at a time (memory O(one month)), folding
-    the recent MT5 ticks into the last month, and writes ``merged_ticks/`` which
-    ``align()`` prefers. This stays within memory bounds for any lookback.
+    MT5 is collected first for the FULL lookback (it covers from "now" back to
+    the start of its tick history). The Exness archive is then downloaded only
+    for the period BEFORE MT5's coverage begins, so there are no gaps and no
+    stale end-of-window bars from the archive's ~1-day lag. Both sides are
+    merged month-by-month in a single streaming pass (memory O(one month)).
     """
     from slytrade.data.exness_archive import normalize_exness_symbol
-    from slytrade.data.tick_stream import merge_tick_sources_streaming
+    from slytrade.data.tick_stream import merge_mt5_exness_streaming, min_tick_time_ns
 
     canonical = normalize_exness_symbol(symbol)
-    exness = _download_exness_ticks(symbol, lookback=lookback, root=root)
-    if not exness.ok:
-        return exness
-    exness_files = find_exness_ticks(canonical, root=root)
-    if not exness_files:
-        return TaskResult(False, "Exness ticks downloaded but could not be found")
 
-    recent = pd.DataFrame()
-    mt5_res = _collect_ticks_from_mt5(symbol, lookback=f"{recent_days}d", root=root)
-    if mt5_res.ok:
-        try:
-            recent = load_collected_ticks(symbol, root=root)
-            console.print(f"  recent MT5 ticks: {len(recent)} rows (merged on top of Exness)")
-        except FileNotFoundError:  # pragma: no cover - broker dependent
-            console.print("[yellow]Recent MT5 ticks unavailable; using Exness-only ticks.[/yellow]")
+    # 1) MT5 ticks — full lookback (authoritative for the recent part).
+    mt5_res = _collect_ticks_from_mt5(symbol, lookback=lookback, root=root)
+    mt5_files = find_collected_ticks(symbol, root=root) if mt5_res.ok else []
+    if mt5_files:
+        console.print(f"  MT5 ticks: {len(mt5_files)} files (full lookback, authoritative)")
     else:  # pragma: no cover - broker dependent
-        console.print(f"[yellow]Recent MT5 ticks unavailable ({mt5_res.message}); using Exness-only ticks.[/yellow]")
+        console.print(f"[yellow]MT5 ticks unavailable ({mt5_res.message if not mt5_res.ok else 'no files'}); using Exness only.[/yellow]")
+
+    # 2) Exness archive — only for the period BEFORE MT5 coverage.
+    if mt5_files:
+        mt5_start_ns = min_tick_time_ns(mt5_files)
+        if mt5_start_ns is not None:
+            exness = _download_exness_ticks_before(symbol, lookback=lookback, root=root, end_override=pd.Timestamp(mt5_start_ns, tz="UTC"))
+            if not exness.ok and exness.data is None:
+                # A hard failure (network/permissions) aborts; "not needed"
+                # returns ok with ticks=0 and is fine.
+                return exness
+        else:  # pragma: no cover
+            exness = TaskResult(False, "MT5 tick files are empty")
+    else:
+        exness = _download_exness_ticks(symbol, lookback=lookback, root=root)
+        if not exness.ok:
+            return exness
+
+    exness_files = find_exness_ticks(canonical, root=root)
+    if not mt5_files and not exness_files:
+        return TaskResult(False, "no tick data available (both MT5 and Exness empty)")
 
     try:
-        total_rows = merge_tick_sources_streaming(
+        total_rows = merge_mt5_exness_streaming(
             exness_files,
-            recent,
+            mt5_files,
             out_root=Path(root) / "merged_ticks",
             symbol=canonical,
         )
@@ -715,7 +762,10 @@ def align(
                 max_quote_age_seconds=5.0,
                 min_fresh_coverage=0.95,
                 include_ict_features=True,
-                require_fresh_quotes=False,
+                # Drop bars without a fresh decision quote so the delivered
+                # dataset has zero stale bars/ticks (edge-of-history gaps from
+                # the archive are trimmed, never trained on).
+                require_fresh_quotes=True,
             )
             # Ticks are already on disk under their source tree; reference them
             # instead of copying (avoids a multi-GB copy for long lookbacks).
