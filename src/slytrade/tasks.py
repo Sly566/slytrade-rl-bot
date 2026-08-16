@@ -977,7 +977,7 @@ def train(
     total_timesteps: int = 50_000,
     seed: int = 42,
     policy: str = "mlp",
-    reward: str = "trade_pnl",
+    reward: str = "r_multiple",
     artifacts_dir: str | Path = "models/artifacts",
     registry_path: str | Path = "models/registry.jsonl",
 ) -> TaskResult:
@@ -1007,7 +1007,11 @@ def train(
         info(f"dataset: {len(dataset.bars):,} bars × {len(dataset.features.columns)} features "
              f"(ML + ICT + tick microstructure + MTF)")
         scaler_params = dataset.fit_scaler(0, len(dataset.bars))
-        env = dataset.env_factory(0, len(dataset.bars), seed=seed, scaler_params=scaler_params)
+        # Dynamic footprint-driven feature selection (train slice only).
+        selected = list(dataset.select_features_on_fold(0, len(dataset.bars)))
+        info(f"dynamic selection: {len(selected)}/{len(dataset.features.columns)} features "
+             f"(footprint significance, threshold-free)")
+        env = dataset.env_factory(0, len(dataset.bars), seed=seed, scaler_params=scaler_params, feature_columns=selected)
     except ImportError as exc:
         return TaskResult(False, f"RL dependencies not installed: {exc}")
     env.config = _with_reward(env.config, reward)
@@ -1042,7 +1046,7 @@ def train(
         model_id=model_id,
         algorithm=algorithm,
         symbol=resolved,
-        feature_columns=list(dataset.features.columns),
+        feature_columns=selected,
         scaler_params=scaler_params,
         env_config={
             "reward_type": reward,
@@ -1062,7 +1066,7 @@ def train(
     return TaskResult(True, "training complete", {"model_id": record["model_id"], "metrics": {k: float(v) for k, v in results.items() if isinstance(v, (int, float))}})
 
 
-VALID_REWARDS = ("raw", "risk_adjusted", "trade_pnl")
+VALID_REWARDS = ("raw", "risk_adjusted", "trade_pnl", "r_multiple")
 
 
 def _with_reward(config, reward: str):
@@ -1089,7 +1093,7 @@ def walk_forward(
     validation_window: int = 2_000,
     test_window: int = 2_000,
     embargo: int = 100,
-    reward: str = "raw",
+    reward: str = "r_multiple",
     policy: str = "mlp",
 ) -> TaskResult:
     from slytrade.backtest.reporting import infer_symbol
@@ -1225,7 +1229,7 @@ def full_pipeline(
     algorithm: str = "ppo",
     total_timesteps: int = 50_000,
     policy: str = "mlp",
-    reward: str = "risk_adjusted",
+    reward: str = "r_multiple",
     promote_stage: str = "paper",
     clean: bool = False,
 ) -> TaskResult:

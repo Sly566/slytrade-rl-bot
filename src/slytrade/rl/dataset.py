@@ -134,13 +134,24 @@ class RLDataset:
         scaler_params: dict[str, tuple[float, float]],
         config: RLEnvironmentConfig | None = None,
         mode_vector: np.ndarray | None = None,
+        feature_columns: list[str] | None = None,
     ) -> SlyTradeRLEnvironment:
-        """Create an environment over bars[start:end] with the given scaler."""
+        """Create an environment over bars[start:end] with the given scaler.
+
+        ``feature_columns`` restricts the observation to a dynamic selection
+        (fitted on the training slice only); when omitted the full feature set
+        is used.
+        """
         if not 0 <= start < end <= len(self.bars):
             raise ValueError(f"invalid slice [{start}, {end}) for {len(self.bars)} rows")
         cfg = config or RLEnvironmentConfig(point_size=self.point_size, point_value=self.point_value, seed=seed)
         bars_slice = self.bars.iloc[start:end].reset_index(drop=True)
         features_slice = self.features.iloc[start:end].copy()
+        if feature_columns is not None:
+            missing = set(feature_columns).difference(features_slice.columns)
+            if missing:
+                raise ValueError(f"selected features missing: {sorted(missing)}")
+            features_slice = features_slice.loc[:, feature_columns]
         for column, (mean, std) in scaler_params.items():
             if column in features_slice.columns:
                 features_slice[column] = (pd.to_numeric(features_slice[column], errors="coerce").fillna(0.0) - mean) / std
@@ -151,6 +162,38 @@ class RLDataset:
             config=cfg,
             mode_vector=mode_vector,
         )
+
+    def select_features_on_fold(
+        self,
+        train_start: int,
+        train_end: int,
+        *,
+        correlation_threshold: float = 0.92,
+    ) -> tuple[str, ...]:
+        """Dynamically select features on the training slice only.
+
+        The objectives are the market-footprint outcomes (structure R-multiple
+        and sweep reversal) from :mod:`slytrade.ml.footprint`. The count emerges
+        from significance vs. shuffled shadows — no admin-set number.
+        """
+        from slytrade.ml.feature_selection import select_features_dynamic
+        from slytrade.ml.footprint import structure_r_objective, sweep_reversal_objective
+
+        if not 0 <= train_start < train_end <= len(self.bars):
+            raise ValueError(f"invalid train slice [{train_start}, {train_end}) for {len(self.bars)} rows")
+        bars_slice = self.bars.iloc[train_start:train_end]
+        objectives = {
+            "structure_r": structure_r_objective(bars_slice),
+            "sweep_reversal": sweep_reversal_objective(bars_slice),
+        }
+        selection = select_features_dynamic(
+            self.features,
+            objectives,
+            train_start=train_start,
+            train_end=train_end,
+            correlation_threshold=correlation_threshold,
+        )
+        return selection.selected
 
 
 def build_rl_dataset(bars: pd.DataFrame, personality: TraderPersonality | None = None) -> RLDataset:

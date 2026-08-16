@@ -407,13 +407,15 @@ def walk_forward_validation(
     policy_type: str = "mlp",
     progress: bool = False,
     progress_bar: bool = False,
+    dynamic_features: bool = True,
+    correlation_threshold: float = 0.92,
 ) -> pd.DataFrame:
     """Train PPO on each fold's training window, evaluate on its test window.
 
-    The scaler is re-fitted on each fold's train slice (no leakage). The
-    ``reward_type`` is applied to BOTH the training and the test environments so
-    the out-of-sample metric measures the same objective the policy optimised.
-    Returns a DataFrame with one row per fold plus an AGGREGATE summary row.
+    The scaler AND the feature selection are fitted on each fold's train slice
+    only (no leakage). With ``dynamic_features`` the observation is restricted
+    to the footprint-significant columns for that fold; the count emerges from
+    the data (threshold-free shadow significance), never from a hardcoded size.
     """
     from slytrade.rl.environment import RLEnvironmentConfig
 
@@ -427,12 +429,20 @@ def walk_forward_validation(
             _progress(index + 1, len(folds), f"fold {fold.index}: train [{fold.train_start}, {fold.train_end}) → test [{fold.test_start}, {fold.test_end})")
         # Fit the scaler on this fold's train window ONLY.
         scaler_params = dataset.fit_scaler(fold.train_start, fold.train_end)
+        selected: list[str] | None = None
+        if dynamic_features:
+            selected = list(dataset.select_features_on_fold(fold.train_start, fold.train_end, correlation_threshold=correlation_threshold))
+            if progress:
+                from slytrade.progress import info as _info
+
+                _info(f"  selected {len(selected)}/{len(dataset.features.columns)} features (footprint significance)")
         train_env = dataset.env_factory(
             fold.train_start,
             fold.train_end,
             seed=seed + fold.index,
             scaler_params=scaler_params,
             config=env_config,
+            feature_columns=selected,
         )
         model = train_ppo(train_env, total_timesteps=total_timesteps, seed=seed + fold.index, policy_type=policy_type, progress_bar=progress_bar)
 
@@ -442,6 +452,7 @@ def walk_forward_validation(
             seed=seed + fold.index,
             scaler_params=scaler_params,
             config=env_config,
+            feature_columns=selected,
         )
         results = evaluate_ppo(model, test_env, episodes=3, seed=seed + fold.index)
 

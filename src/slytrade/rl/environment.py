@@ -106,6 +106,12 @@ class RLEnvironmentConfig:
     stop_loss_atr: float = 1.0
     take_profit_atr: float = 2.0
     trailing_stop_atr: float | None = None
+    # Production reward (reward_type="r_multiple") — the unit is R, the risk
+    # at entry. Entry/regret shaping is driven by the ICT footprint score.
+    setup_score_threshold: int = 4
+    entry_quality_bonus: float = 0.05
+    low_quality_entry_penalty: float = 0.05
+    missed_setup_regret: float = 0.05
 
 
 if gym is not None:
@@ -143,10 +149,13 @@ if gym is not None:
             self._equity = self.config.initial_balance
             self._peak_equity = self.config.initial_balance
             self._entry_price = 0.0
+            self._entry_stop_distance = 0.0
             self._stop_loss = 0.0
             self._take_profit = 0.0
             self._episode_step = 0
             self._last_exit_price = 0.0
+            self._closed_r: list[float] = []
+            self._regret_charged = False
 
         def reset(self, *, seed: int | None = None, options: dict | None = None):
             super().reset(seed=seed)
@@ -155,10 +164,13 @@ if gym is not None:
             self._equity = self.config.initial_balance
             self._peak_equity = self.config.initial_balance
             self._entry_price = 0.0
+            self._entry_stop_distance = 0.0
             self._stop_loss = 0.0
             self._take_profit = 0.0
             self._episode_step = 0
             self._last_exit_price = 0.0
+            self._closed_r = []
+            self._regret_charged = False
             self.ledger.records.clear()
             return self._observation(), {}
 
@@ -171,6 +183,7 @@ if gym is not None:
             decision_bar = self.bars.iloc[self.current_step]
             previous = float(decision_bar["close"])
             old_position = self._position
+            self._closed_r = []  # reset per-step closure ledger
             target = self._position
             if action == 1:
                 target = 1
@@ -259,6 +272,8 @@ if gym is not None:
                 )
             elif self.config.reward_type == "trade_pnl":
                 reward = realized_frac - (turnover + extra_closes) * cost_fraction
+            elif self.config.reward_type == "r_multiple":
+                reward = self._r_multiple_reward(decision_bar, opened=target != 0 and (old_position == 0 or target != old_position))
             else:
                 reward = equity_change / max(previous_equity, 1e-12)
 
@@ -279,6 +294,7 @@ if gym is not None:
                 atr = max(high - low, price * 0.0005)
             stop_dist = max(atr * self.config.stop_loss_atr, price * 0.0002)
             target_dist = atr * self.config.take_profit_atr
+            self._entry_stop_distance = stop_dist
             if direction > 0:
                 self._stop_loss = price - stop_dist
                 self._take_profit = price + target_dist
@@ -287,14 +303,100 @@ if gym is not None:
                 self._take_profit = price - target_dist
 
         def _realize_return(self, direction: int, exit_price: float) -> float:
+            from slytrade.rl.rewards import r_from_fraction
+
             if self._entry_price > 0:
                 realized = direction * (exit_price - self._entry_price) / self._entry_price
             else:
                 realized = 0.0
+            # Record the R-multiple of this closure (used by the production
+            # reward) before the entry state is cleared.
+            self._closed_r.append(r_from_fraction(realized, self._entry_price, self._entry_stop_distance))
             self._entry_price = 0.0
+            self._entry_stop_distance = 0.0
             self._stop_loss = 0.0
             self._take_profit = 0.0
             return realized
+
+        def _r_multiple_reward(self, decision_bar: pd.Series, *, opened: bool) -> float:
+            """Production reward: realised R + ICT-footprint shaping.
+
+            * realised R on every closure (sparse, risk-normalised),
+            * entry-quality shaping: +bonus for high-confluence entries,
+              −penalty for low-confluence entries,
+            * missed-setup regret: a small −R when a high-confluence setup
+              prints and the agent stays flat (kills the "never trade" trap).
+            """
+            from slytrade.rl.rewards import opening_cost_r
+
+            reward = float(sum(self._closed_r))
+
+            if opened:
+                score = self._setup_score(decision_bar)
+                if score >= self.config.setup_score_threshold:
+                    reward += self.config.entry_quality_bonus
+                else:
+                    reward -= self.config.low_quality_entry_penalty
+                reward -= opening_cost_r(
+                    self.config.transaction_cost,
+                    self._entry_price if self._entry_price > 0 else float(decision_bar["close"]),
+                    self._entry_stop_distance if self._entry_stop_distance > 0 else float(decision_bar["close"]) * 0.0002,
+                )
+                self._regret_charged = True  # entered: don't charge regret this bar
+                return reward
+
+            # Flat: opportunity-cost regret for ignoring a high-confluence setup.
+            if self._position == 0:
+                score = self._setup_score(decision_bar)
+                if score >= self.config.setup_score_threshold:
+                    if not self._regret_charged:
+                        reward -= self.config.missed_setup_regret
+                        self._regret_charged = True
+                else:
+                    self._regret_charged = False
+            return reward
+
+        def _setup_score(self, bar: pd.Series) -> int:
+            """ICT confluence score (mirrors the persona strategy's scorer).
+
+            The footprint a professional trader waits for: market-structure
+            breaks (BOS/CHOCH), liquidity sweeps, FVGs, order blocks, and
+            premium/discount location. Returns the max of the long/short score.
+            """
+            long_score = 0
+            short_score = 0
+            premium_discount = float(bar.get("premium_discount", 0.0))
+            trend = float(bar.get("trend_strength", 0.0))
+
+            if float(bar.get("bos_dir", 0.0)) > 0:
+                long_score += 2
+            if float(bar.get("bos_dir", 0.0)) < 0:
+                short_score += 2
+            if float(bar.get("choch_dir", 0.0)) > 0:
+                long_score += 1
+            if float(bar.get("choch_dir", 0.0)) < 0:
+                short_score += 1
+            if float(bar.get("liquidity_sweep", 0.0)) < 0:
+                long_score += 1
+            if float(bar.get("liquidity_sweep", 0.0)) > 0:
+                short_score += 1
+            if float(bar.get("fvg_bullish", 0.0)) > 0:
+                long_score += 1
+            if float(bar.get("fvg_bearish", 0.0)) > 0:
+                short_score += 1
+            if float(bar.get("order_block_bullish", 0.0)) > 0:
+                long_score += 1
+            if float(bar.get("order_block_bearish", 0.0)) > 0:
+                short_score += 1
+            if premium_discount <= -0.15:
+                long_score += 1
+            if premium_discount >= 0.15:
+                short_score += 1
+            if trend > 0:
+                long_score += 1
+            if trend < 0:
+                short_score += 1
+            return max(long_score, short_score)
 
         def _check_managed_exit(self, bar: pd.Series) -> tuple[float, float | None]:
             """Return (realized_return, exit_price) if SL/TP was hit this bar."""

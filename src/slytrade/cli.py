@@ -533,7 +533,7 @@ def train_rl(
     bars_file: str = typer.Option(..., help="Aligned bars file with decision quote / ICT columns (.csv or .parquet)"),
     algorithm: str = typer.Option("ppo", help="RL algorithm: ppo, sac, or td3"),
     policy: str = typer.Option("mlp", help="Policy network: mlp or lstm (recurrent)"),
-    reward: str = typer.Option("trade_pnl", help="Reward type: trade_pnl, risk_adjusted, or raw"),
+    reward: str = typer.Option("r_multiple", help="Reward type: r_multiple, trade_pnl, risk_adjusted, or raw"),
     total_timesteps: int = typer.Option(100_000, help="Number of training steps"),
     seed: int = typer.Option(42, help="Random seed"),
     learning_rate: float = typer.Option(3e-4, help="Learning rate"),
@@ -581,8 +581,9 @@ def walk_forward(
     step: int | None = typer.Option(None, help="Step between folds (defaults to test_window)"),
     total_timesteps: int = typer.Option(20_000, help="PPO steps per fold"),
     seed: int = typer.Option(42, help="Random seed"),
-    reward: str = typer.Option("raw", help="Reward type: raw, risk_adjusted, or trade_pnl"),
+    reward: str = typer.Option("r_multiple", help="Reward type: r_multiple, trade_pnl, risk_adjusted, or raw"),
     policy: str = typer.Option("mlp", help="Policy network: mlp or lstm"),
+    dynamic_features: bool = typer.Option(True, "--dynamic-features/--no-dynamic-features", help="Footprint-driven per-fold feature selection"),
     symbol: str | None = typer.Option(None, help="Symbol override if the file contains multiple symbols"),
     personality_file: str = typer.Option("configs/trader_personality.yaml", help="Trader personality YAML path"),
 ) -> None:
@@ -621,7 +622,10 @@ def walk_forward(
         embargo=windows.embargo,
         step=windows.step,
     )
-    table = walk_forward_validation(dataset, folds, total_timesteps=total_timesteps, seed=seed, reward_type=reward, policy_type=policy)
+    table = walk_forward_validation(
+        dataset, folds, total_timesteps=total_timesteps, seed=seed, reward_type=reward, policy_type=policy,
+        progress=True, progress_bar=True, dynamic_features=dynamic_features,
+    )
     console.print(table.to_string(index=False))
 
 
@@ -1340,7 +1344,7 @@ def full_pipeline(
     algorithm: str = typer.Option("ppo", help="ppo, sac, or td3"),
     total_timesteps: int = typer.Option(50_000, help="Training steps"),
     policy: str = typer.Option("mlp", help="mlp or lstm"),
-    reward: str = typer.Option("trade_pnl", help="trade_pnl, risk_adjusted, or raw"),
+    reward: str = typer.Option("r_multiple", help="r_multiple, trade_pnl, risk_adjusted, or raw"),
     promote_stage: str = typer.Option("paper", help="Stage to promote the model to"),
     clean: bool = typer.Option(False, "--clean", help="Wipe previous derived data before the run"),
 ) -> None:

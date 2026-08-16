@@ -91,3 +91,51 @@ def sharpe_of_returns(returns: list[float], *, floor: float = 1e-12) -> float:
     if std <= floor:
         return 0.0
     return mean / std
+
+
+# ---------------------------------------------------------------------------
+# Production reward: R-multiple with ICT-footprint shaping
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ProductionRewardConfig:
+    """R-multiple reward with footprint shaping.
+
+    The unit of reward is **R** (one unit of risk = the stop distance at
+    entry). This normalises across volatility (gold's ATR swings enormously) and
+    matches how a professional trader judges a trade: "did I make 2R on that?"
+
+    * ``entry_quality_bonus`` — R added for entering on a high-confluence ICT
+      setup (structure + sweep + FVG/OB), so the agent is *attracted* to the
+      setups a professional trader takes.
+    * ``low_quality_entry_penalty`` — R subtracted for entering without
+      confluence, so the agent is *repelled* from random entries.
+    * ``missed_setup_regret`` — R subtracted when a high-confluence setup
+      prints and the agent stays flat (opportunity cost). This is what stops
+      the "never trade is optimal" attractor of the pure sparse reward.
+    """
+
+    setup_score_threshold: int = 4
+    entry_quality_bonus: float = 0.05
+    low_quality_entry_penalty: float = 0.05
+    missed_setup_regret: float = 0.05
+    transaction_cost: float = 0.0002
+
+
+def r_from_fraction(fraction: float, entry_price: float, stop_distance: float) -> float:
+    """Convert a realised return fraction into R-multiples.
+
+    ``fraction`` = direction × (exit − entry) / entry; stop_distance is the
+    entry risk in price units. R = direction × (exit − entry) / stop_distance.
+    """
+    if entry_price <= 0 or stop_distance <= 0:
+        return 0.0
+    return float(fraction) * entry_price / stop_distance
+
+
+def opening_cost_r(transaction_cost: float, entry_price: float, stop_distance: float) -> float:
+    """One-side transaction cost expressed in R."""
+    if entry_price <= 0 or stop_distance <= 0:
+        return 0.0
+    return float(transaction_cost) * entry_price / stop_distance
