@@ -140,6 +140,13 @@ if gym is not None:
             self.bars = bars.reset_index(drop=True)
             self.config = config or RLEnvironmentConfig()
             self.mode_vector = mode_vector
+            # Precompute the full observation matrix once (float32) so each
+            # step's observation is a single numpy row slice instead of a
+            # pandas Series -> numpy conversion. SB3 calls this millions of
+            # times during training; the conversion was the dominant per-step
+            # cost at ~46 it/s.
+            self._feature_matrix = self.features.to_numpy(dtype=np.float32, copy=True)
+            self._mode_vector32 = np.asarray(mode_vector, dtype=np.float32) if mode_vector is not None else None
             shape = len(self.features.columns) + (len(mode_vector) if mode_vector is not None else 0)
             self.observation_space = spaces.Box(-np.inf, np.inf, shape=(shape,), dtype=np.float32)
             self.action_space = spaces.Discrete(4)
@@ -443,11 +450,11 @@ if gym is not None:
             )
 
         def _observation(self) -> np.ndarray:
-            index = min(self.current_step, len(self.features) - 1)
-            row = self.features.iloc[index].to_numpy(dtype=np.float32)
-            if self.mode_vector is not None:
-                row = np.concatenate((row, np.asarray(self.mode_vector, dtype=np.float32)))
-            return np.asarray(row, dtype=np.float32)
+            index = min(self.current_step, self._feature_matrix.shape[0] - 1)
+            row = self._feature_matrix[index]
+            if self._mode_vector32 is not None:
+                return np.concatenate((row, self._mode_vector32))
+            return row
 
 else:
 

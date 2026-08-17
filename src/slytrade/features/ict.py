@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
 import pandas as pd
 
-from slytrade.features.sessions import SESSION_COLUMNS, session_one_hot
+from slytrade.features.sessions import SESSION_COLUMNS, session_hour_labels
 
 PivotType = Literal["high", "low"]
 Direction = Literal["bullish", "bearish"]
@@ -218,6 +219,11 @@ def compute_ict_features(bars: pd.DataFrame, config: ICTFeatureConfig | None = N
 
     No row uses data from after that row. Confirmed pivots are delayed by
     `pivot_lookback` bars, which prevents lookahead leakage.
+
+    The per-bar state is kept in bounded deques instead of rescanning the whole
+    pivot/FVG/order-block history, so the whole pass is O(n) in the bar count
+    (the old implementation rescanned every past pivot per bar — O(n^2) —
+    which made multi-year alignment take hours).
     """
     cfg = config or ICTFeatureConfig()
     _require_columns(bars, ["time", "symbol", "timeframe", "open", "high", "low", "close"])
@@ -236,44 +242,89 @@ def compute_ict_features(bars: pd.DataFrame, config: ICTFeatureConfig | None = N
     ema_fast = _ema(close, cfg.ema_fast_period)
     ema_slow = _ema(close, cfg.ema_slow_period)
 
-    pivots: list[ConfirmedPivot] = []
-    active_fvgs: list[FairValueGap] = []
-    active_obs: list[OrderBlock] = []
-    equal_levels: list[EqualLevel] = []
+    # Vectorized context-window extrema (same [i-context_window+1, i] window).
+    context_high = pd.Series(high).rolling(cfg.context_window, min_periods=1).max().to_numpy(dtype=float)
+    context_low = pd.Series(low).rolling(cfg.context_window, min_periods=1).min().to_numpy(dtype=float)
+
+    # Vectorized session one-hots (UTC hour-of-day, same ranges as session_label).
+    session_cols = session_hour_labels(pd.to_datetime(data["time"], utc=True).dt.hour.to_numpy())
+
+    # Bounded state. maxlen=10 mirrors the old "last 10 pivots of each type"
+    # equal-level scan exactly; the window deques mirror the old per-bar
+    # filtering of the unbounded pivot/FVG/OB/equal-level lists.
+    high_pivots: deque[tuple[int, float]] = deque(maxlen=10)  # (pivot_index, price)
+    low_pivots: deque[tuple[int, float]] = deque(maxlen=10)
+    win_highs: deque[tuple[int, float]] = deque()  # (confirmation_index, price)
+    win_lows: deque[tuple[int, float]] = deque()
+    active_fvgs: deque[FairValueGap] = deque()
+    active_obs: deque[OrderBlock] = deque()
+    equal_levels: deque[EqualLevel] = deque()
     last_high: ConfirmedPivot | None = None
     last_low: ConfirmedPivot | None = None
     trend = 0
 
-    feature_rows: list[dict[str, float | str | pd.Timestamp]] = []
+    out = {column: np.zeros(n, dtype=float) for column in FEATURE_COLUMNS}
 
     for i in range(n):
         atr_i = max(float(atr[i]), 1e-12)
         close_i = max(float(close[i]), 1e-12)
         start = max(0, i - cfg.context_window + 1)
 
+        # --- Confirmed pivots + equal-level detection (bounded) ------------
         pivot_high_confirmed = 0.0
         pivot_low_confirmed = 0.0
         for pivot in _confirmed_pivot_at(high, low, i, cfg.pivot_lookback):
-            pivots.append(pivot)
             if pivot.pivot_type == "high":
                 pivot_high_confirmed = 1.0
-                prior = [p for p in pivots[:-1] if p.pivot_type == "high"]
-                for prev in reversed(prior[-10:]):
-                    if pivot.pivot_index - prev.pivot_index <= cfg.equal_level_max_bars:
-                        if abs(pivot.price - prev.price) <= cfg.equal_level_tolerance_atr * atr_i:
-                            equal_levels.append(EqualLevel(i, "equal_high", (pivot.price + prev.price) / 2.0, prev.pivot_index, pivot.pivot_index))
+                for prev_index, prev_price in reversed(tuple(high_pivots)):
+                    if pivot.pivot_index - prev_index <= cfg.equal_level_max_bars:
+                        if abs(pivot.price - prev_price) <= cfg.equal_level_tolerance_atr * atr_i:
+                            equal_levels.append(
+                                EqualLevel(
+                                    i,
+                                    "equal_high",
+                                    (pivot.price + prev_price) / 2.0,
+                                    prev_index,
+                                    pivot.pivot_index,
+                                )
+                            )
                             break
                 last_high = pivot
+                high_pivots.append((pivot.pivot_index, pivot.price))
+                win_highs.append((i, pivot.price))
             else:
                 pivot_low_confirmed = 1.0
-                prior = [p for p in pivots[:-1] if p.pivot_type == "low"]
-                for prev in reversed(prior[-10:]):
-                    if pivot.pivot_index - prev.pivot_index <= cfg.equal_level_max_bars:
-                        if abs(pivot.price - prev.price) <= cfg.equal_level_tolerance_atr * atr_i:
-                            equal_levels.append(EqualLevel(i, "equal_low", (pivot.price + prev.price) / 2.0, prev.pivot_index, pivot.pivot_index))
+                for prev_index, prev_price in reversed(tuple(low_pivots)):
+                    if pivot.pivot_index - prev_index <= cfg.equal_level_max_bars:
+                        if abs(pivot.price - prev_price) <= cfg.equal_level_tolerance_atr * atr_i:
+                            equal_levels.append(
+                                EqualLevel(
+                                    i,
+                                    "equal_low",
+                                    (pivot.price + prev_price) / 2.0,
+                                    prev_index,
+                                    pivot.pivot_index,
+                                )
+                            )
                             break
                 last_low = pivot
+                low_pivots.append((pivot.pivot_index, pivot.price))
+                win_lows.append((i, pivot.price))
 
+        # Prune the windowed state to the causal context window (nothing added
+        # this bar can be pruned: its index/confirmation_index == i >= start).
+        while win_highs and win_highs[0][0] < start:
+            win_highs.popleft()
+        while win_lows and win_lows[0][0] < start:
+            win_lows.popleft()
+        while active_fvgs and active_fvgs[0].index < start:
+            active_fvgs.popleft()
+        while active_obs and active_obs[0].index < start:
+            active_obs.popleft()
+        while equal_levels and equal_levels[0].index < start:
+            equal_levels.popleft()
+
+        # --- Fair value gaps -------------------------------------------------
         fvg_bullish = 0.0
         fvg_bearish = 0.0
         fvg_size_atr = 0.0
@@ -291,9 +342,7 @@ def compute_ict_features(bars: pd.DataFrame, config: ICTFeatureConfig | None = N
                     fvg_size_atr = size / atr_i
                     active_fvgs.append(FairValueGap(i, "bearish", float(low[i - 2]), float(high[i]), size))
 
-        active_fvgs = [gap for gap in active_fvgs if gap.index >= start]
-        active_obs = [block for block in active_obs if block.index >= start]
-
+        # --- Structure breaks / trend / order blocks ------------------------
         bos_dir = 0.0
         choch_dir = 0.0
         order_block_bullish = 0.0
@@ -321,6 +370,7 @@ def compute_ict_features(bars: pd.DataFrame, config: ICTFeatureConfig | None = N
                 order_block_bearish = 1.0
                 order_block_strength = block.strength / 100.0
 
+        # --- Nearest active FVG distances ------------------------------------
         nearest_bull_fvg_dist = 0.0
         nearest_bear_fvg_dist = 0.0
         for gap in active_fvgs:
@@ -335,6 +385,7 @@ def compute_ict_features(bars: pd.DataFrame, config: ICTFeatureConfig | None = N
                     normalized = distance / atr_i
                     nearest_bear_fvg_dist = normalized if nearest_bear_fvg_dist == 0.0 else min(nearest_bear_fvg_dist, normalized)
 
+        # --- Nearest active order-block distances ---------------------------
         nearest_bull_ob_dist = 0.0
         nearest_bear_ob_dist = 0.0
         max_active_ob_strength = order_block_strength
@@ -351,11 +402,12 @@ def compute_ict_features(bars: pd.DataFrame, config: ICTFeatureConfig | None = N
                     normalized = distance / atr_i
                     nearest_bear_ob_dist = normalized if nearest_bear_ob_dist == 0.0 else min(nearest_bear_ob_dist, normalized)
 
-        recent_equal = [level for level in equal_levels if level.index >= start]
-        equal_high = 1.0 if recent_equal and recent_equal[-1].level_type == "equal_high" and recent_equal[-1].index == i else 0.0
-        equal_low = 1.0 if recent_equal and recent_equal[-1].level_type == "equal_low" and recent_equal[-1].index == i else 0.0
+        # --- Equal levels + liquidity sweep ----------------------------------
+        equal_high = 1.0 if equal_levels and equal_levels[-1].level_type == "equal_high" and equal_levels[-1].index == i else 0.0
+        equal_low = 1.0 if equal_levels and equal_levels[-1].level_type == "equal_low" and equal_levels[-1].index == i else 0.0
         liquidity_sweep = 0.0
-        for level in reversed(recent_equal[-20:]):
+        recent = tuple(reversed(tuple(equal_levels)[-20:]))
+        for level in recent:
             if level.level_type == "equal_high" and high[i] > level.price and close[i] < level.price:
                 liquidity_sweep = 1.0
                 break
@@ -363,50 +415,53 @@ def compute_ict_features(bars: pd.DataFrame, config: ICTFeatureConfig | None = N
                 liquidity_sweep = -1.0
                 break
 
-        confirmed_pivots = [pivot for pivot in pivots if start <= pivot.confirmation_index <= i]
-        pivot_highs = [pivot.price for pivot in confirmed_pivots if pivot.pivot_type == "high"]
-        pivot_lows = [pivot.price for pivot in confirmed_pivots if pivot.pivot_type == "low"]
+        # --- Premium / discount from confirmed pivots in the window ----------
         premium_discount = 0.0
-        if pivot_highs and pivot_lows and max(pivot_highs) > min(pivot_lows):
-            premium_discount = ((close_i - min(pivot_lows)) / (max(pivot_highs) - min(pivot_lows)) - 0.5) * 2.0
+        if win_highs and win_lows:
+            max_high = max(price for _, price in win_highs)
+            min_low = min(price for _, price in win_lows)
+            if max_high > min_low:
+                premium_discount = ((close_i - min_low) / (max_high - min_low) - 0.5) * 2.0
 
-        context_high = float(np.max(high[start : i + 1]))
-        context_low = float(np.min(low[start : i + 1]))
-        price_percentile = (close_i - context_low) / max(context_high - context_low, 1e-12)
+        price_percentile = (close_i - context_low[i]) / max(context_high[i] - context_low[i], 1e-12)
         trend_strength = (float(ema_fast[i]) - float(ema_slow[i])) / atr_i
         distance_from_ema50 = (close_i - float(ema_slow[i])) / atr_i
         volume_ratio = float(volume[i]) / max(float(volume_sma[i]), 1e-9)
 
-        row: dict[str, float | str | pd.Timestamp] = {
-            "time": data.loc[i, "time"],
-            "symbol": str(data.loc[i, "symbol"]),
-            "timeframe": str(data.loc[i, "timeframe"]),
-            "atr": atr_i,
-            "atr_norm": atr_i / close_i,
-            "volume_ratio": volume_ratio,
-            "pivot_high_confirmed": pivot_high_confirmed,
-            "pivot_low_confirmed": pivot_low_confirmed,
-            "bos_dir": bos_dir,
-            "choch_dir": choch_dir,
-            "fvg_bullish": fvg_bullish,
-            "fvg_bearish": fvg_bearish,
-            "fvg_size_atr": fvg_size_atr,
-            "nearest_bull_fvg_dist_atr": nearest_bull_fvg_dist,
-            "nearest_bear_fvg_dist_atr": nearest_bear_fvg_dist,
-            "order_block_bullish": order_block_bullish,
-            "order_block_bearish": order_block_bearish,
-            "order_block_strength": max_active_ob_strength,
-            "nearest_bull_ob_dist_atr": nearest_bull_ob_dist,
-            "nearest_bear_ob_dist_atr": nearest_bear_ob_dist,
-            "equal_high": equal_high,
-            "equal_low": equal_low,
-            "liquidity_sweep": liquidity_sweep,
-            "premium_discount": premium_discount,
-            "price_percentile": price_percentile,
-            "trend_strength": trend_strength,
-            "distance_from_ema50_atr": distance_from_ema50,
-        }
-        row.update(session_one_hot(pd.Timestamp(data.loc[i, "time"]).to_pydatetime()))
-        feature_rows.append(row)
+        out["atr"][i] = atr_i
+        out["atr_norm"][i] = atr_i / close_i
+        out["volume_ratio"][i] = volume_ratio
+        out["pivot_high_confirmed"][i] = pivot_high_confirmed
+        out["pivot_low_confirmed"][i] = pivot_low_confirmed
+        out["bos_dir"][i] = bos_dir
+        out["choch_dir"][i] = choch_dir
+        out["fvg_bullish"][i] = fvg_bullish
+        out["fvg_bearish"][i] = fvg_bearish
+        out["fvg_size_atr"][i] = fvg_size_atr
+        out["nearest_bull_fvg_dist_atr"][i] = nearest_bull_fvg_dist
+        out["nearest_bear_fvg_dist_atr"][i] = nearest_bear_fvg_dist
+        out["order_block_bullish"][i] = order_block_bullish
+        out["order_block_bearish"][i] = order_block_bearish
+        out["order_block_strength"][i] = max_active_ob_strength
+        out["nearest_bull_ob_dist_atr"][i] = nearest_bull_ob_dist
+        out["nearest_bear_ob_dist_atr"][i] = nearest_bear_ob_dist
+        out["equal_high"][i] = equal_high
+        out["equal_low"][i] = equal_low
+        out["liquidity_sweep"][i] = liquidity_sweep
+        out["premium_discount"][i] = premium_discount
+        out["price_percentile"][i] = price_percentile
+        out["trend_strength"][i] = trend_strength
+        out["distance_from_ema50_atr"][i] = distance_from_ema50
 
-    return pd.DataFrame(feature_rows, columns=OUTPUT_COLUMNS)
+    for column in SESSION_COLUMNS:
+        out[column] = session_cols[column]
+
+    result = pd.DataFrame(
+        {
+            "time": data["time"].to_numpy(),
+            "symbol": data["symbol"].astype(str).to_numpy(),
+            "timeframe": data["timeframe"].astype(str).to_numpy(),
+            **out,
+        }
+    )
+    return result[OUTPUT_COLUMNS]

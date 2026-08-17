@@ -35,13 +35,28 @@ def compute_volume_profile_features(
         else pd.Series(1.0, index=bars.index)
     )
     typical = (high + low + close) / 3.0
-    rows: list[dict[str, float]] = []
-    for end in range(len(bars)):
+
+    # Pre-extract numpy arrays once (the old per-bar ``Series.iloc[start:end+1]``
+    # re-slicing cost ~112s on a 1y frame). Rolling extrema are vectorized.
+    typical_arr = typical.to_numpy(dtype=float)
+    volume_arr = volume.to_numpy(dtype=float)
+    close_arr = close.to_numpy(dtype=float)
+    roll_lo = low.rolling(window, min_periods=1).min().to_numpy(dtype=float)
+    roll_hi = high.rolling(window, min_periods=1).max().to_numpy(dtype=float)
+
+    n = len(bars)
+    vp_poc = np.empty(n, dtype=float)
+    va_low = np.empty(n, dtype=float)
+    va_high = np.empty(n, dtype=float)
+    vp_position = np.empty(n, dtype=float)
+    vp_concentration = np.empty(n, dtype=float)
+
+    for end in range(n):
         start = max(0, end - window + 1)
-        prices = typical.iloc[start : end + 1].to_numpy(dtype=float)
-        weights = volume.iloc[start : end + 1].to_numpy(dtype=float)
-        lo = float(np.min(low.iloc[start : end + 1]))
-        hi = float(np.max(high.iloc[start : end + 1]))
+        prices = typical_arr[start : end + 1]
+        weights = volume_arr[start : end + 1]
+        lo = float(roll_lo[end])
+        hi = float(roll_hi[end])
         width = max((hi - lo) / bins, 1e-12)
         indices = np.clip(((prices - lo) / width).astype(int), 0, bins - 1)
         histogram = np.bincount(indices, weights=np.maximum(weights, 0.0), minlength=bins)
@@ -67,17 +82,23 @@ def compute_volume_profile_features(
         poc = lo + (poc_bin + 0.5) * width
         value_low = lo + left * width
         value_high = lo + (right + 1) * width
-        rows.append(
-            {
-                "vp_poc": poc,
-                "vp_value_area_low": value_low,
-                "vp_value_area_high": value_high,
-                "vp_position": float((close.iloc[end] - value_low) / max(value_high - value_low, width)),
-                "vp_poc_distance_atr": 0.0,
-                "vp_volume_concentration": float(histogram[poc_bin] / max(total, 1e-12)),
-            }
-        )
-    output = pd.DataFrame(rows, index=bars.index)
+        vp_poc[end] = poc
+        va_low[end] = value_low
+        va_high[end] = value_high
+        vp_position[end] = float((close_arr[end] - value_low) / max(value_high - value_low, width))
+        vp_concentration[end] = float(histogram[poc_bin] / max(total, 1e-12))
+
+    output = pd.DataFrame(
+        {
+            "vp_poc": vp_poc,
+            "vp_value_area_low": va_low,
+            "vp_value_area_high": va_high,
+            "vp_position": vp_position,
+            "vp_poc_distance_atr": 0.0,
+            "vp_volume_concentration": vp_concentration,
+        },
+        index=bars.index,
+    )
     atr_proxy = (high - low).rolling(min(window, 14), min_periods=1).mean().replace(0.0, np.nan)
     output["vp_poc_distance_atr"] = (close - output["vp_poc"]).abs() / atr_proxy
     return output.replace([np.inf, -np.inf], 0.0).fillna(0.0)

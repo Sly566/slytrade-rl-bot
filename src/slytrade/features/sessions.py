@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, time
 
+import numpy as np
+
 SESSION_COLUMNS = [
     "session_asia",
     "session_london",
@@ -41,6 +43,35 @@ def session_label(timestamp: datetime) -> str:
     return "other"
 
 
+def _hour_label(hour: int) -> str:
+    """Session label for a UTC hour-of-day (0..23), matching session_label."""
+    if 0 <= hour < 7:
+        return "asia"
+    if 7 <= hour < 12:
+        return "london"
+    if 12 <= hour < 16:
+        return "ny_am"
+    if 16 <= hour < 21:
+        return "ny_pm"
+    return "other"
+
+
+def session_hour_labels(hours: np.ndarray) -> dict[str, np.ndarray]:
+    """Vectorized session one-hots from UTC hour-of-day values.
+
+    Equivalent to calling ``session_one_hot`` on every row's timestamp, but in
+    a single vectorized pass (used by the ICT feature engine's hot loop).
+    """
+    hours = np.asarray(hours, dtype=int)
+    return {
+        "session_asia": ((hours >= 0) & (hours < 7)).astype(float),
+        "session_london": ((hours >= 7) & (hours < 12)).astype(float),
+        "session_ny_am": ((hours >= 12) & (hours < 16)).astype(float),
+        "session_ny_pm": ((hours >= 16) & (hours < 21)).astype(float),
+        "session_other": ((hours >= 21) | (hours < 0)).astype(float),
+    }
+
+
 def session_one_hot(timestamp: datetime) -> dict[str, float]:
     label = session_label(timestamp)
     return {
@@ -50,3 +81,4 @@ def session_one_hot(timestamp: datetime) -> dict[str, float]:
         "session_ny_pm": 1.0 if label == "ny_pm" else 0.0,
         "session_other": 1.0 if label == "other" else 0.0,
     }
+

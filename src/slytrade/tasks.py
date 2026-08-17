@@ -980,6 +980,7 @@ def train(
     reward: str = "r_multiple",
     artifacts_dir: str | Path = "models/artifacts",
     registry_path: str | Path = "models/registry.jsonl",
+    n_envs: int = 1,
 ) -> TaskResult:
     from slytrade.backtest.reporting import infer_symbol
     from slytrade.progress import info, stage
@@ -1033,7 +1034,14 @@ def train(
     maybe_log_params(run, {"algorithm": algorithm, "symbol": resolved, "seed": seed, "timesteps": total_timesteps, "policy": policy, "reward": reward, "features": len(dataset.features.columns)})
     try:
         if algorithm == "ppo":
-            model = train_ppo(env, total_timesteps=total_timesteps, seed=seed, policy_type=policy, progress_bar=True)
+            model = train_ppo(
+                env,
+                total_timesteps=total_timesteps,
+                seed=seed,
+                policy_type=policy,
+                progress_bar=True,
+                n_envs=n_envs,
+            )
         else:
             model = train_policy(algorithm, env, total_timesteps=total_timesteps, seed=seed, policy_type=policy, progress_bar=True)
         results = evaluate_policy(model, env, episodes=3, seed=seed)
@@ -1095,6 +1103,7 @@ def walk_forward(
     embargo: int = 100,
     reward: str = "r_multiple",
     policy: str = "mlp",
+    n_envs: int = 1,
 ) -> TaskResult:
     from slytrade.backtest.reporting import infer_symbol
     from slytrade.progress import info, stage
@@ -1133,7 +1142,7 @@ def walk_forward(
         info(f"{len(folds)} folds · reward={reward} · policy={policy} · {total_timesteps} steps/fold")
         table = walk_forward_validation(
             dataset, folds, total_timesteps=total_timesteps, seed=seed, reward_type=reward, policy_type=policy,
-            progress=True, progress_bar=True,
+            progress=True, progress_bar=True, n_envs=n_envs,
         )
         if len(folds) < 2:
             console.print(
@@ -1232,6 +1241,7 @@ def full_pipeline(
     reward: str = "r_multiple",
     promote_stage: str = "paper",
     clean: bool = False,
+    n_envs: int = 1,
 ) -> TaskResult:
     """Run collection → alignment → backtest → train → walk-forward → promote.
 
@@ -1263,12 +1273,12 @@ def full_pipeline(
     backtest(bars_file, strategy="persona-adaptive", symbol=symbol)
     steps.append("backtest")
 
-    trained = train(bars_file, symbol=symbol, algorithm=algorithm, total_timesteps=total_timesteps, policy=policy, reward=reward)
+    trained = train(bars_file, symbol=symbol, algorithm=algorithm, total_timesteps=total_timesteps, policy=policy, reward=reward, n_envs=n_envs)
     if not trained.ok:
         return trained
     steps.append("train")
 
-    walk_forward(bars_file, symbol=symbol, reward=reward, policy=policy)
+    walk_forward(bars_file, symbol=symbol, reward=reward, policy=policy, n_envs=n_envs)
     steps.append("walk_forward")
 
     model_id = trained.data["model_id"] if trained.data else None

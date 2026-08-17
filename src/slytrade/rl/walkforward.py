@@ -148,6 +148,31 @@ def resolve_fold_windows(
 # Training (stable-baselines3, lazy import)
 # ---------------------------------------------------------------------------
 
+def _as_vec_env(env: SlyTradeRLEnvironment, n_envs: int):
+    """Wrap an environment in parallel subprocess vector envs.
+
+    Each worker gets its own copy of the environment (rollout diversity), and
+    SB3 steps them in parallel so PPO's data collection is n_envs times faster.
+    ``env`` itself is left untouched (the single-env evaluation paths use it).
+
+    ``fork`` is requested explicitly (the SB3 default ``forkserver`` is
+    fragile in some environments); if spawning workers fails for any reason,
+    training degrades gracefully to single-process rollouts instead of
+    crashing a long run.
+    """
+    import copy
+    import logging
+
+    from stable_baselines3.common.vec_env import SubprocVecEnv
+
+    logger = logging.getLogger("slytrade.rl")
+    try:
+        return SubprocVecEnv([lambda: copy.deepcopy(env) for _ in range(n_envs)], start_method="fork")
+    except Exception as exc:  # pragma: no cover - environment dependent
+        logger.warning("parallel rollouts unavailable (%s); falling back to single-process", exc)
+        return env
+
+
 def train_ppo(
     env: SlyTradeRLEnvironment,
     *,
@@ -164,6 +189,7 @@ def train_ppo(
     model_dir: str | None = None,
     verbose: int = 0,
     progress_bar: bool = False,
+    n_envs: int = 1,
 ):
     """Train a PPO policy on the environment. Returns the trained model.
 
@@ -171,8 +197,13 @@ def train_ppo(
     (recurrent, regime memory). LSTM policies are NOT part of core
     stable-baselines3 — they live in ``sb3-contrib`` (RecurrentPPO), so the
     ``rl`` extra must include ``sb3-contrib``.
+
+    ``n_envs > 1`` collects rollouts from parallel subprocess copies of the
+    environment, which speeds up PPO data collection several-fold on
+    multi-core machines (total_timesteps are spread across the workers).
     """
     normalized = policy_type.strip().lower()
+    training_env = _as_vec_env(env, n_envs) if n_envs > 1 else env
     model: Any
     if normalized in ("lstm", "recurrent", "mlplstm"):
         try:
@@ -183,7 +214,7 @@ def train_ppo(
             ) from exc
         model = RecurrentPPO(
             "MlpLstmPolicy",
-            env,
+            training_env,
             learning_rate=learning_rate,
             n_steps=n_steps,
             batch_size=batch_size,
@@ -199,7 +230,7 @@ def train_ppo(
 
         model = PPO(
             "MlpPolicy",
-            env,
+            training_env,
             learning_rate=learning_rate,
             n_steps=n_steps,
             batch_size=batch_size,
@@ -409,6 +440,7 @@ def walk_forward_validation(
     progress_bar: bool = False,
     dynamic_features: bool = True,
     correlation_threshold: float = 0.92,
+    n_envs: int = 1,
 ) -> pd.DataFrame:
     """Train PPO on each fold's training window, evaluate on its test window.
 
@@ -444,7 +476,14 @@ def walk_forward_validation(
             config=env_config,
             feature_columns=selected,
         )
-        model = train_ppo(train_env, total_timesteps=total_timesteps, seed=seed + fold.index, policy_type=policy_type, progress_bar=progress_bar)
+        model = train_ppo(
+            train_env,
+            total_timesteps=total_timesteps,
+            seed=seed + fold.index,
+            policy_type=policy_type,
+            progress_bar=progress_bar,
+            n_envs=n_envs,
+        )
 
         test_env = dataset.env_factory(
             fold.test_start,

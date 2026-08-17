@@ -543,6 +543,7 @@ def train_rl(
     gamma: float = typer.Option(0.99, help="Discount factor"),
     gae_lambda: float = typer.Option(0.95, help="PPO GAE lambda"),
     model_dir: str = typer.Option("models/rl", help="Directory to save the trained policy"),
+    n_envs: int = typer.Option(1, help="Parallel rollout envs (1 = single process; >1 speeds up PPO data collection)"),
     symbol: str | None = typer.Option(None, help="Symbol override if the file contains multiple symbols"),
     personality_file: str = typer.Option("configs/trader_personality.yaml", help="Trader personality YAML path"),
 ) -> None:
@@ -564,6 +565,7 @@ def train_rl(
         policy=policy,
         reward=reward,
         artifacts_dir=model_dir,
+        n_envs=n_envs,
     )
     if not result.ok:
         console.print(f"[red]{result.message}[/red]")
@@ -584,6 +586,7 @@ def walk_forward(
     reward: str = typer.Option("r_multiple", help="Reward type: r_multiple, trade_pnl, risk_adjusted, or raw"),
     policy: str = typer.Option("mlp", help="Policy network: mlp or lstm"),
     dynamic_features: bool = typer.Option(True, "--dynamic-features/--no-dynamic-features", help="Footprint-driven per-fold feature selection"),
+    n_envs: int = typer.Option(1, help="Parallel rollout envs (1 = single process; >1 speeds up PPO data collection)"),
     symbol: str | None = typer.Option(None, help="Symbol override if the file contains multiple symbols"),
     personality_file: str = typer.Option("configs/trader_personality.yaml", help="Trader personality YAML path"),
 ) -> None:
@@ -624,7 +627,7 @@ def walk_forward(
     )
     table = walk_forward_validation(
         dataset, folds, total_timesteps=total_timesteps, seed=seed, reward_type=reward, policy_type=policy,
-        progress=True, progress_bar=True, dynamic_features=dynamic_features,
+        progress=True, progress_bar=True, dynamic_features=dynamic_features, n_envs=n_envs,
     )
     console.print(table.to_string(index=False))
 
@@ -1347,6 +1350,7 @@ def full_pipeline(
     reward: str = typer.Option("r_multiple", help="r_multiple, trade_pnl, risk_adjusted, or raw"),
     promote_stage: str = typer.Option("paper", help="Stage to promote the model to"),
     clean: bool = typer.Option(False, "--clean", help="Wipe previous derived data before the run"),
+    n_envs: int = typer.Option(1, help="Parallel rollout envs (1 = single process; >1 speeds up PPO data collection)"),
 ) -> None:
     """Run the entire pipeline from scratch: collect → align → backtest → train
     → walk-forward → promote."""
@@ -1362,6 +1366,7 @@ def full_pipeline(
         reward=reward,
         promote_stage=promote_stage,
         clean=clean,
+        n_envs=n_envs,
     )
     if not result.ok:
         console.print(f"[red]{result.message}[/red]")

@@ -10,6 +10,7 @@ from pathlib import Path
 from urllib.request import urlopen
 from zipfile import ZipFile
 
+import numpy as np
 import pandas as pd
 
 from slytrade.data.schemas import TICK_COLUMNS
@@ -44,6 +45,38 @@ class ExnessArchiveResult:
     @property
     def file_count(self) -> int:
         return len(self.files)
+
+
+_EXNESS_TIME_FORMATS = (
+    "%Y.%m.%d %H:%M:%S.%f",
+    "%Y.%m.%d %H:%M:%S",
+    "%Y-%m-%d %H:%M:%S.%f",
+    "%Y-%m-%d %H:%M:%S",
+)
+
+
+def parse_exness_timestamps(values: pd.Series) -> pd.Series:
+    """Parse Exness CSV timestamps with a vectorized explicit-format fast path.
+
+    The Exness archive uses a fixed timestamp layout, but pandas' format
+    inference does not recognize it and falls back to parsing every element
+    one-by-one with ``dateutil`` — which takes minutes for a 40M-tick month.
+    Explicit formats parse in bulk. When none of the known layouts match
+    (>= 99.5% coverage), fall back to the original inference so unknown/edge
+    layouts still work.
+    """
+    if values.empty:
+        return pd.to_datetime(values, utc=True, errors="coerce")
+    sample = values.iloc[0]
+    if isinstance(sample, (pd.Timestamp, datetime)) or np.issubdtype(values.dtype, np.datetime64):
+        # Already datetime — nothing to infer.
+        return pd.to_datetime(values, utc=True, errors="coerce")
+    total = len(values)
+    for fmt in _EXNESS_TIME_FORMATS:
+        parsed = pd.to_datetime(values, utc=True, errors="coerce", format=fmt)
+        if float(parsed.notna().sum()) >= total * 0.995:
+            return parsed
+    return pd.to_datetime(values, utc=True, errors="coerce")
 
 
 def normalize_exness_symbol(symbol: str) -> str:
@@ -103,7 +136,7 @@ def _exness_chunk_to_canonical(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
     if timestamp_column is None or bid_column is None or ask_column is None:
         raise ValueError(f"Exness CSV missing timestamp/bid/ask columns. Found: {list(raw.columns)}")
 
-    time_msc = pd.to_datetime(raw[timestamp_column], utc=True, errors="coerce")
+    time_msc = parse_exness_timestamps(raw[timestamp_column])
     frame = pd.DataFrame(
         {
             "time": time_msc.dt.floor("s"),
