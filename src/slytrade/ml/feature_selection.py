@@ -123,7 +123,7 @@ def select_features_dynamic(
     if n_shadow < 1 or not 0.0 < shadow_quantile <= 1.0:
         raise ValueError("invalid shadow configuration")
 
-    x = features.iloc[train_start:train_end].reset_index(drop=True)
+    x = features.iloc[train_start:train_end]
     n_rows, n_cols = x.shape
     rng = np.random.default_rng(seed)
 
@@ -139,9 +139,14 @@ def select_features_dynamic(
             )
         return values
 
-    objective_arrays = {name: _aligned_objective(series) for name, series in objectives.items()}
+    objective_arrays = [np.asarray(_aligned_objective(series), dtype=float) for series in objectives.values()]
 
-    # Feature score matrix: [n_cols, n_objectives]
+    # One float32 matrix for the train slice (half the float64 footprint), plus
+    # one reusable shuffled buffer. Scores are reduced in float64 per column so
+    # the ranking matches the old float64 math, but never by materialising a
+    # whole float64 frame (or five shuffled copies of it).
+    X = x.to_numpy(dtype=np.float32)
+
     def _pearson(a: np.ndarray, b: np.ndarray) -> float:
         a = a - a.mean()
         b = b - b.mean()
@@ -150,30 +155,36 @@ def select_features_dynamic(
             return 0.0
         return float((a @ b) / denom)
 
-    def _score(columns: pd.DataFrame) -> np.ndarray:
-        out = np.zeros((columns.shape[1], len(objective_arrays)), dtype=float)
-        for oi, target in enumerate(objective_arrays.values()):
+    def _score_columns(mat: np.ndarray) -> np.ndarray:
+        """Return an [n_cols, n_objectives] matrix of |pearson| scores."""
+        out = np.zeros((mat.shape[1], len(objective_arrays)), dtype=float)
+        for oi, target in enumerate(objective_arrays):
             finite = np.isfinite(target)
             if finite.sum() < 3:
                 continue
-            colvals = columns.to_numpy(dtype=float)
-            for ci in range(columns.shape[1]):
-                valid = finite & np.isfinite(colvals[:, ci])
-                if valid.sum() < 3 or float(colvals[:, ci][valid].var()) <= 1e-12:
+            for ci in range(mat.shape[1]):
+                valid = finite & np.isfinite(mat[:, ci])
+                if valid.sum() < 3:
                     continue
-                correlation = _pearson(colvals[:, ci][valid], target[valid])
+                column = mat[:, ci][valid].astype(np.float64)
+                if float(column.var()) <= 1e-12:
+                    continue
+                correlation = _pearson(column, target[valid])
                 out[ci, oi] = abs(correlation) if np.isfinite(correlation) else 0.0
         return out
 
-    real_scores = _score(x)
+    real_scores = _score_columns(X)
 
     # Shadow scores: for each objective, threshold = quantile over all shadows.
+    # One shuffled buffer is reused across shadows (never 5 simultaneous copies).
     shadow_thresholds = np.zeros(len(objective_arrays), dtype=float)
+    shuffled = np.empty_like(X)
     for oi in range(len(objective_arrays)):
         shadow_scores: list[float] = []
         for _ in range(n_shadow):
-            shuffled = x.apply(lambda column: rng.permutation(column.to_numpy(dtype=float)))
-            shadow_scores.extend(_score(shuffled)[:, oi].tolist())
+            for ci in range(n_cols):
+                shuffled[:, ci] = rng.permutation(X[:, ci])
+            shadow_scores.extend(_score_columns(shuffled)[:, oi].tolist())
         shadow_thresholds[oi] = float(np.quantile(shadow_scores, shadow_quantile))
 
     significant: list[str] = []
@@ -195,7 +206,7 @@ def select_features_dynamic(
         )
 
     ordered = sorted(significant, key=lambda name: (-best_scores[name], name))
-    train_values = x.loc[:, ordered].astype(float)
+    train_values = x.loc[:, ordered]
     chosen: list[str] = []
     for column in ordered:
         if not chosen:

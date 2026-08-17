@@ -110,17 +110,21 @@ class RLDataset:
         *,
         variance_floor: float = 1e-6,
     ) -> dict[str, tuple[float, float]]:
-        """Fit per-column (mean, std) on features[train_start:train_end] only."""
+        """Fit per-column (mean, std) on features[train_start:train_end] only.
+
+        Computed column-by-column on the slice view (never a full-frame copy),
+        so a full-dataset scaler fit stays O(one column) in memory.
+        """
         if not 0 <= train_start < train_end <= len(self.features):
             raise ValueError(f"invalid train slice [{train_start}, {train_end}) for {len(self.features)} rows")
-        train_features = self.features.iloc[train_start:train_end].copy()
         rng = np.random.default_rng(0)
+        n_rows = train_end - train_start
         params: dict[str, tuple[float, float]] = {}
-        for col in train_features.columns:
-            series = pd.to_numeric(train_features[col], errors="coerce").fillna(0.0)
+        for col in self.features.columns:
+            series = pd.to_numeric(self.features[col].iloc[train_start:train_end], errors="coerce").fillna(0.0)
             std = float(series.std())
             if std < variance_floor:
-                series = series + rng.normal(0.0, variance_floor, size=len(series))
+                series = series + rng.normal(0.0, variance_floor, size=n_rows)
                 std = float(series.std())
             params[col] = (float(series.mean()), std if std > 1e-9 else 1.0)
         return params
@@ -145,17 +149,23 @@ class RLDataset:
         if not 0 <= start < end <= len(self.bars):
             raise ValueError(f"invalid slice [{start}, {end}) for {len(self.bars)} rows")
         cfg = config or RLEnvironmentConfig(point_size=self.point_size, point_value=self.point_value, seed=seed)
-        bars_slice = self.bars.iloc[start:end].reset_index(drop=True)
-        features_slice = self.features.iloc[start:end].copy()
+        bars_slice = self.bars.iloc[start:end]
         if feature_columns is not None:
-            missing = set(feature_columns).difference(features_slice.columns)
+            missing = set(feature_columns).difference(self.features.columns)
             if missing:
                 raise ValueError(f"selected features missing: {sorted(missing)}")
-            features_slice = features_slice.loc[:, feature_columns]
-        for column, (mean, std) in scaler_params.items():
-            if column in features_slice.columns:
-                features_slice[column] = (pd.to_numeric(features_slice[column], errors="coerce").fillna(0.0) - mean) / std
-        features_slice = features_slice.reset_index(drop=True)
+            columns = [column for column in self.features.columns if column in feature_columns]
+        else:
+            columns = list(self.features.columns)
+
+        # Scale into a fresh float32 matrix (one allocation, no float64
+        # temporaries, no per-column pandas copies). The env indexes rows
+        # positionally, so no index reset is needed.
+        matrix = self.features.iloc[start:end].loc[:, columns].to_numpy(dtype=np.float32)
+        for column_index, column in enumerate(columns):
+            mean, std = scaler_params[column]
+            matrix[:, column_index] = (matrix[:, column_index] - float(mean)) / float(std)
+        features_slice = pd.DataFrame(matrix, columns=columns)
         return SlyTradeRLEnvironment(
             features=features_slice,
             bars=bars_slice,
@@ -213,7 +223,11 @@ def build_rl_dataset(bars: pd.DataFrame, personality: TraderPersonality | None =
         raise ValueError(f"bars missing required columns: {sorted(missing)}")
 
     personality = personality or TraderPersonality.from_yaml()
-    bars = bars.sort_values("time").reset_index(drop=True)
+    # The aligned output is already time-sorted with a RangeIndex; only pay for
+    # a sort+copy when it genuinely isn't (a full-frame copy is ~1 GB).
+    time_col = bars["time"]
+    if not (time_col.is_monotonic_increasing and isinstance(bars.index, pd.RangeIndex)):
+        bars = bars.sort_values("time").reset_index(drop=True)
     ml_features = compute_ml_features(bars)
     if ml_features.empty or len(ml_features) != len(bars):
         raise ValueError("feature computation failed")
@@ -221,7 +235,7 @@ def build_rl_dataset(bars: pd.DataFrame, personality: TraderPersonality | None =
     feature_columns = rl_feature_columns(bars)
     adopted = [column for column in feature_columns if column in bars.columns and column not in ml_features.columns]
 
-    # Persona + regime conditioning channel (the "professional trader" wiring).
+    # Persona + regime conditioning channel (the \"professional trader\" wiring).
     from slytrade.rl.mode_vector import build_mode_matrix
 
     mode = build_mode_matrix(bars, personality).reset_index(drop=True)
@@ -229,13 +243,14 @@ def build_rl_dataset(bars: pd.DataFrame, personality: TraderPersonality | None =
     # Build the feature frame in one shot with concat: per-column assignment
     # fragments the DataFrame and emits a PerformanceWarning for every column
     # (the aligned bars carry ~200 adopted columns). Single-shot concat keeps
-    # the frame contiguous and the console clean.
-    frames = [ml_features.reset_index(drop=True)]
+    # the frame contiguous and the console clean. Everything is float32 from
+    # the start so the whole RL stack stays at half the float64 footprint.
+    frames = [ml_features.reset_index(drop=True).astype(np.float32)]
     if adopted:
         adopted_frame = bars[adopted].reset_index(drop=True)
-        adopted_frame = adopted_frame.apply(pd.to_numeric, errors="coerce")
+        adopted_frame = adopted_frame.apply(pd.to_numeric, errors="coerce").astype(np.float32)
         frames.append(adopted_frame)
-    frames.append(mode)
+    frames.append(mode.astype(np.float32))
     features = pd.concat(frames, axis=1)
     features = features.fillna(0.0)
 

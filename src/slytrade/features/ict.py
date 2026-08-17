@@ -227,7 +227,12 @@ def compute_ict_features(bars: pd.DataFrame, config: ICTFeatureConfig | None = N
     """
     cfg = config or ICTFeatureConfig()
     _require_columns(bars, ["time", "symbol", "timeframe", "open", "high", "low", "close"])
-    data = bars.sort_values("time").reset_index(drop=True).copy()
+    # Only pay for a sort+copy when the input isn't already time-sorted with a
+    # RangeIndex (the aligned pipeline output already is).
+    if bars["time"].is_monotonic_increasing and isinstance(bars.index, pd.RangeIndex):
+        data = bars
+    else:
+        data = bars.sort_values("time").reset_index(drop=True)
     n = len(data)
     if n == 0:
         return pd.DataFrame(columns=OUTPUT_COLUMNS)

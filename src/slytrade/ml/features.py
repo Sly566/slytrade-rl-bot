@@ -52,7 +52,12 @@ def compute_ml_features(bars: pd.DataFrame) -> pd.DataFrame:
     if bars.empty:
         return pd.DataFrame(columns=ML_FEATURE_COLUMNS, index=bars.index)
 
-    data = bars.sort_values("time").reset_index(drop=True).copy()
+    # Only pay for a sort+copy when the input isn't already time-sorted with a
+    # RangeIndex (the aligned pipeline output already is).
+    if "time" in bars.columns and bars["time"].is_monotonic_increasing and isinstance(bars.index, pd.RangeIndex):
+        data = bars
+    else:
+        data = bars.sort_values("time").reset_index(drop=True)
     open_ = pd.to_numeric(data["open"], errors="coerce").ffill().fillna(0.0)
     high = pd.to_numeric(data["high"], errors="coerce").ffill().fillna(0.0)
     low = pd.to_numeric(data["low"], errors="coerce").ffill().fillna(0.0)

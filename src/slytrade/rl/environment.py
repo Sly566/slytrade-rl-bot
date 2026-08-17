@@ -136,16 +136,17 @@ if gym is not None:
             if not required.issubset(bars.columns):
                 raise ValueError(f"bars missing required columns: {sorted(required.difference(bars.columns))}")
             super().__init__()
-            self.features = features.reset_index(drop=True)
-            self.bars = bars.reset_index(drop=True)
+            # The env indexes rows positionally (`.iloc`), so a RangeIndex is
+            # all it needs — reset_index(drop=True) would copy a multi-GB frame.
+            self.features = features if isinstance(features.index, pd.RangeIndex) else features.reset_index(drop=True)
+            self.bars = bars if isinstance(bars.index, pd.RangeIndex) else bars.reset_index(drop=True)
             self.config = config or RLEnvironmentConfig()
             self.mode_vector = mode_vector
             # Precompute the full observation matrix once (float32) so each
             # step's observation is a single numpy row slice instead of a
-            # pandas Series -> numpy conversion. SB3 calls this millions of
-            # times during training; the conversion was the dominant per-step
-            # cost at ~46 it/s.
-            self._feature_matrix = self.features.to_numpy(dtype=np.float32, copy=True)
+            # pandas Series -> numpy conversion. When the frame is already
+            # float32 this is a zero-copy view of its buffer.
+            self._feature_matrix = self.features.to_numpy(dtype=np.float32)
             self._mode_vector32 = np.asarray(mode_vector, dtype=np.float32) if mode_vector is not None else None
             shape = len(self.features.columns) + (len(mode_vector) if mode_vector is not None else 0)
             self.observation_space = spaces.Box(-np.inf, np.inf, shape=(shape,), dtype=np.float32)

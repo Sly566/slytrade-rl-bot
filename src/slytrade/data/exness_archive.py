@@ -48,22 +48,29 @@ class ExnessArchiveResult:
 
 
 _EXNESS_TIME_FORMATS = (
+    # The live Exness archive uses ISO-8601 with a literal trailing "Z"
+    # ("2026-08-02 22:01:30.645Z"), which some pandas versions refuse to
+    # infer (falling back to per-element dateutil). The "Z" strip fast path
+    # below is what actually matches the real data; these formats cover
+    # legacy/edge layouts.
     "%Y.%m.%d %H:%M:%S.%f",
     "%Y.%m.%d %H:%M:%S",
     "%Y-%m-%d %H:%M:%S.%f",
     "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M:%S.%fZ",
+    "%Y-%m-%d %H:%M:%SZ",
 )
 
 
 def parse_exness_timestamps(values: pd.Series) -> pd.Series:
-    """Parse Exness CSV timestamps with a vectorized explicit-format fast path.
+    """Parse Exness CSV timestamps fast and format-agnostically.
 
-    The Exness archive uses a fixed timestamp layout, but pandas' format
-    inference does not recognize it and falls back to parsing every element
-    one-by-one with ``dateutil`` — which takes minutes for a 40M-tick month.
-    Explicit formats parse in bulk. When none of the known layouts match
-    (>= 99.5% coverage), fall back to the original inference so unknown/edge
-    layouts still work.
+    The Exness archive's real layout is ISO-8601 with a trailing "Z"
+    (``2026-08-02 22:01:30.645Z``). Some pandas versions don't infer that and
+    fall back to per-element ``dateutil`` — minutes for a 40M-tick month. This
+    strips the "Z" (making the string plain ISO, which every pandas version
+    parses on the fast vectorized path) and only then tries explicit formats,
+    with the slow inference as a last resort.
     """
     if values.empty:
         return pd.to_datetime(values, utc=True, errors="coerce")
@@ -72,6 +79,17 @@ def parse_exness_timestamps(values: pd.Series) -> pd.Series:
         # Already datetime — nothing to infer.
         return pd.to_datetime(values, utc=True, errors="coerce")
     total = len(values)
+
+    # Fast path for the real archive layout ("YYYY-MM-DD HH:MM:SS.mmmZ"): the
+    # trailing "Z" is what trips pandas' inference on some versions. Detect it
+    # on the first row, strip it with the C-level rstrip (no regex), and parse
+    # plain ISO-8601 on the vectorized path (~3M rows/s vs ~300k via dateutil).
+    head = values.iloc[0]
+    if isinstance(head, str) and head.rstrip().endswith(("Z", "z")):
+        parsed = pd.to_datetime(values.str.rstrip("Zz"), utc=True, errors="coerce")
+        if float(parsed.notna().sum()) >= total * 0.995:
+            return parsed
+
     for fmt in _EXNESS_TIME_FORMATS:
         parsed = pd.to_datetime(values, utc=True, errors="coerce", format=fmt)
         if float(parsed.notna().sum()) >= total * 0.995:

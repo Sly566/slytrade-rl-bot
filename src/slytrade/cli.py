@@ -602,7 +602,7 @@ def walk_forward(
 
     bars = load_bars_file(Path(bars_file))
     resolved_symbol = infer_symbol(bars, symbol)
-    bars = bars[bars["symbol"] == resolved_symbol].copy()
+    bars = bars[bars["symbol"] == resolved_symbol] if bars["symbol"].nunique() > 1 else bars
     dataset = build_rl_dataset(bars)
     windows = resolve_fold_windows(
         len(dataset.bars),

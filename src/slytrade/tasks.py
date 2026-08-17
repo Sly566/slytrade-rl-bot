@@ -1002,7 +1002,9 @@ def train(
         return load_error
     assert bars is not None
     resolved = infer_symbol(bars, symbol)
-    bars = bars[bars["symbol"] == resolved].copy()
+    # Single-symbol aligned output: skip the full-frame boolean-mask copy.
+    if bars["symbol"].nunique() > 1:
+        bars = bars[bars["symbol"] == resolved].reset_index(drop=True)
     try:
         dataset = build_rl_dataset(bars)
         info(f"dataset: {len(dataset.bars):,} bars × {len(dataset.features.columns)} features "
@@ -1116,7 +1118,9 @@ def walk_forward(
         return load_error
     assert bars is not None
     resolved = infer_symbol(bars, symbol)
-    bars = bars[bars["symbol"] == resolved].copy()
+    # Single-symbol aligned output: skip the full-frame boolean-mask copy.
+    if bars["symbol"].nunique() > 1:
+        bars = bars[bars["symbol"] == resolved].reset_index(drop=True)
     try:
         dataset = build_rl_dataset(bars)
         windows = resolve_fold_windows(
@@ -1376,7 +1380,9 @@ def robustness(
     stage("Robustness evidence (Monte Carlo + perturbation + regime)")
     bars = load_bars_file(Path(bars_file))
     resolved = infer_symbol(bars, symbol)
-    bars = bars[bars["symbol"] == resolved].copy()
+    # Single-symbol aligned output: skip the full-frame boolean-mask copy.
+    if bars["symbol"].nunique() > 1:
+        bars = bars[bars["symbol"] == resolved].reset_index(drop=True)
 
     # Baseline backtest + its realized-PnL sequence.
     result = _run_backtest_for_pnls(bars, strategy, resolved)
