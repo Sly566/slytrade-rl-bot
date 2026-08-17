@@ -15,13 +15,16 @@ class MicroMacroAlignmentEngine:
     def __init__(self, personality: TraderPersonality):
         self.personality = personality
 
-    def evaluate(self, bars: pd.DataFrame, context: dict) -> float:
+    def evaluate(self, bars: pd.DataFrame | None, context: dict) -> float:
         """Return an alignment score in [0, 1].
 
         Combines:
         - macro structure strength (from context['macro_strength'])
         - MTF bias alignment (if the execution frame carries 'mtf_bias')
         - regime quality (context['regime_score']) weighted by macro respect
+
+        ``bars`` is accepted for interface compatibility; the score is derived
+        entirely from ``context``, so the fast persona path passes ``None``.
         """
         score = 0.5
 

@@ -12,8 +12,11 @@ of the existing backtest engines that call `on_bar(index, bar)`.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
+from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from slytrade.config.trader_personality import TraderPersonality
@@ -100,7 +103,25 @@ class PersonalityAdaptiveStrategy:
         self._context_engine = MarketContextEngine(self.personality, MarketRegimeEngine())
         self._alignment_engine = MicroMacroAlignmentEngine(self.personality)
 
-        self._history: list[pd.Series] = []
+        # Cheap scalar ring buffers for the causal context computation. The old
+        # path rebuilt a (history_window x ~200 cols) DataFrame *twice* per bar
+        # and re-classified the whole regime window per bar, which is O(window)
+        # per bar — over a 2-year aligned frame that is both slow and memory
+        # hungry. The buffers below keep only the scalars the context actually
+        # reads, and the context itself is computed from numpy arrays in O(1).
+        lookback = getattr(self._context_engine.regime_engine, "volatility_lookback", 100)
+        self._window_maxlen = max(self.config.history_window, lookback)
+        self._atr_norm: deque = deque(maxlen=self._window_maxlen)
+        self._trend: deque = deque(maxlen=self._window_maxlen)
+        self._premium: deque = deque(maxlen=self._window_maxlen)
+        self._times: deque = deque(maxlen=self._window_maxlen)
+        self._mtf_bias: deque = deque(maxlen=self._window_maxlen)
+        self._mtf_conf: deque = deque(maxlen=self._window_maxlen)
+        self._cols_initialized = False
+        self._has_htf = False
+        self._has_mtf_bias = False
+        self._has_mtf_conf = False
+
         self._side: str = "flat"
         self._last_entry_index: int = -1_000_000
         self._trades: list[OrderIntent] = []
@@ -110,9 +131,7 @@ class PersonalityAdaptiveStrategy:
     # ------------------------------------------------------------------
     def on_bar(self, index: int, bar: pd.Series) -> OrderIntent | None:
         """Return an OrderIntent when the persona wants to enter, else None."""
-        self._history.append(bar.copy())
-        if len(self._history) > self.config.history_window:
-            self._history.pop(0)
+        self._push_history(bar)
 
         if index - self._last_entry_index < self.config.cooldown_bars:
             return None
@@ -121,8 +140,16 @@ class PersonalityAdaptiveStrategy:
         if not _session_allowed(bar, self.config.allowed_sessions):
             return None
 
-        context = self._context_engine.analyze(pd.DataFrame(self._history))
-        alignment = self._alignment_engine.evaluate(pd.DataFrame(self._history), context)
+        context = self._context_engine.analyze_tail_arrays(
+            atr_norm=np.asarray(list(self._atr_norm), dtype=float),
+            trend_strength=np.asarray(list(self._trend), dtype=float),
+            premium_discount=np.asarray(list(self._premium), dtype=float),
+            times=list(self._times),
+            mtf_bias=np.asarray(list(self._mtf_bias), dtype=float) if self._has_mtf_bias else None,
+            mtf_confluence=np.asarray(list(self._mtf_conf), dtype=float) if self._has_mtf_conf else None,
+            has_htf=self._has_htf,
+        )
+        alignment = self._alignment_engine.evaluate(None, context)
 
         # Regime gates -------------------------------------------------
         if self.config.use_regime_filter:
@@ -163,10 +190,16 @@ class PersonalityAdaptiveStrategy:
 
     def reset(self) -> None:
         """Reset in-strategy state (used between episodes/walk-forward folds)."""
-        self._history.clear()
+        self._atr_norm.clear()
+        self._trend.clear()
+        self._premium.clear()
+        self._times.clear()
+        self._mtf_bias.clear()
+        self._mtf_conf.clear()
         self._side = "flat"
         self._last_entry_index = -1_000_000
         self._trades.clear()
+        self._cols_initialized = False
 
     @property
     def trade_count(self) -> int:
@@ -175,6 +208,26 @@ class PersonalityAdaptiveStrategy:
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+    def _push_history(self, bar: pd.Series) -> None:
+        """Buffer the scalars the context engine reads, in causal order.
+
+        Mirrors the old ``self._history.append(bar.copy())`` behaviour (every
+        bar is buffered, even during cooldown / non-fresh bars), but stores
+        only the handful of values the regime + context computation needs.
+        """
+        if not self._cols_initialized:
+            self._has_mtf_bias = "mtf_bias" in bar.index
+            self._has_mtf_conf = "mtf_confluence_score" in bar.index
+            self._has_htf = self._has_mtf_bias or self._has_mtf_conf
+            self._cols_initialized = True
+        self._atr_norm.append(_to_float(bar.get("atr_norm", 0.0)))
+        self._trend.append(_to_float(bar.get("trend_strength", 0.0)))
+        self._premium.append(_to_float(bar.get("premium_discount", 0.0)))
+        self._times.append(bar.get("time", None))
+        if self._has_mtf_bias:
+            self._mtf_bias.append(_to_float(bar.get("mtf_bias", 0.0)))
+        if self._has_mtf_conf:
+            self._mtf_conf.append(_to_float(bar.get("mtf_confluence_score", 0.0)))
     def _adaptive_threshold(self, context: dict) -> int:
         """Compute the entry-score threshold from personality + regime.
 
@@ -226,6 +279,19 @@ class PersonalityAdaptiveStrategy:
         if volume <= 0 or not volume == volume:  # NaN guard
             return self.volume
         return round(float(volume), 8)
+
+
+def _to_float(value: Any) -> float:
+    """Coerce a bar scalar to float, mapping missing/NaN to 0.0.
+
+    Mirrors ``MarketRegimeEngine._column_or_zeros`` so the fast context path
+    sees the same numbers the old DataFrame path produced.
+    """
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return 0.0 if result != result else result
 
 
 def _session_allowed(bar: pd.Series, allowed_sessions: tuple[str, ...]) -> bool:

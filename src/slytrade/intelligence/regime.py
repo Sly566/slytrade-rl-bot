@@ -130,6 +130,58 @@ class MarketRegimeEngine:
         regimes = self.analyze_frame(bars)
         return regimes.iloc[-1]
 
+    def analyze_tail_arrays(
+        self,
+        atr_norm: np.ndarray,
+        trend_strength: np.ndarray,
+        premium_discount: np.ndarray,
+        times: list,
+    ) -> MarketRegime:
+        """Classify the trailing bar from pre-buffered scalar windows.
+
+        Equivalent to ``analyze_frame(...).iloc[-1]`` for the tail row, but O(1)
+        in the window length: it applies the exact same rolling mean/std,
+        z-score thresholds, trend thresholds and session label to numpy arrays
+        instead of rebuilding a DataFrame and iterating every row with
+        ``apply``. Used by the persona strategy's per-bar hot loop.
+        """
+        if atr_norm is None or atr_norm.size == 0:
+            return MarketRegime("normal", "ranging", "unknown", 0.0, 0.0, 0.0, score=0.0)
+
+        window = atr_norm[-self.volatility_lookback :] if atr_norm.size > self.volatility_lookback else atr_norm
+        # rolling(min_periods=20) yields NaN -> the tail z-score is treated as 0.0
+        if window.size < 20:
+            z_score = 0.0
+        else:
+            mean = float(window.mean())
+            std = float(window.std(ddof=1))
+            # rolling(...).std().replace(0.0, NaN) -> z becomes NaN -> treated as 0.0
+            z_score = 0.0 if std == 0.0 else (float(atr_norm[-1]) - mean) / std
+
+        volatility: VolatilityRegime = (
+            "high"
+            if z_score > self.volatile_z_threshold
+            else ("low" if z_score < self.quiet_z_threshold else "normal")
+        )
+        trend_value = float(trend_strength[-1]) if trend_strength.size else 0.0
+        trend: TrendRegime = (
+            "bull"
+            if trend_value > self.trend_threshold_atr
+            else ("bear" if trend_value < -self.trend_threshold_atr else "ranging")
+        )
+        session = _tail_session(times)
+        premium = float(premium_discount[-1]) if premium_discount.size else 0.0
+
+        return MarketRegime(
+            volatility=volatility,
+            trend=trend,
+            session=session,
+            volatility_zscore=z_score,
+            trend_strength_raw=trend_value,
+            premium_discount=premium,
+            score=float(_quality_score(volatility, trend, session)),
+        )
+
 
 def _column_or_zeros(bars: pd.DataFrame, name: str) -> pd.Series:
     """Return a numeric feature column, defaulting safely for sparse bars."""
@@ -156,6 +208,19 @@ def _row_session(bars: pd.DataFrame, i: int) -> str:
     if isinstance(index_value, (pd.Timestamp, np.datetime64)):
         return session_label(pd.Timestamp(index_value).to_pydatetime())
     return "unknown"
+
+
+def _tail_session(times: list) -> str:
+    """Session label for the last buffered timestamp (mirrors ``_row_session``)."""
+    if not times:
+        return "unknown"
+    value = times[-1]
+    if value is None or pd.isna(value):
+        return "unknown"
+    try:
+        return session_label(pd.Timestamp(value).to_pydatetime())
+    except (ValueError, TypeError):
+        return "unknown"
 
 
 def _quality_score(volatility: VolatilityRegime, trend: TrendRegime, session: str) -> float:

@@ -1,5 +1,6 @@
 """Tests for the personality-adaptive ICT strategy and regime engine."""
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -151,3 +152,53 @@ def test_persona_strategy_emits_stop_budgeted_volume():
     if intent is not None:
         # Risk-budgeted volume: 100k * 0.005 / (1.0 ATR * 1.0) = 50
         assert intent.volume == pytest.approx(50.0, rel=0.01)
+
+
+def test_analyze_tail_arrays_matches_analyze():
+    """The fast tail-only context must reproduce the slow analyze() output.
+
+    This is the safety net for the persona backtest hot-loop rewrite: the
+    vectorized path has to classify every trailing window identically to the
+    old DataFrame + per-row apply() path, across window lengths spanning the
+    rolling(min_periods=20) and lookback(100) boundaries.
+    """
+    rng = np.random.default_rng(7)
+    n = 150
+    bars = pd.DataFrame(
+        {
+            "time": pd.date_range("2026-07-01T09:00:00Z", periods=n, freq="1min"),
+            "atr_norm": rng.uniform(0.001, 0.06, n),
+            "trend_strength": rng.uniform(-1.0, 1.0, n),
+            "premium_discount": rng.uniform(-1.0, 1.0, n),
+            "mtf_bias": rng.integers(-1, 2, n).astype(float),
+            "mtf_confluence_score": rng.integers(0, 5, n).astype(float),
+        }
+    )
+    personality = make_personality()
+    engine = MarketContextEngine(personality, MarketRegimeEngine())
+
+    categorical = ("volatility", "trend", "session", "macro_strength", "mtf_bias", "mtf_confluence_score")
+    numeric = ("regime_score", "volatility_zscore", "trend_strength_raw", "premium_discount", "atr_norm_20")
+
+    for end in (1, 19, 20, 45, 99, 100, 120, 150):
+        window = bars.iloc[:end]
+        slow = engine.analyze(window)
+        fast = engine.analyze_tail_arrays(
+            atr_norm=window["atr_norm"].to_numpy(),
+            trend_strength=window["trend_strength"].to_numpy(),
+            premium_discount=window["premium_discount"].to_numpy(),
+            times=list(window["time"]),
+            mtf_bias=window["mtf_bias"].to_numpy(),
+            mtf_confluence=window["mtf_confluence_score"].to_numpy(),
+            has_htf=True,
+        )
+        for key in categorical:
+            assert fast.get(key) == slow.get(key), (end, key, fast.get(key), slow.get(key))
+        for key in numeric:
+            assert fast.get(key) == pytest.approx(slow.get(key), rel=1e-9, abs=1e-9), (
+                end,
+                key,
+                fast.get(key),
+                slow.get(key),
+            )
+        assert fast.get("has_htf") is True

@@ -216,7 +216,13 @@ class ManagedAlignedBacktestEngine:
         if missing:
             raise ValueError(f"aligned bars missing required columns: {sorted(missing)}")
 
-        ordered = aligned_bars.sort_values("decision_time").reset_index(drop=True)
+        # Avoid the multi-GB sort+reset allocations when the frame is already
+        # time-ordered with a clean RangeIndex (the normal pipeline output).
+        decision_times = aligned_bars["decision_time"]
+        if decision_times.is_monotonic_increasing and isinstance(aligned_bars.index, pd.RangeIndex):
+            ordered = aligned_bars
+        else:
+            ordered = aligned_bars.sort_values("decision_time").reset_index(drop=True)
         broker = self.make_broker()
         equity_curve = [self.config.initial_balance]
         reports: list[ExecutionReport] = []

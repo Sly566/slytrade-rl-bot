@@ -213,7 +213,10 @@ def run_managed_aligned_backtest_from_bars(
     trade_config: TradeManagementConfig | None = None,
 ) -> BacktestResult:
     resolved_symbol = infer_symbol(aligned_bars, symbol)
-    prepared_bars = ensure_ict_features(aligned_bars) if strategy_name == "ict-bias" else aligned_bars.copy()
+    # Only the ict-bias baseline needs a (possibly enriched) copy; the other
+    # strategies read the frame read-only, and deep-copying a ~200-column,
+    # multi-year aligned frame is a multi-GB allocation that can OOM the box.
+    prepared_bars = ensure_ict_features(aligned_bars) if strategy_name == "ict-bias" else aligned_bars
     strategy = build_strategy(
         strategy_name,
         symbol=resolved_symbol,

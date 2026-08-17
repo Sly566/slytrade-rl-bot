@@ -6,6 +6,7 @@ data and macro-alignment input, and is deliberately deterministic.
 """
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 from slytrade.config.trader_personality import TraderPersonality
@@ -96,4 +97,41 @@ class MarketContextEngine:
             mtf_score = int(pd.to_numeric(bars["mtf_confluence_score"], errors="coerce").fillna(0).iloc[-1])
             context["mtf_confluence_score"] = mtf_score
 
+        return context
+
+    def analyze_tail_arrays(
+        self,
+        *,
+        atr_norm: np.ndarray,
+        trend_strength: np.ndarray,
+        premium_discount: np.ndarray,
+        times: list,
+        mtf_bias: np.ndarray | None = None,
+        mtf_confluence: np.ndarray | None = None,
+        has_htf: bool = False,
+    ) -> dict:
+        """Tail-only context from pre-buffered scalar windows.
+
+        Equivalent to :meth:`analyze` for the trailing bar, but O(1) in the
+        window length — the persona strategy calls this every bar, so it must
+        never rebuild a DataFrame or re-classify the whole window.
+        """
+        regime = self.regime_engine.analyze_tail_arrays(atr_norm, trend_strength, premium_discount, times)
+        context = {
+            "volatility": regime.volatility,
+            "trend": regime.trend,
+            "session": regime.session,
+            "regime_score": regime.score,
+            "volatility_zscore": regime.volatility_zscore,
+            "trend_strength_raw": regime.trend_strength_raw,
+            "premium_discount": regime.premium_discount,
+        }
+        if atr_norm.size:
+            context["atr_norm_20"] = float(np.mean(atr_norm[-20:]))
+        context["macro_strength"] = "moderate"
+        context["has_htf"] = has_htf
+        if mtf_bias is not None and mtf_bias.size:
+            context["mtf_bias"] = int(mtf_bias[-1])
+        if mtf_confluence is not None and mtf_confluence.size:
+            context["mtf_confluence_score"] = int(mtf_confluence[-1])
         return context
