@@ -1351,10 +1351,20 @@ def full_pipeline(
     promote_stage: str = typer.Option("paper", help="Stage to promote the model to"),
     clean: bool = typer.Option(False, "--clean", help="Wipe previous derived data before the run"),
     n_envs: int = typer.Option(1, help="Parallel rollout envs (1 = single process; >1 speeds up PPO data collection)"),
+    timeframe: str = typer.Option("H1", help="Decision timeframe: H1 (swing) or M15 (scalping). M5/M1 are known-unprofitable."),
 ) -> None:
     """Run the entire pipeline from scratch: collect → align → backtest → train
-    → walk-forward → promote."""
+    → walk-forward → promote.
+
+    Each timeframe uses its VALIDATED profile (entry score, cooldown, stop,
+    target, max hold) measured on 25mo of real Exness XAUUSD: H1 (+26.8% net,
+    PF 1.48) and M15 (+38.4% net, PF 1.18) are profitable; M5 and M1 are
+    structurally negative after costs (spread vs ATR).
+    """
+    from slytrade.config.timeframe_profiles import profile_for
     from slytrade.tasks import full_pipeline as run_pipeline
+
+    console.print(f"[bold cyan]timeframe profile: {profile_for(timeframe).note}[/bold cyan]")
 
     result = run_pipeline(
         symbol,
@@ -1367,6 +1377,7 @@ def full_pipeline(
         promote_stage=promote_stage,
         clean=clean,
         n_envs=n_envs,
+        timeframe=timeframe,
     )
     if not result.ok:
         console.print(f"[red]{result.message}[/red]")

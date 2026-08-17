@@ -46,7 +46,6 @@ class PersonalityAdaptiveConfig:
     min_tick_rate: float = 0.0
     min_abs_trend_strength: float = 0.0
     history_window: int = 120
-
     # Risk-based position sizing
     risk_based_sizing: bool = True
     equity: float = 100_000.0
@@ -60,6 +59,36 @@ class PersonalityAdaptiveConfig:
     require_mtf_alignment: bool = True
     alignment_threshold: float = 0.6
     regime_filter_penalty: float = field(default=1.5)  # extra score required when regime is poor
+
+    # ICT setup-quality entry filters — the "trade only the real footprint"
+    # layer. Measured on 18mo real XAUUSD: on H1 the winners are bar-momentum
+    # confirmation + strict higher-timeframe direction. On M1 the sweep+reversal
+    # filter cuts overtrading hard (but is neutral-to-negative on H1).
+    require_sweep_reversal: bool = True
+    sweep_reversal_window: int = 12
+    require_entry_momentum: bool = True
+    strict_mtf_direction: bool = True
+    # Deprecated: was "spread in points" but the gate compared it to a PRICE
+    # (quote_spread), so it could never trigger correctly. Use ``max_spread``
+    # (PRICE units) instead — the scorer and the gate now share that one field.
+    max_spread_points: float | None = None
+    # Directional asymmetry: trade ONLY with the higher-timeframe macro trend.
+    # When set (e.g. "d1"), longs require htf_<tf>_trend_strength > 0 and shorts
+    # require < 0 — so in a confirmed bull market the strategy stops fading the
+    # trend with counter-trend shorts (the main bleed in the old results). The
+    # column is causal (pre-computed on the HTF, merged backward). Off by default
+    # in the dataclass; enabled for backtests via configs/risk.yaml.
+    htf_trend_timeframe: str | None = None
+
+    # SMC microstructure score weights (see ICTConfluenceStrategy). 0 disables.
+    # Measured on 2y real XAUUSD: scoring these into the threshold overtrades
+    # and dilutes PF, so the validated default is OFF for the rule-based entry;
+    # the features still reach the RL and the MTF context (htf_* columns).
+    smc_displacement: int = 0
+    smc_ifvg: int = 0
+    smc_breaker: int = 0
+    smc_vi: int = 0
+    smc_dol_tap: int = 0
 
 
 class PersonalityAdaptiveStrategy:
@@ -99,6 +128,11 @@ class PersonalityAdaptiveStrategy:
             require_fresh_quote=self.config.require_fresh_quote,
             max_spread=self.config.max_spread,
             min_tick_rate=self.config.min_tick_rate,
+            smc_displacement=self.config.smc_displacement,
+            smc_ifvg=self.config.smc_ifvg,
+            smc_breaker=self.config.smc_breaker,
+            smc_vi=self.config.smc_vi,
+            smc_dol_tap=self.config.smc_dol_tap,
         )
         self._context_engine = MarketContextEngine(self.personality, MarketRegimeEngine())
         self._alignment_engine = MicroMacroAlignmentEngine(self.personality)
@@ -121,6 +155,13 @@ class PersonalityAdaptiveStrategy:
         self._has_htf = False
         self._has_mtf_bias = False
         self._has_mtf_conf = False
+
+        # Setup-quality ring buffers (the sweep/reversal entry filter reads a
+        # short, causal lookback of the footprint columns).
+        setup_window = max(self.config.sweep_reversal_window, 2)
+        self._sweeps: deque = deque(maxlen=setup_window)
+        self._bos: deque = deque(maxlen=setup_window)
+        self._choch: deque = deque(maxlen=setup_window)
 
         self._side: str = "flat"
         self._last_entry_index: int = -1_000_000
@@ -182,11 +223,26 @@ class PersonalityAdaptiveStrategy:
         elif short_score >= threshold and short_score > long_score and self._side != "short":
             intent = self._build_intent(Side.SELL, short_score, bar)
 
+        # Setup-quality gate: drop the entry unless it is a real footprint
+        # (sweep + reversal, with momentum, in the HTF direction, tight spread).
+        if intent is not None and not self._setup_quality_ok(intent.side, bar):
+            intent = None
+
         if intent is not None:
             self._side = "long" if intent.side == Side.BUY else "short"
             self._last_entry_index = index
             self._trades.append(intent)
         return intent
+
+    def on_position_closed(self) -> None:
+        """Called by the managed-exit engine when a managed trade fully closes.
+
+        The engine manages position state (SL/TP/trailing) and only requests a
+        new entry while flat — but this strategy tracked its own ``_side`` and
+        never learned the exit happened, which locked it out of same-direction
+        re-entries. Resetting to flat lets the next bias-aligned setup enter.
+        """
+        self._side = "flat"
 
     def reset(self) -> None:
         """Reset in-strategy state (used between episodes/walk-forward folds)."""
@@ -196,6 +252,9 @@ class PersonalityAdaptiveStrategy:
         self._times.clear()
         self._mtf_bias.clear()
         self._mtf_conf.clear()
+        self._sweeps.clear()
+        self._bos.clear()
+        self._choch.clear()
         self._side = "flat"
         self._last_entry_index = -1_000_000
         self._trades.clear()
@@ -228,6 +287,76 @@ class PersonalityAdaptiveStrategy:
             self._mtf_bias.append(_to_float(bar.get("mtf_bias", 0.0)))
         if self._has_mtf_conf:
             self._mtf_conf.append(_to_float(bar.get("mtf_confluence_score", 0.0)))
+        self._sweeps.append(_to_float(bar.get("liquidity_sweep", 0.0)))
+        self._bos.append(_to_float(bar.get("bos_dir", 0.0)))
+        self._choch.append(_to_float(bar.get("choch_dir", 0.0)))
+
+    def _setup_quality_ok(self, side: Side, bar: pd.Series) -> bool:
+        """Return True when the entry is a high-quality ICT footprint.
+
+        The checks are cheap and causal: they only read the current bar plus
+        the short setup ring buffers (all <= the current bar).
+        """
+        cfg = self.config
+        long = side == Side.BUY
+
+        # Momentum: enter WITH the bar's own direction (no fading a candle).
+        if cfg.require_entry_momentum:
+            open_ = _to_float(bar.get("open", 0.0))
+            close_ = _to_float(bar.get("close", 0.0))
+            if open_ and close_:
+                if long and close_ <= open_:
+                    return False
+                if not long and close_ >= open_:
+                    return False
+
+        # Spread gate: never pay a wide spread for a setup. Both the scorer and
+        # this gate share the PRICE-unit threshold (``max_spread``); the old
+        # ``max_spread_points`` compared price against points, which could never
+        # trigger correctly. A missing column / None threshold = gate off.
+        if cfg.max_spread is not None:
+            if _to_float(bar.get("quote_spread", 0.0)) > cfg.max_spread:
+                return False
+
+        # Strict MTF direction: trade WITH higher-timeframe structure only.
+        if cfg.strict_mtf_direction and self._has_mtf_bias and self._mtf_bias:
+            bias = self._mtf_bias[-1]
+            if long and bias < 0:
+                return False
+            if not long and bias > 0:
+                return False
+
+        # HTF macro-trend asymmetry: trade only in the D1 trend's direction.
+        # Guarded on column presence so live bars without htf_* columns are
+        # unaffected (the gate is then a no-op, not a full block).
+        if cfg.htf_trend_timeframe:
+            trend_col = f"htf_{cfg.htf_trend_timeframe}_trend_strength"
+            if trend_col in bar.index:
+                ts = _to_float(bar.get(trend_col, 0.0))
+                if long and ts <= 0:
+                    return False
+                if not long and ts >= 0:
+                    return False
+
+        # Sweep + reversal: the actual ICT setup — a liquidity sweep that has
+        # been confirmed by a structure shift in the reversal's direction.
+        if cfg.require_sweep_reversal:
+            sweeps = list(self._sweeps)
+            bos = list(self._bos)
+            choch = list(self._choch)
+            if not sweeps:
+                return False
+            if long:
+                swept = any(s < 0 for s in sweeps)
+                structure = any(b > 0 or c > 0 for b, c in zip(bos, choch, strict=False))
+            else:
+                swept = any(s > 0 for s in sweeps)
+                structure = any(b < 0 or c < 0 for b, c in zip(bos, choch, strict=False))
+            if not (swept and structure):
+                return False
+
+        return True
+
     def _adaptive_threshold(self, context: dict) -> int:
         """Compute the entry-score threshold from personality + regime.
 

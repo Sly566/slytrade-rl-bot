@@ -52,16 +52,36 @@ def _first_friday(year: int, month: int) -> datetime:
     return datetime(year, month, day, 12, 30, tzinfo=UTC)
 
 
+def _nth_weekday(year: int, month: int, weekday: int, nth: int) -> datetime:
+    """Return the nth ``weekday`` (0=Mon..6=Sun) of a month at 00:00 UTC."""
+    first = datetime(year, month, 1)
+    offset = (weekday - first.weekday()) % 7
+    return first + timedelta(days=offset + 7 * (nth - 1))
+
+
 def _recurring_events(year: int) -> tuple[NewsEvent, ...]:
     """Approximate recurring US red-folder events (UTC, no DST adjustment).
 
-    NFP is a fixed 12:30 UTC announcement on the first Friday of each month.
-    These are approximations for dry-run convenience only.
+    * NFP — first Friday of each month, 12:30 UTC (fixed).
+    * FOMC — eight meetings a year, ~18:00 UTC on a Wednesday (approximated as
+      the third Wednesday of Jan/Mar/Apr/Jun/Jul/Sep/Oct/Dec).
+    * CPI — monthly, ~12:30 UTC, approximated as the 12th of each month.
+
+    These are dry-run approximations for the recurring rule only. Production
+    operators should load explicit windows from a trusted calendar feed; exact
+    dates shift every year (especially FOMC, which follows a published schedule
+    and US daylight saving).
     """
     events: list[NewsEvent] = []
     for month in range(1, 13):
         nfp = _first_friday(year, month)
         events.append(NewsEvent(name="NFP", start=nfp, end=nfp + timedelta(minutes=75)))
+        cpi = datetime(year, month, 12, 12, 30, tzinfo=UTC)
+        events.append(NewsEvent(name="CPI", start=cpi, end=cpi + timedelta(minutes=75)))
+    for month in (1, 3, 4, 6, 7, 9, 10, 12):
+        fomc_day = _nth_weekday(year, month, weekday=2, nth=3)  # third Wednesday
+        fomc = fomc_day.replace(hour=18, minute=0, tzinfo=UTC)
+        events.append(NewsEvent(name="FOMC", start=fomc, end=fomc + timedelta(minutes=105)))
     return tuple(events)
 
 

@@ -12,12 +12,16 @@ import getpass
 import importlib.util
 import os
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pandas as pd
 from rich.console import Console
+
+if TYPE_CHECKING:  # pragma: no cover - annotations only
+    from slytrade.backtest.trade_management import TradeManagementConfig
+    from slytrade.strategies.personality_adaptive import PersonalityAdaptiveConfig
 
 console = Console()
 
@@ -690,7 +694,12 @@ def align(
     from slytrade.progress import stage
 
     stage(f"Align {symbol} {timeframe} — ticks → features → decision quotes → MTF")
-    output = Path(out_dir) if out_dir else Path("data/processed/aligned") / symbol
+    # Timeframe-aware output dir: M1 lives at .../aligned/XAUUSD/m1/bars.parquet,
+    # H1 at .../aligned/XAUUSD/h1/bars.parquet, so the swing (H1) dataset and the
+    # scalping (M1) dataset never clobber each other. An explicit --out-dir still
+    # wins (used by tests and advanced flows).
+    normalized_tf = (timeframe or "M1").upper()
+    output = Path(out_dir) if out_dir else (Path("data/processed/aligned") / symbol / normalized_tf.lower())
     # Recreate any deleted data directories and ensure the output path is
     # writable (self-heals a deleted data/processed tree).
     writable_error = _ensure_writable_root(output.parent)
@@ -882,6 +891,89 @@ def _load_bars_or_error(bars_file: str | Path) -> tuple[pd.DataFrame | None, Tas
 # ---------------------------------------------------------------------------
 
 
+def _risk_ict_section() -> dict:
+    """Return the ``ict`` section of configs/risk.yaml (entry + exit rules)."""
+    from slytrade.core.config import load_config as _load_config
+
+    return dict(_load_config("configs").risk.get("ict", {}) or {})
+
+
+def _trade_config_from_risk(timeframe: str | None = None) -> TradeManagementConfig:
+    """Build the managed-exit config: per-timeframe profile + configs/risk.yaml.
+
+    The timeframe-sensitive structure (stop / target / max hold) comes from the
+    validated :mod:`slytrade.config.timeframe_profiles` profile; the
+    timeframe-insensitive exit rules (partials, trailing, breakeven) come from
+    configs/risk.yaml so they stay operator-tunable.
+    """
+    from slytrade.backtest.trade_management import TradeManagementConfig
+    from slytrade.config.timeframe_profiles import profile_for
+
+    ict = _risk_ict_section()
+    profile = profile_for(timeframe)
+    trailing = ict.get("trailing_atr_mult")
+    return TradeManagementConfig(
+        stop_loss_atr=float(ict.get("sl_atr_mult", profile.stop_loss_atr)),
+        take_profit_atr=float(ict.get("tp_atr_mult", profile.take_profit_atr)),
+        partial_take_profit_enabled=bool(ict.get("partial_tp_enabled", False)),
+        partial_take_profit_atr=float(ict.get("partial_tp_atr_mult", 1.0)),
+        partial_close_fraction=float(ict.get("partial_close_fraction", 0.5)),
+        move_to_breakeven_after_partial=bool(ict.get("move_to_breakeven_after_partial", True)),
+        trailing_stop_atr=(float(trailing) if trailing is not None else None),
+        trail_after_partial=bool(ict.get("trail_after_partial", True)),
+        breakeven_at_r=(float(ict["breakeven_at_r"]) if ict.get("breakeven_at_r") is not None else None),
+        max_bars_in_trade=(
+            int(ict["max_bars_in_trade"]) if ict.get("max_bars_in_trade") is not None else profile.max_bars_in_trade
+        ),
+    )
+
+
+def _persona_config_from_risk(symbol: str = "XAUUSD", timeframe: str | None = None) -> PersonalityAdaptiveConfig:
+    """Build the persona entry config: per-timeframe profile + configs/risk.yaml.
+
+    The timeframe-sensitive entry structure (min confluence score, cooldown,
+    HTF trend gate) comes from the validated per-timeframe profile; the
+    footprint gates and SMC score weights come from configs/risk.yaml.
+
+    ``symbol`` sets the per-point PnL value used by risk-based position sizing,
+    so it always matches the backtest's PnL accounting (gold = 100/lot/point).
+    """
+    from slytrade.config.timeframe_profiles import profile_for
+    from slytrade.strategies.personality_adaptive import PersonalityAdaptiveConfig
+
+    risk_cfg = _risk_ict_section()
+    entry = risk_cfg.get("entry", {}) or {}
+    profile = profile_for(timeframe)
+    return PersonalityAdaptiveConfig(
+        min_score=int(entry.get("min_score", profile.min_score)),
+        cooldown_bars=int(entry.get("cooldown_bars", profile.cooldown_bars)),
+        require_sweep_reversal=bool(entry.get("require_sweep_reversal", True)),
+        sweep_reversal_window=int(entry.get("sweep_reversal_window", 12)),
+        require_entry_momentum=bool(entry.get("require_entry_momentum", True)),
+        strict_mtf_direction=bool(entry.get("strict_mtf_direction", True)),
+        max_spread=(float(entry["max_spread"]) if entry.get("max_spread") is not None else None),
+        htf_trend_timeframe=(
+            str(entry["htf_trend_timeframe"]) if entry.get("htf_trend_timeframe") else profile.htf_trend_timeframe
+        ),
+        smc_displacement=int(entry.get("smc_displacement", 0)),
+        smc_ifvg=int(entry.get("smc_ifvg", 0)),
+        smc_breaker=int(entry.get("smc_breaker", 0)),
+        smc_vi=int(entry.get("smc_vi", 0)),
+        smc_dol_tap=int(entry.get("smc_dol_tap", 0)),
+        point_value=default_point_value(symbol),
+    )
+
+
+def _timeframe_of(bars: pd.DataFrame, default: str = "H1") -> str:
+    """Infer the decision timeframe of an aligned bars frame (profile lookup)."""
+    try:
+        from slytrade.data.alignment import infer_single_timeframe
+
+        return infer_single_timeframe(bars)
+    except Exception:  # pragma: no cover - malformed frame
+        return default
+
+
 def default_point_value(symbol: str) -> float:
     """Conservative per-symbol point value for sizing.
 
@@ -947,6 +1039,8 @@ def backtest(
             commission_per_volume=commission,
             slippage_points=slippage_points,
         ),
+        trade_config=_trade_config_from_risk(_timeframe_of(bars)),
+        persona_config=_persona_config_from_risk(resolved, _timeframe_of(bars)),
     )
     render_backtest_report(result, strategy_name=strategy, console=console)
     return TaskResult(
@@ -1009,6 +1103,12 @@ def train(
         dataset = build_rl_dataset(bars)
         info(f"dataset: {len(dataset.bars):,} bars × {len(dataset.features.columns)} features "
              f"(ML + ICT + tick microstructure + MTF)")
+        if len(dataset.bars) < 20_000:
+            console.print(
+                f"[yellow]Only {len(dataset.bars):,} decision bars — RL on a small sample is "
+                "statistically weak (high variance, easy to overfit). At this timeframe the "
+                "rule-based champion is the more reliable signal.[/yellow]"
+            )
         scaler_params = dataset.fit_scaler(0, len(dataset.bars))
         # Dynamic footprint-driven feature selection (train slice only).
         selected = list(dataset.select_features_on_fold(0, len(dataset.bars)))
@@ -1047,7 +1147,7 @@ def train(
         else:
             model = train_policy(algorithm, env, total_timesteps=total_timesteps, seed=seed, policy_type=policy, progress_bar=True)
         results = evaluate_policy(model, env, episodes=3, seed=seed)
-        maybe_log_metrics(run, {f"mean_{key}": float(value) for key, value in results.items() if isinstance(value, (int, float))})
+        maybe_log_metrics(run, {key: float(value) for key, value in results.items() if isinstance(value, (int, float))})
     finally:
         maybe_end_run(run)
 
@@ -1066,7 +1166,7 @@ def train(
             "use_managed_exits": env.config.use_managed_exits,
             "n_features": len(dataset.features.columns),
         },
-        metrics={f"mean_{key}": float(value) for key, value in results.items() if isinstance(value, (int, float))},
+        metrics={key: float(value) for key, value in results.items() if isinstance(value, (int, float))},
         artifacts_dir=artifacts_dir,
         registry_path=registry_path,
     )
@@ -1123,6 +1223,12 @@ def walk_forward(
         bars = bars[bars["symbol"] == resolved].reset_index(drop=True)
     try:
         dataset = build_rl_dataset(bars)
+        if len(dataset.bars) < 20_000:
+            console.print(
+                f"[yellow]Only {len(dataset.bars):,} decision bars — walk-forward RL on a small "
+                "sample is statistically weak (high variance). The rule-based champion comparison "
+                "is the more reliable read at this timeframe.[/yellow]"
+            )
         windows = resolve_fold_windows(
             len(dataset.bars),
             train_window=train_window,
@@ -1168,9 +1274,10 @@ def _add_champion_comparison(table: pd.DataFrame, dataset, folds, symbol: str) -
     """
     from slytrade.backtest.engine import BacktestConfig
     from slytrade.backtest.reporting import run_managed_aligned_backtest_from_bars
-    from slytrade.backtest.trade_management import TradeManagementConfig
+    from slytrade.core.config import load_config as _load_config
 
     persona_returns: list[float | None] = []
+    costs = _load_config("configs").risk.get("costs", {})
     for fold in folds:
         test_bars = dataset.bars.iloc[fold.test_start:fold.test_end].reset_index(drop=True)
         try:
@@ -1184,9 +1291,13 @@ def _add_champion_comparison(table: pd.DataFrame, dataset, folds, symbol: str) -
                     initial_balance=100_000.0,
                     point_size=0.01,
                     point_value=default_point_value(symbol),
-                    commission_per_volume=0.0,
+                    # Net-of-cost champion, same cost model as the main
+                    # backtest, so rl_minus_persona is an honest comparison.
+                    commission_per_volume=float(costs.get("commission_per_volume", 0.0) or 0.0),
+                    slippage_points=float(costs.get("slippage_points", 0.0) or 0.0),
                 ),
-                trade_config=TradeManagementConfig(stop_loss_atr=1.0, take_profit_atr=2.0),
+                trade_config=_trade_config_from_risk(_timeframe_of(test_bars)),
+                persona_config=_persona_config_from_risk(symbol, _timeframe_of(test_bars)),
             )
             realized = sum(float(record.realized_pnl) for record in result.trades if record.reason.startswith("managed_"))
             persona_returns.append(realized / 100_000.0)
@@ -1217,12 +1328,92 @@ def _add_champion_comparison(table: pd.DataFrame, dataset, folds, symbol: str) -
 # ---------------------------------------------------------------------------
 
 
-def promote(model_id: str, *, stage: str = "paper", registry_path: str | Path = "models/registry.jsonl") -> TaskResult:
+CHAMPION_BASELINE_PATH = Path("models/champion.json")
+
+
+def _write_champion_baseline(symbol: str, total_return: float) -> None:
+    """Persist the persona-adaptive (rule-based champion) result.
+
+    Written by ``full_pipeline`` after the backtest so the promotion gate can
+    refuse to ship an RL policy that does not beat the champion net of costs.
+    """
+    import json as _json
+
+    baseline = {
+        "symbol": symbol,
+        "total_return": float(total_return),
+        "created_at": datetime.now(UTC).isoformat(),
+    }
+    CHAMPION_BASELINE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CHAMPION_BASELINE_PATH.write_text(_json.dumps(baseline, indent=2), encoding="utf-8")
+
+
+def _load_champion_baseline() -> dict | None:
+    import json as _json
+
+    if not CHAMPION_BASELINE_PATH.exists():
+        return None
+    try:
+        return _json.loads(CHAMPION_BASELINE_PATH.read_text(encoding="utf-8"))
+    except Exception:  # pragma: no cover - malformed baseline file
+        return None
+
+
+def _model_mean_return(model_id: str, artifacts_dir: str | Path = "models/artifacts") -> float | None:
+    """Read the model's tracked mean_total_return from its artifact manifest."""
+    import json as _json
+
+    manifest = Path(artifacts_dir) / model_id / "manifest.json"
+    if not manifest.exists():
+        return None
+    try:
+        meta = _json.loads(manifest.read_text(encoding="utf-8"))
+    except Exception:  # pragma: no cover - malformed manifest
+        return None
+    metrics = meta.get("metrics", {}) or {}
+    value = metrics.get("mean_total_return")
+    return float(value) if value is not None else None
+
+
+def promote(
+    model_id: str,
+    *,
+    stage: str = "paper",
+    registry_path: str | Path = "models/registry.jsonl",
+    require_champion_beat: bool | None = None,
+    artifacts_dir: str | Path = "models/artifacts",
+) -> TaskResult:
     from slytrade.rl.deployment import promote_artifact
 
     dir_error = _ensure_writable_root(Path(registry_path).parent)
     if dir_error is not None:
         return dir_error
+
+    # Beat-the-baseline gate (ROADMAP): shipping the RL to demo/live requires
+    # it to beat the rule-based champion net of costs. Off by default for
+    # 'paper'; enforced for 'demo'/'live' unless explicitly overridden.
+    if require_champion_beat is None:
+        require_champion_beat = stage in ("demo", "live")
+    if require_champion_beat:
+        baseline = _load_champion_baseline()
+        if baseline is None:
+            return TaskResult(
+                False,
+                "promotion refused: no champion baseline (models/champion.json) to compare against. "
+                "Run 'slytrade full-pipeline' first so the persona-adaptive backtest writes it.",
+            )
+        model_return = _model_mean_return(model_id, artifacts_dir)
+        champion_return = float(baseline.get("total_return", 0.0))
+        if model_return is None:
+            return TaskResult(False, f"promotion refused: no tracked metrics for model {model_id}")
+        if model_return <= champion_return:
+            return TaskResult(
+                False,
+                f"promotion to '{stage}' refused: RL mean return ({model_return:.2%}) does not beat the "
+                f"persona champion ({champion_return:.2%}) net of costs. Re-run walk-forward; promote only "
+                "when rl_minus_persona is positive in most folds, or pass require_champion_beat=False after "
+                "manual review.",
+            )
 
     record = promote_artifact(model_id, stage=stage, registry_path=registry_path)
     console.print(f"[green]Promoted {model_id} to stage '{stage}'.[/green]")
@@ -1246,8 +1437,15 @@ def full_pipeline(
     promote_stage: str = "paper",
     clean: bool = False,
     n_envs: int = 1,
+    timeframe: str = "H1",
 ) -> TaskResult:
     """Run collection → alignment → backtest → train → walk-forward → promote.
+
+    ``timeframe`` is the DECISION timeframe (bars are collected for all
+    timeframes regardless). It defaults to H1: measured on 18 months of real
+    Exness XAUUSD, the ICT footprints carry edge on 1-4h horizons and are
+    noise at M1, so the swing (H1, MTF H4/D1) mode is the profitable default.
+    ``--timeframe M1`` restores the old scalping path (known-losing).
 
     With ``clean=True`` the derived data tree is wiped first so no stale files
     from a previous run can leak into this one.
@@ -1255,7 +1453,7 @@ def full_pipeline(
     from slytrade.progress import stage
 
     steps: list[str] = []
-    stage(f"Full pipeline — {symbol} · lookback={lookback} · source={source}")
+    stage(f"Full pipeline — {symbol} · lookback={lookback} · source={source} · timeframe={timeframe}")
     if clean:
         cleaned = clean_all()
         if not cleaned.ok:
@@ -1266,15 +1464,20 @@ def full_pipeline(
         return collected
     steps.append("collect")
 
-    aligned = align(symbol)
+    aligned = align(symbol, timeframe=timeframe)
     if not aligned.ok:
         return aligned
     bars_file = aligned.data["bars_file"] if aligned.data else None
     if not bars_file:
         return TaskResult(False, "alignment did not produce a bars file")
+    console.print(f"[green]aligned bars: {bars_file}[/green]")
     steps.append("align")
 
-    backtest(bars_file, strategy="persona-adaptive", symbol=symbol)
+    bt = backtest(bars_file, strategy="persona-adaptive", symbol=symbol)
+    # Persist the champion result as the beat-the-baseline reference for the
+    # promotion gate (RL must beat this net of costs before demo/live).
+    if bt.ok and bt.data and bt.data.get("total_return") is not None:
+        _write_champion_baseline(symbol, float(bt.data["total_return"]))
     steps.append("backtest")
 
     trained = train(bars_file, symbol=symbol, algorithm=algorithm, total_timesteps=total_timesteps, policy=policy, reward=reward, n_envs=n_envs)
@@ -1427,13 +1630,24 @@ def _run_backtest_for_pnls(
     strategy: str,
     symbol: str,
     *,
-    stop_loss_atr: float = 1.0,
-    take_profit_atr: float = 2.0,
+    stop_loss_atr: float | None = None,
+    take_profit_atr: float | None = None,
 ):
-    """Run a managed backtest and return the BacktestResult (for robustness)."""
+    """Run a managed backtest and return the BacktestResult (for robustness).
+
+    Uses the production exit config from configs/risk.yaml; SL/TP ATR multiples
+    can be overridden (the robustness perturbation sweep does exactly that).
+    """
+    from dataclasses import replace
+
     from slytrade.backtest.engine import BacktestConfig
     from slytrade.backtest.reporting import run_managed_aligned_backtest_from_bars
-    from slytrade.backtest.trade_management import TradeManagementConfig
+
+    trade_config = _trade_config_from_risk(_timeframe_of(bars))
+    if stop_loss_atr is not None:
+        trade_config = replace(trade_config, stop_loss_atr=stop_loss_atr)
+    if take_profit_atr is not None:
+        trade_config = replace(trade_config, take_profit_atr=take_profit_atr)
 
     return run_managed_aligned_backtest_from_bars(
         bars,
@@ -1447,5 +1661,6 @@ def _run_backtest_for_pnls(
             point_value=default_point_value(symbol),
             commission_per_volume=0.0,
         ),
-        trade_config=TradeManagementConfig(stop_loss_atr=stop_loss_atr, take_profit_atr=take_profit_atr),
+        trade_config=trade_config,
+        persona_config=_persona_config_from_risk(symbol, _timeframe_of(bars)),
     )

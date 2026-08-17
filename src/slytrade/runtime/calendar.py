@@ -114,21 +114,44 @@ def calendar_gate(
 
 
 def build_news_gate_from_settings(settings) -> NewsGate:
-    """Build the runtime news gate from settings (calendar feed > static YAML).
+    """Build the runtime news gate from settings + configs/news.yaml.
 
-    Returns a disabled gate unless ``news_enabled`` is set. When a calendar
-    path/URL is configured it takes precedence over the static YAML file.
+    Precedence when ``news_enabled`` is set: settings calendar URL/path →
+    news.yaml ``calendar_url``/``calendar_path`` → static news.yaml events →
+    recurring approximations. Returns a disabled gate unless enabled.
     """
     from datetime import UTC, datetime
+    from pathlib import Path as _Path
+
+    import yaml as _yaml
 
     from slytrade.runtime.news_gate import NewsGate, load_news_gate
 
     if not getattr(settings, "news_enabled", False):
         return NewsGate(enabled=False)
-    calendar_path = getattr(settings, "calendar_path", "") or ""
-    calendar_url = getattr(settings, "calendar_url", "") or ""
+
+    news_cfg: dict = {}
+    news_path = _Path(getattr(settings, "news_config_file", "configs/news.yaml"))
+    if news_path.exists():
+        try:
+            news_cfg = _yaml.safe_load(news_path.read_text(encoding="utf-8")) or {}
+        except Exception:  # pragma: no cover - malformed operator file
+            news_cfg = {}
+
+    # Calendar feed source: env/settings wins, then news.yaml.
+    calendar_path = getattr(settings, "calendar_path", "") or str(news_cfg.get("calendar_path", ""))
+    calendar_url = getattr(settings, "calendar_url", "") or str(news_cfg.get("calendar_url", ""))
+    min_impact = getattr(settings, "news_min_impact", "high") or str(news_cfg.get("min_impact", "high"))
+
     if calendar_path or calendar_url:
-        gate = calendar_gate(path=calendar_path or None, url=calendar_url or None)
+        gate = calendar_gate(
+            path=calendar_path or None,
+            url=calendar_url or None,
+            min_impact=min_impact,
+            quiet_before_minutes=int(news_cfg.get("quiet_before_minutes", 15)),
+            quiet_after_minutes=int(news_cfg.get("quiet_after_minutes", 15)),
+        )
         if gate.enabled:
             return gate
-    return load_news_gate(getattr(settings, "news_config_file", "configs/news.yaml"), year=datetime.now(UTC).year)
+
+    return load_news_gate(news_path, year=datetime.now(UTC).year)

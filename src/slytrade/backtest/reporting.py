@@ -117,6 +117,7 @@ def build_strategy(
     min_mtf_score: int = 2,
     require_mtf_bias_alignment: bool = True,
     point_value: float = 1.0,
+    persona_config=None,
 ) -> BarStrategy:
     if strategy_name == "no-trade":
         return NoTradeStrategy()
@@ -141,10 +142,11 @@ def build_strategy(
     if strategy_name == "persona-adaptive":
         from slytrade.strategies.personality_adaptive import PersonalityAdaptiveConfig
 
+        config = persona_config if persona_config is not None else PersonalityAdaptiveConfig(point_value=point_value)
         return PersonalityAdaptiveStrategy(
             symbol=symbol,
             volume=volume,
-            config=PersonalityAdaptiveConfig(point_value=point_value),
+            config=config,
         )
     raise ValueError(f"Unknown strategy '{strategy_name}'. Valid strategies: {', '.join(VALID_STRATEGIES)}")
 
@@ -211,6 +213,7 @@ def run_managed_aligned_backtest_from_bars(
     point_value: float = 1.0,
     config: BacktestConfig | None = None,
     trade_config: TradeManagementConfig | None = None,
+    persona_config=None,
 ) -> BacktestResult:
     resolved_symbol = infer_symbol(aligned_bars, symbol)
     # Only the ict-bias baseline needs a (possibly enriched) copy; the other
@@ -224,6 +227,7 @@ def run_managed_aligned_backtest_from_bars(
         fast_window=fast_window,
         slow_window=slow_window,
         point_value=point_value,
+        persona_config=persona_config,
     )
     engine = ManagedAlignedBacktestEngine(config, trade_config)
     return engine.run(prepared_bars, strategy)

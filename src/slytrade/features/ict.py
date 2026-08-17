@@ -37,6 +37,24 @@ BASE_FEATURE_COLUMNS = [
     "price_percentile",
     "trend_strength",
     "distance_from_ema50_atr",
+    # --- ICT/SMC "smart money" microstructure (micro->macro resolution) ---
+    "displacement_dir",       # -1/0/+1 impulsive expansion candle (LTF confirmation)
+    "displacement_strength",  # |body|/ATR of the expansion candle
+    "vi_bullish",             # volume imbalance (body gap up) printed this bar
+    "vi_bearish",             # volume imbalance (body gap down) printed this bar
+    "ifvg_bullish",           # inverse FVG retest (violated bearish FVG -> support)
+    "ifvg_bearish",           # inverse FVG retest (violated bullish FVG -> resistance)
+    "breaker_bullish",        # swept-and-reclaimed bullish order block (support)
+    "breaker_bearish",        # swept-and-reclaimed bearish order block (resistance)
+    "nearest_pdh_dist_atr",   # (previous-day high - close)/ATR  (draw on liquidity)
+    "nearest_pdl_dist_atr",   # (close - previous-day low)/ATR
+    "pdh_tap",                # price resting just under PDH (liquidity tapped)
+    "pdl_tap",                # price resting just above PDL (liquidity tapped)
+    "session_high_dist_atr",  # (running session high - close)/ATR (Asia/overnight range)
+    "session_low_dist_atr",   # (close - running session low)/ATR
+    "killzone_london",        # 07:00-10:00 UTC London open kill zone
+    "killzone_ny",            # 12:00-15:00 UTC NY open kill zone
+    "killzone_london_close",  # 15:00-17:00 UTC London close kill zone
 ]
 
 FEATURE_COLUMNS = BASE_FEATURE_COLUMNS + SESSION_COLUMNS
@@ -55,6 +73,16 @@ class ICTFeatureConfig:
     context_window: int = 100
     ema_fast_period: int = 10
     ema_slow_period: int = 50
+    # Displacement = an impulsive expansion candle: |body| >= body_atr*ATR and
+    # the body spans >= range_frac of the full candle range.
+    displacement_body_atr: float = 0.8
+    displacement_range_frac: float = 0.6
+    # Volume imbalance (VI): min body gap between candle bodies across a
+    # 3-candle window, in ATR.
+    vi_min_atr: float = 0.1
+    # A liquidity level is "tapped" when price rests within tap_zone_atr ATR of
+    # it (draw on liquidity: PDH/PDL/session range).
+    tap_zone_atr: float = 0.3
 
 
 @dataclass(frozen=True)
@@ -91,6 +119,22 @@ class EqualLevel:
     price: float
     first_pivot_index: int
     second_pivot_index: int
+
+
+@dataclass(frozen=True)
+class InverseFVG:
+    """A fair value gap that was violated and therefore flipped polarity.
+
+    A bullish FVG (gap up, support) that is traded through to the downside
+    becomes resistance; a bearish FVG (gap down, resistance) traded through to
+    the upside becomes support. ``direction`` is the NEW polarity: "bullish" =
+    now support (retest -> buy), "bearish" = now resistance (retest -> sell).
+    """
+
+    index: int
+    direction: Direction
+    top: float
+    bottom: float
 
 
 def _require_columns(bars: pd.DataFrame, columns: list[str]) -> None:
@@ -264,6 +308,9 @@ def compute_ict_features(bars: pd.DataFrame, config: ICTFeatureConfig | None = N
     active_fvgs: deque[FairValueGap] = deque()
     active_obs: deque[OrderBlock] = deque()
     equal_levels: deque[EqualLevel] = deque()
+    inverted_fvgs: deque[InverseFVG] = deque()
+    inverted_fvg_indices: set[int] = set()
+    reclaimed_ob_indices: set[int] = set()
     last_high: ConfirmedPivot | None = None
     last_low: ConfirmedPivot | None = None
     trend = 0
@@ -407,6 +454,43 @@ def compute_ict_features(bars: pd.DataFrame, config: ICTFeatureConfig | None = N
                     normalized = distance / atr_i
                     nearest_bear_ob_dist = normalized if nearest_bear_ob_dist == 0.0 else min(nearest_bear_ob_dist, normalized)
 
+        # --- Inverse FVGs: violated gaps flip polarity, retests flag ---------
+        ifvg_bullish = 0.0
+        ifvg_bearish = 0.0
+        for gap in active_fvgs:
+            if gap.index in inverted_fvg_indices:
+                continue
+            if gap.direction == "bullish" and low[i] < gap.bottom:
+                # Gap-up support traded through to the downside -> resistance.
+                inverted_fvg_indices.add(gap.index)
+                inverted_fvgs.append(InverseFVG(i, "bearish", gap.top, gap.bottom))
+            elif gap.direction == "bearish" and high[i] > gap.top:
+                # Gap-down resistance traded through to the upside -> support.
+                inverted_fvg_indices.add(gap.index)
+                inverted_fvgs.append(InverseFVG(i, "bullish", gap.top, gap.bottom))
+        while inverted_fvgs and inverted_fvgs[0].index < start:
+            inverted_fvgs.popleft()
+        for inv in inverted_fvgs:
+            if inv.index >= i:
+                continue
+            if inv.direction == "bullish" and low[i] <= inv.top:
+                ifvg_bullish = 1.0
+            elif inv.direction == "bearish" and high[i] >= inv.bottom:
+                ifvg_bearish = 1.0
+
+        # --- Breaker blocks: swept stop + reclaimed order block ---------------
+        breaker_bullish = 0.0
+        breaker_bearish = 0.0
+        for block in active_obs:
+            if block.index in reclaimed_ob_indices:
+                continue
+            if block.direction == "bullish" and low[i] < block.bottom and close[i] > block.top:
+                reclaimed_ob_indices.add(block.index)
+                breaker_bullish = 1.0
+            elif block.direction == "bearish" and high[i] > block.top and close[i] < block.bottom:
+                reclaimed_ob_indices.add(block.index)
+                breaker_bearish = 1.0
+
         # --- Equal levels + liquidity sweep ----------------------------------
         equal_high = 1.0 if equal_levels and equal_levels[-1].level_type == "equal_high" and equal_levels[-1].index == i else 0.0
         equal_low = 1.0 if equal_levels and equal_levels[-1].level_type == "equal_low" and equal_levels[-1].index == i else 0.0
@@ -457,9 +541,63 @@ def compute_ict_features(bars: pd.DataFrame, config: ICTFeatureConfig | None = N
         out["price_percentile"][i] = price_percentile
         out["trend_strength"][i] = trend_strength
         out["distance_from_ema50_atr"][i] = distance_from_ema50
+        out["ifvg_bullish"][i] = ifvg_bullish
+        out["ifvg_bearish"][i] = ifvg_bearish
+        out["breaker_bullish"][i] = breaker_bullish
+        out["breaker_bearish"][i] = breaker_bearish
 
     for column in SESSION_COLUMNS:
         out[column] = session_cols[column]
+
+    # --- Displacement: impulsive expansion candle (LTF confirmation) ---------
+    body = close - open_
+    candle_range = high - low
+    atr_safe = np.maximum(atr, 1e-12)
+    expansion = (np.abs(body) >= cfg.displacement_body_atr * atr_safe) & (
+        np.abs(body) >= cfg.displacement_range_frac * np.maximum(candle_range, 1e-12)
+    )
+    out["displacement_dir"] = np.where(expansion, np.sign(body), 0.0)
+    out["displacement_strength"] = np.where(expansion, np.abs(body) / atr_safe, 0.0)
+
+    # --- Volume imbalance: body gap across a 3-candle window ------------------
+    body_top = np.maximum(open_, close)
+    body_bot = np.minimum(open_, close)
+    vi_bull = np.zeros(n, dtype=float)
+    vi_bear = np.zeros(n, dtype=float)
+    if n >= 3:
+        vi_bull[2:] = body_bot[2:] - body_top[:-2]
+        vi_bear[2:] = body_bot[:-2] - body_top[2:]
+    vi_threshold = cfg.vi_min_atr * atr_safe
+    out["vi_bullish"] = (vi_bull >= vi_threshold).astype(float)
+    out["vi_bearish"] = (vi_bear >= vi_threshold).astype(float)
+
+    # --- Previous-day high/low: the draw-on-liquidity levels ------------------
+    times = pd.to_datetime(data["time"], utc=True)
+    day = times.dt.normalize()
+    daily_high = pd.Series(high, index=day).groupby(level=0).max()
+    daily_low = pd.Series(low, index=day).groupby(level=0).min()
+    pdh = day.map(daily_high.shift(1)).to_numpy(dtype=float)
+    pdl = day.map(daily_low.shift(1)).to_numpy(dtype=float)
+    pdh = np.where(np.isfinite(pdh), pdh, 0.0)
+    pdl = np.where(np.isfinite(pdl), pdl, 0.0)
+    nearest_pdh_dist = np.where(pdh > 0.0, (pdh - close) / atr_safe, 0.0)
+    nearest_pdl_dist = np.where(pdl > 0.0, (close - pdl) / atr_safe, 0.0)
+    out["nearest_pdh_dist_atr"] = nearest_pdh_dist
+    out["nearest_pdl_dist_atr"] = nearest_pdl_dist
+    out["pdh_tap"] = ((nearest_pdh_dist >= 0.0) & (nearest_pdh_dist <= cfg.tap_zone_atr)).astype(float)
+    out["pdl_tap"] = ((nearest_pdl_dist >= 0.0) & (nearest_pdl_dist <= cfg.tap_zone_atr)).astype(float)
+
+    # --- Running session range since 00:00 UTC (Asia/overnight liquidity) -----
+    run_high = pd.Series(high, index=day).groupby(level=0).cummax().to_numpy(dtype=float)
+    run_low = pd.Series(low, index=day).groupby(level=0).cummin().to_numpy(dtype=float)
+    out["session_high_dist_atr"] = (run_high - close) / atr_safe
+    out["session_low_dist_atr"] = (close - run_low) / atr_safe
+
+    # --- Kill zones (liquidity windows) ---------------------------------------
+    hour = times.dt.hour.to_numpy(dtype=int)
+    out["killzone_london"] = ((hour >= 7) & (hour < 10)).astype(float)
+    out["killzone_ny"] = ((hour >= 12) & (hour < 15)).astype(float)
+    out["killzone_london_close"] = ((hour >= 15) & (hour < 17)).astype(float)
 
     result = pd.DataFrame(
         {

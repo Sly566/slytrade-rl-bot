@@ -32,6 +32,12 @@ class BacktestConfig:
     max_position_volume: float = 100.0
     max_quote_age_seconds: float = 5.0
     allow_bar_quote_fallback: bool = True
+    # Drawdown kill-switches are LIVE-safety features. A research backtest must
+    # see the FULL performance of the strategy, so these default to disabled
+    # (None). The live paper/demo loops build their own GuardrailConfig from
+    # configs/risk.yaml and keep the kill-switch active there.
+    max_daily_drawdown: float | None = None
+    max_total_drawdown: float | None = None
 
 
 @dataclass(frozen=True)
@@ -92,6 +98,10 @@ class BarBacktestEngine:
             guardrail_config=GuardrailConfig(
                 max_spread_points=self.config.max_spread_points,
                 max_position_volume=self.config.max_position_volume,
+                # Disabled in research backtests (None -> no drawdown kill-switch)
+                # unless the caller explicitly configured them.
+                max_daily_drawdown=self.config.max_daily_drawdown if self.config.max_daily_drawdown is not None else float("inf"),
+                max_total_drawdown=self.config.max_total_drawdown if self.config.max_total_drawdown is not None else float("inf"),
             ),
         )
 

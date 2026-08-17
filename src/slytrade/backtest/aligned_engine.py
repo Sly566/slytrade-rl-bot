@@ -42,6 +42,10 @@ class AlignedBacktestEngine:
             guardrail_config=GuardrailConfig(
                 max_spread_points=self.config.max_spread_points,
                 max_position_volume=self.config.max_position_volume,
+                # Disabled in research backtests (None -> no drawdown kill-switch)
+                # unless the caller explicitly configured them.
+                max_daily_drawdown=self.config.max_daily_drawdown if self.config.max_daily_drawdown is not None else float("inf"),
+                max_total_drawdown=self.config.max_total_drawdown if self.config.max_total_drawdown is not None else float("inf"),
             ),
         )
 

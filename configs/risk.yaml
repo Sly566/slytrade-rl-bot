@@ -15,8 +15,53 @@ costs:
   # rate (used only for non-USD accounts). 1 USD = this many account units.
   currency_rate_to_usd: 18.0
 
+# Account currency — sizing/PnL math uses USD point values (gold = $100/lot/
+# point). A non-USD account (e.g. ZAR) is converted with the fallback rate
+# above; the demo loop additionally resolves a live rate from the terminal
+# (USDZAR / ZARUSD). The paper loop uses the configured rate. USD = no-op.
+currency:
+  base_currency: USD
+  account_currency: ZAR
+  rate_to_usd: 18.0
+
 ict:
-  sl_atr_mult: 1.0
-  trailing_atr_mult: 2.0
-  min_trail_distance_points: 50
+  # Timeframe-sensitive exit structure (stop / target / max hold) is driven by
+  # the VALIDATED per-timeframe profiles in src/slytrade/config/timeframe_profiles.py
+  # (H1 = 1:2, M15 = 1:3 with a 60-bar time exit, etc.). Only the timeframe-
+  # insensitive exit rules below live here, so they stay operator-tunable.
   partial_tp_enabled: false
+  partial_tp_atr_mult: 1.0
+  partial_close_fraction: 0.5
+  move_to_breakeven_after_partial: true
+  trailing_atr_mult: null
+  trail_after_partial: true
+  # Move the stop to entry after +X R. Tested on 2y real XAUUSD: EVERY level
+  # (0.5R/0.75R/1R/1.5R) reduced returns — it scratches winners that dip back
+  # to entry before running to target. Keep off (null). Available for future
+  # regime-adaptive tuning only.
+  breakeven_at_r: null
+  min_trail_distance_points: 50
+
+  # Entry-quality gates and SMC score weights (timeframe-insensitive). The
+  # timeframe-sensitive entry structure (min confluence score, cooldown, HTF
+  # trend gate) is driven by the per-timeframe profiles.
+  entry:
+    require_sweep_reversal: false
+    sweep_reversal_window: 12
+    require_entry_momentum: true
+    strict_mtf_direction: true
+    # SMC microstructure score weights — the smart-money confirmations (IFVG,
+    # displacement, breaker, volume imbalance, draw-on-liquidity). Measured on
+    # 2y real XAUUSD: scoring these INTO the entry threshold overtrades and
+    # dilutes profit factor (PF 1.32 -> 1.02 out-of-sample), so they default
+    # OFF for the rule-based scorer. They still reach the RL observation and
+    # the MTF context (htf_* columns) where they add value. Enable only with
+    # re-validation on your own data.
+    smc_displacement: 0
+    smc_ifvg: 0
+    smc_breaker: 0
+    smc_vi: 0
+    smc_dol_tap: 0
+    # Max spread gate, in PRICE units (e.g. 0.30 = $0.30 on gold). Applies to
+    # both the scorer and the entry-quality gate. null = off.
+    max_spread: null

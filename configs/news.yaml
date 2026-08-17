@@ -3,10 +3,13 @@
 # The gate is DISABLED by default and stays disabled while `enabled: false` or
 # the file is missing. Open positions and risk-reducing exits are never touched.
 #
-# For production, load explicit event windows (UTC) from a trusted economic
-# calendar. The optional `enable_recurring` rule is an approximation of the US
-# Non-Farm Payroll release (first Friday of each month, 12:30 UTC) for dry-run
-# convenience only — it does not adjust for US daylight saving time.
+# Three sources, in order of precedence (when `enabled: true`):
+#   1. calendar_url / calendar_path — a live/static economic-calendar feed
+#      (JSON: {"events": [{"name","start_utc","end_utc","impact"}]} or CSV with
+#      those columns). Prefer this for production.
+#   2. explicit `events:` windows below.
+#   3. `enable_recurring` — approximations of NFP / FOMC / CPI for dry-run only
+#      (no US DST adjustment; FOMC dates shift every year).
 
 enabled: false
 year: 2026
@@ -15,7 +18,14 @@ year: 2026
 quiet_before_minutes: 15
 quiet_after_minutes: 15
 
-# Approximate recurring US red-folder events (UTC). Off by default.
+# Only pause for events at/above this impact (low | medium | high).
+min_impact: high
+
+# Optional economic-calendar feed (URL wins over path). Leave empty to disable.
+calendar_url: ""
+calendar_path: ""
+
+# Approximate recurring US red-folder events (NFP/FOMC/CPI, UTC). Off by default.
 enable_recurring: false
 
 # Explicit event windows (UTC). Add real calendar entries here.

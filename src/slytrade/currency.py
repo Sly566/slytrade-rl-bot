@@ -77,6 +77,7 @@ class CurrencyConverter:
 
 
 def load_converter(risk_config: dict) -> CurrencyConverter:
+    currency = risk_config.get("currency", {}) or {}
     costs = risk_config.get("costs", {})
-    rate = float(costs.get("currency_rate_to_usd", 1.0) or 1.0)
+    rate = float(currency.get("rate_to_usd") or costs.get("currency_rate_to_usd", 1.0) or 1.0)
     return CurrencyConverter(fallback_rate=rate)

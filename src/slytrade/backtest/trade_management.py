@@ -41,6 +41,16 @@ class TradeManagementConfig:
     partial_close_fraction: float = 0.5
     move_to_breakeven_after_partial: bool = True
     trailing_stop_atr: float | None = None
+    # Only start trailing after a partial has been banked (or the stop is at
+    # breakeven). This is the "let winners run" setting: the stop stays wide
+    # until 1R is locked in, then trails — instead of choking the trade before
+    # it reaches the partial target.
+    trail_after_partial: bool = True
+    # Move the stop to entry once the trade has travelled this many R in
+    # favour (e.g. 1.0 = break even after +1R). Converts some losers into
+    # scratches without banking any profit early (unlike a partial close).
+    # None disables the rule.
+    breakeven_at_r: float | None = None
 
     def __post_init__(self) -> None:
         if self.stop_loss_atr <= 0:
@@ -55,6 +65,8 @@ class TradeManagementConfig:
             raise ValueError("partial_close_fraction must be between 0 and 1")
         if self.trailing_stop_atr is not None and self.trailing_stop_atr <= 0:
             raise ValueError("trailing_stop_atr must be positive when provided")
+        if self.breakeven_at_r is not None and self.breakeven_at_r <= 0:
+            raise ValueError("breakeven_at_r must be positive when provided")
 
 
 @dataclass
@@ -150,6 +162,28 @@ def update_trailing_stop(trade: ManagedTradeState, bar: pd.Series, config: Trade
         trade.stop_loss = min(trade.stop_loss, low + distance)
 
 
+def update_breakeven_stop(trade: ManagedTradeState, bar: pd.Series, config: TradeManagementConfig) -> None:
+    """Move the stop to entry once the trade has travelled ``breakeven_at_r`` R.
+
+    Triggered on the bar's extreme (high for longs, low for shorts), consistent
+    with the engine's same-bar SL/TP logic. Idempotent via ``breakeven_applied``.
+    """
+    if config.breakeven_at_r is None or trade.breakeven_applied or trade.is_closed:
+        return
+    stop_distance = abs(trade.entry_price - trade.stop_loss)
+    if stop_distance <= 1e-12:
+        return
+    high, low = _bar_high_low(bar)
+    if trade.is_long:
+        if high >= trade.entry_price + config.breakeven_at_r * stop_distance:
+            trade.stop_loss = max(trade.stop_loss, trade.entry_price)
+            trade.breakeven_applied = True
+    else:
+        if low <= trade.entry_price - config.breakeven_at_r * stop_distance:
+            trade.stop_loss = min(trade.stop_loss, trade.entry_price)
+            trade.breakeven_applied = True
+
+
 def exit_reason_for_bar(trade: ManagedTradeState, bar: pd.Series, index: int, config: TradeManagementConfig) -> ExitReason:
     event = next_exit_event(trade, bar, index, config)
     return event[0]
@@ -210,6 +244,21 @@ class ManagedAlignedBacktestEngine:
 
         return AlignedBacktestEngine(self.config).make_broker()
 
+    @staticmethod
+    def _notify_position_closed(strategy: BarStrategy) -> None:
+        """Tell the strategy its managed trade is closed, so its internal side
+        state resets to flat.
+
+        The engine only requests entries while flat, but strategies that track
+        their own ``_side`` (the persona, the confluence baseline) never learn
+        the exit happened — they set ``_side = long/short`` on entry and would
+        otherwise lock themselves out of same-direction re-entries for the rest
+        of the run. Optional hook: strategies without it are unaffected.
+        """
+        hook = getattr(strategy, "on_position_closed", None)
+        if hook is not None:
+            hook()
+
     def run(self, aligned_bars: pd.DataFrame, strategy: BarStrategy) -> BacktestResult:
         required = {"time", "symbol", "open", "high", "low", "close", "decision_time"}
         missing = required.difference(aligned_bars.columns)
@@ -238,7 +287,9 @@ class ManagedAlignedBacktestEngine:
             broker.update_quote(quote)
 
             if trade_state is not None:
-                update_trailing_stop(trade_state, bar, self.trade_config)
+                if not self.trade_config.trail_after_partial or trade_state.partial_taken or trade_state.breakeven_applied:
+                    update_trailing_stop(trade_state, bar, self.trade_config)
+                update_breakeven_stop(trade_state, bar, self.trade_config)
                 # A bar can trigger a partial and later another bar can trigger a final exit.
                 reason, volume, exit_price = next_exit_event(trade_state, bar, index, self.trade_config)
                 if reason != "none" and volume > 0:
@@ -260,6 +311,7 @@ class ManagedAlignedBacktestEngine:
                                 trade_state.breakeven_applied = True
                         if trade_state.is_closed:
                             trade_state = None
+                            self._notify_position_closed(strategy)
 
             if trade_state is None and not broker.guardrails.kill_switch:
                 intent = strategy.on_bar(index, bar)

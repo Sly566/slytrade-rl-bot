@@ -280,7 +280,8 @@ def test_align_prefers_merged_ticks(tmp_path: Path, monkeypatch) -> None:
     assert result.ok, result.message
     import json
 
-    manifest = json.loads((tmp_path / "data" / "processed" / "aligned" / "XAUUSD" / "manifest.json").read_text())
+    # Timeframe-aware output: M1 lives under .../aligned/XAUUSD/m1/.
+    manifest = json.loads((tmp_path / "data" / "processed" / "aligned" / "XAUUSD" / "m1" / "manifest.json").read_text())
     assert manifest["tick_source"] == "merged_ticks"
 
 

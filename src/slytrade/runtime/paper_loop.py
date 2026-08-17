@@ -41,6 +41,7 @@ from slytrade.backtest.trade_management import (
     update_trailing_stop,
 )
 from slytrade.core.config import load_config
+from slytrade.currency import CurrencyConverter
 from slytrade.data.timeframes import timeframe_duration
 from slytrade.execution.journal import SqliteJournal
 from slytrade.execution.ledger import TradeLedger
@@ -271,6 +272,17 @@ class PaperTradingLoop:
         config = load_config(self.settings.config_dir)
         risk_cfg = config.risk
         limits = limits_from_config(risk_cfg)
+        # Account-currency handling: sizing math uses USD point values, so a
+        # non-USD account equity must be converted before risk-based sizing.
+        # Env settings win; risk.yaml's `currency:` block is the fallback.
+        currency_cfg = risk_cfg.get("currency", {}) or {}
+        self._account_currency = (
+            self.settings.account_currency or str(currency_cfg.get("account_currency", "USD"))
+        ).upper()
+        rate = float(self.settings.currency_rate_to_usd or 1.0)
+        if rate == 1.0 and currency_cfg.get("rate_to_usd"):
+            rate = float(currency_cfg["rate_to_usd"])
+        self._converter = CurrencyConverter(fallback_rate=rate)
         self.breaker = LossCircuitBreaker(limits)
         self.window = window_from_settings(
             self.settings.trading_days,
@@ -317,7 +329,13 @@ class PaperTradingLoop:
         self.bar_builder = BarBuilder(self.settings.symbol, self.settings.timeframe)
 
         if self.strategy is None:
-            self.strategy = PersonalityAdaptiveStrategy(symbol=self.settings.symbol, volume=0.1)
+            from slytrade.tasks import _persona_config_from_risk
+
+            self.strategy = PersonalityAdaptiveStrategy(
+                symbol=self.settings.symbol,
+                volume=0.1,
+                config=_persona_config_from_risk(self.settings.symbol, self.settings.timeframe),
+            )
 
     def _point_size(self) -> float:
         try:
@@ -338,6 +356,22 @@ class PaperTradingLoop:
         except Exception:  # pragma: no cover - spec file is optional
             pass
         return 1.0
+
+    def _equity_usd(self) -> float:
+        """Current equity converted to USD for sizing math.
+
+        The portfolio marks positions in account currency; point_value is
+        USD-based, so risk-budgeted volume must be computed from the
+        USD-equivalent equity. USD accounts are a no-op.
+        """
+        equity = self.broker.portfolio.mark_to_market(self.broker.last_marks)
+        if self._account_currency == "USD":
+            return equity
+        return self._converter.to_usd(equity)
+
+    def _equity_account(self) -> float:
+        """Current equity in account currency (for reporting/metrics)."""
+        return self.broker.portfolio.mark_to_market(self.broker.last_marks)
 
     # -- main entry -----------------------------------------------------------
     def run(self, *, max_bars: int | None = None, max_seconds: float = 0.0) -> LoopSummary:
@@ -491,7 +525,9 @@ class PaperTradingLoop:
         # strategy can never size past the guardrails.
         atr = float(bar.get("atr", 0.0) or 0.0)
         stop_distance = max(atr, 0.10)
-        equity = self.broker.portfolio.mark_to_market(self.broker.last_marks)
+        # Sizing is computed on USD-equivalent equity: point_value is USD-based
+        # (gold = $100/lot/point), so a ZAR account must be converted first.
+        equity = self._equity_usd()
         volume = risk_based_volume(
             equity,
             stop_distance,
@@ -577,14 +613,25 @@ class PaperTradingLoop:
         )
 
     def _trade_management_config(self) -> TradeManagementConfig:
+        from slytrade.config.timeframe_profiles import profile_for
+
         config = load_config(self.settings.config_dir)
         ict = config.risk.get("ict", {})
-        rl = config.training.get("rl", {})
+        profile = profile_for(self.settings.timeframe)
+        trailing = ict.get("trailing_atr_mult")
         return TradeManagementConfig(
-            stop_loss_atr=float(ict.get("sl_atr_mult", 1.0)),
-            take_profit_atr=float(rl.get("take_profit_atr", 2.0)),
-            trailing_stop_atr=float(ict.get("trailing_atr_mult", 2.0)),
+            stop_loss_atr=float(ict.get("sl_atr_mult", profile.stop_loss_atr)),
+            take_profit_atr=float(ict.get("tp_atr_mult", profile.take_profit_atr)),
+            trailing_stop_atr=float(trailing) if trailing is not None else None,
             partial_take_profit_enabled=bool(ict.get("partial_tp_enabled", False)),
+            partial_take_profit_atr=float(ict.get("partial_tp_atr_mult", 1.0)),
+            partial_close_fraction=float(ict.get("partial_close_fraction", 0.5)),
+            move_to_breakeven_after_partial=bool(ict.get("move_to_breakeven_after_partial", True)),
+            trail_after_partial=bool(ict.get("trail_after_partial", True)),
+            breakeven_at_r=(float(ict["breakeven_at_r"]) if ict.get("breakeven_at_r") is not None else None),
+            max_bars_in_trade=(
+                int(ict["max_bars_in_trade"]) if ict.get("max_bars_in_trade") is not None else profile.max_bars_in_trade
+            ),
         )
 
     # -- helpers ---------------------------------------------------------------

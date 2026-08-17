@@ -68,6 +68,13 @@ class RuntimeSettings(BaseSettings):
     timeframe: str = "M1"
     strategy: str = "persona-adaptive"
     initial_balance: float = 100_000.0
+    # --- Account currency ------------------------------------------------------
+    # Sizing/PnL math uses USD point values (e.g. gold = $100/lot/point). A
+    # non-USD account (ZAR, EUR, ...) is converted with the configured fallback
+    # rate (1 account unit = X USD); the demo loop additionally resolves a live
+    # rate from the MT5 terminal when available.
+    account_currency: str = "USD"
+    currency_rate_to_usd: float = 1.0
     poll_seconds: float = 1.0
     stale_quote_seconds: float = 5.0
     heartbeat_interval_seconds: float = 5.0
@@ -94,6 +101,7 @@ class RuntimeSettings(BaseSettings):
     # set and news_enabled, the red-folder gate is built from this feed.
     calendar_path: str = ""
     calendar_url: str = ""
+    news_min_impact: str = "high"  # low | medium | high
 
     def fail_closed_checks(self) -> list[str]:
         """Return a list of configuration problems that must block startup.

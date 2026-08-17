@@ -161,8 +161,24 @@ class ICTConfluenceStrategy:
     min_abs_trend_strength: float = 0.0
     allowed_sessions: tuple[str, ...] = ("london", "ny_am", "ny_pm")
     require_fresh_quote: bool = True
+    # SMC microstructure score weights (0 disables a component). These are the
+    # "smart money" confirmations (displacement / inverse-FVG / breaker /
+    # volume-imbalance / draw-on-liquidity). Measured on 2y real XAUUSD: scoring
+    # them INTO the entry threshold overtrades and dilutes profit factor, so the
+    # default is OFF for the rule-based scorer — they still reach the RL and the
+    # MTF context (htf_* columns) where they add the most value. All columns are
+    # causal and optional — a missing column contributes 0.
+    smc_displacement: int = 0
+    smc_ifvg: int = 0
+    smc_breaker: int = 0
+    smc_vi: int = 0
+    smc_dol_tap: int = 0
     _side: StrategySide = field(default="flat", init=False)
     _last_entry_index: int = field(default=-10_000_000, init=False)
+
+    def on_position_closed(self) -> None:
+        """Reset side state when the managed-exit engine closes our trade."""
+        self._side = "flat"
 
     def _can_trade(self, index: int, bar: pd.Series) -> bool:
         if index - self._last_entry_index < self.cooldown_bars:
@@ -193,6 +209,17 @@ class ICTConfluenceStrategy:
             score += 1
         if trend_strength >= self.min_abs_trend_strength:
             score += 1
+        # SMC microstructure confirmations (weight 0 disables; absent column -> 0)
+        if self.smc_displacement and float(bar.get("displacement_dir", 0.0)) > 0:
+            score += self.smc_displacement
+        if self.smc_ifvg and float(bar.get("ifvg_bullish", 0.0)) > 0:
+            score += self.smc_ifvg
+        if self.smc_breaker and float(bar.get("breaker_bullish", 0.0)) > 0:
+            score += self.smc_breaker
+        if self.smc_vi and float(bar.get("vi_bullish", 0.0)) > 0:
+            score += self.smc_vi
+        if self.smc_dol_tap and float(bar.get("pdl_tap", 0.0)) > 0:
+            score += self.smc_dol_tap
         return score
 
     def _short_score(self, bar: pd.Series) -> int:
@@ -213,6 +240,16 @@ class ICTConfluenceStrategy:
             score += 1
         if trend_strength <= -self.min_abs_trend_strength:
             score += 1
+        if self.smc_displacement and float(bar.get("displacement_dir", 0.0)) < 0:
+            score += self.smc_displacement
+        if self.smc_ifvg and float(bar.get("ifvg_bearish", 0.0)) > 0:
+            score += self.smc_ifvg
+        if self.smc_breaker and float(bar.get("breaker_bearish", 0.0)) > 0:
+            score += self.smc_breaker
+        if self.smc_vi and float(bar.get("vi_bearish", 0.0)) > 0:
+            score += self.smc_vi
+        if self.smc_dol_tap and float(bar.get("pdh_tap", 0.0)) > 0:
+            score += self.smc_dol_tap
         return score
 
     def on_bar(self, index: int, bar: pd.Series) -> OrderIntent | None:
