@@ -88,6 +88,27 @@ def test_warmup_logs_when_no_file_configured(tmp_path, caplog) -> None:
     assert any("no replay bars file" in r.message for r in caplog.records)
 
 
+def test_warmup_auto_discovers_pipeline_output(tmp_path, caplog) -> None:
+    """Running the live loop right after the full pipeline must warm up without
+    any SLYTRADE_REPLAY_BARS_FILE — the aligned output is auto-discovered."""
+    import logging
+
+    caplog.set_level(logging.INFO)
+    bars = _m15_bars()
+    aligned_dir = tmp_path / "data" / "processed" / "aligned" / "XAUUSD" / "m15"
+    aligned_dir.mkdir(parents=True)
+    bars.to_parquet(aligned_dir / "bars.parquet")
+
+    loop = _loop(tmp_path)
+    loop.logger.propagate = True
+    loop.settings.data_dir = str(tmp_path / "data")
+    loop.settings.replay_bars_file = None  # nothing configured
+    loop._warmup("XAUUSDm")
+    assert len(loop._window_bars) == len(bars)
+    assert any("auto-discovered" in r.message for r in caplog.records)
+    assert any("warmup loaded" in r.message for r in caplog.records)
+
+
 def test_decision_trace_hold_and_signal(tmp_path) -> None:
     loop = _loop(tmp_path)
     series = pd.Series(

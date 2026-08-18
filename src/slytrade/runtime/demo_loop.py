@@ -243,21 +243,51 @@ class LiveTradingLoop:
                     continue  # skip non-numeric htf columns (e.g. htf_h4_timeframe == "H4")
         return out
 
+    def _discover_replay_bars(self, resolved_symbol: str) -> Path | None:
+        """Find the pipeline's aligned bars file without any configuration.
+
+        ``slytrade full-pipeline`` writes aligned bars to
+        ``data/processed/aligned/<symbol>/<tf>/bars.parquet`` (canonical symbol,
+        lowercase timeframe). When the operator runs the live loop right after
+        the pipeline — as they always should — the warmup must find that file
+        automatically instead of requiring SLYTRADE_REPLAY_BARS_FILE.
+        """
+        base = resolved_symbol.split("m")[0] if resolved_symbol.endswith("m") else resolved_symbol
+        tf = (self.settings.timeframe or "M15").lower()
+        candidates = [
+            Path(self.settings.data_dir) / "processed" / "aligned" / base / tf / "bars.parquet",
+            Path(self.settings.data_dir) / "processed" / "aligned" / resolved_symbol / tf / "bars.parquet",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return None
+
     def _warmup(self, resolved_symbol: str) -> None:
         """Seed the feature window from stored bars before the first streamed bar.
 
         Pre-fills ATR/EMA/H4/D1 context so the champion's gates are warm from
         the first bar instead of cold for the first ``history_bars``. Every
         path logs explicitly — a silent no-op here cost 4 hours of cold H4
-        context once before.
+        context once before. An explicit SLYTRADE_REPLAY_BARS_FILE wins; when
+        unset, the pipeline's aligned output is auto-discovered.
         """
         path = self.settings.replay_bars_file
         if not path:
-            self.logger.warning(
-                "warmup: no replay bars file configured (cold start)",
-                extra={"event": "warmup_none", "hint": "set SLYTRADE_REPLAY_BARS_FILE=data/processed/aligned/XAUUSD/m15/bars.parquet"},
+            discovered = self._discover_replay_bars(resolved_symbol)
+            if discovered is None:
+                self.logger.warning(
+                    "warmup: no replay bars file found (cold start) — run 'slytrade full-pipeline "
+                    f"{resolved_symbol.split('m')[0] if resolved_symbol.endswith('m') else resolved_symbol} "
+                    f"--timeframe {self.settings.timeframe}' first, or set SLYTRADE_REPLAY_BARS_FILE",
+                    extra={"event": "warmup_none", "hint": "run the full pipeline to generate data/processed/aligned/<symbol>/<tf>/bars.parquet"},
+                )
+                return
+            path = str(discovered)
+            self.logger.info(
+                "warmup: auto-discovered bars file",
+                extra={"event": "warmup_discovered", "path": path},
             )
-            return
         try:
             frame = pd.read_parquet(path)
         except Exception as exc_parquet:
@@ -290,8 +320,8 @@ class LiveTradingLoop:
         tail = frame.tail(cap)
         self._window_bars.extend(row.to_dict() for _, row in tail.iterrows())
         self.logger.info(
-            "warmup loaded",
-            extra={"event": "warmup", "bars": len(tail), "first": str(tail["time"].iloc[0]), "last": str(tail["time"].iloc[-1])},
+            f"warmup loaded {len(tail)} bars from {path}",
+            extra={"event": "warmup", "bars": len(tail), "path": path, "first": str(tail["time"].iloc[0]), "last": str(tail["time"].iloc[-1])},
         )
 
     # -- live journal (the bot's memory) --------------------------------------
