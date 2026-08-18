@@ -257,6 +257,39 @@ def persona_signal_columns(bars: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def persona_action_column(bars: pd.DataFrame) -> pd.Series:
+    """The persona-adaptive strategy's STATEFUL per-bar decision (0 hold, 1 long,
+    2 short), computed causally with the validated per-timeframe profile.
+
+    This encodes the part of the champion's edge that a stateless observation
+    cannot: its internal cooldown and side-tracking. Feeding it to the policy
+    turns behavioural cloning from "approximate a stateful rule from a stateless
+    observation" (which under-fits) into "copy a proven decision" — the
+    distillation that actually reproduces the champion.
+    """
+    from slytrade.config.timeframe_profiles import profile_for
+    from slytrade.strategies.personality_adaptive import PersonalityAdaptiveConfig, PersonalityAdaptiveStrategy
+
+    timeframe = str(bars["timeframe"].iloc[0]) if "timeframe" in bars.columns else "H1"
+    profile = profile_for(timeframe)
+    config = PersonalityAdaptiveConfig(
+        point_value=100.0,
+        min_score=profile.min_score,
+        cooldown_bars=profile.cooldown_bars,
+        htf_trend_timeframe=profile.htf_trend_timeframe,
+        require_sweep_reversal=False,
+        require_entry_momentum=True,
+        strict_mtf_direction=True,
+    )
+    strategy = PersonalityAdaptiveStrategy(symbol=str(bars["symbol"].iloc[0]), volume=0.1, config=config)
+    actions = np.zeros(len(bars), dtype=np.float32)
+    for i in range(len(bars)):
+        intent = strategy.on_bar(i, bars.iloc[i])
+        if intent is not None:
+            actions[i] = 1.0 if intent.side.value == "buy" else 2.0
+    return pd.Series(actions, index=bars.index, name="persona_action")
+
+
 def build_rl_dataset(bars: pd.DataFrame, personality: TraderPersonality | None = None) -> RLDataset:
     """Build a raw (unscaled) dataset from validated bars sorted by time.
 
@@ -305,9 +338,11 @@ def build_rl_dataset(bars: pd.DataFrame, personality: TraderPersonality | None =
     # champion trades from, pre-computed causally per bar. Giving the RL this
     # composed signal (instead of expecting a small MLP to re-derive it from
     # 200+ raw columns) turns its job from "rediscover the edge" into "learn
-    # when to filter the edge" — the only RL task that has beaten the champion
-    # on real data.
+    # when to filter the edge". ``persona_action`` additionally carries the
+    # champion's stateful decision (cooldown/side-aware), which is what makes
+    # behavioural cloning actually reproduce the champion.
     frames.append(persona_signal_columns(bars))
+    frames.append(persona_action_column(bars).to_frame().astype(np.float32))
     frames.append(mode.astype(np.float32))
     features = pd.concat(frames, axis=1)
     features = features.fillna(0.0)

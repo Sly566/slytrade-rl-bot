@@ -145,6 +145,74 @@ def resolve_fold_windows(
 
 
 # ---------------------------------------------------------------------------
+# Behavioural cloning: distill the profitable persona into the policy.
+#
+# Raw RL kept failing (in-sample +30%, out-of-sample -62%) because a small MLP
+# cannot rediscover a multi-feature market edge from scratch in 20k steps. The
+# persona already holds the edge. Behavioural cloning pretrains the policy to
+# COPY the persona's decisions (supervised), after which PPO only needs to
+# fine-tune — the standard "imitation -> RL" recipe. No hardcoded trade cap is
+# needed: the policy inherits the persona's selective, dynamic behaviour.
+# ---------------------------------------------------------------------------
+
+
+def persona_actions_for_bars(bars: pd.DataFrame) -> list[int]:
+    """Map the persona-adaptive strategy's decisions to env actions per bar.
+
+    0 = hold, 1 = enter/confirm long, 2 = enter/confirm short. The persona never
+    emits a flatten (managed exits handle that), so the cloned action set is
+    {0, 1, 2}. Uses the SAME validated per-timeframe profile + gates as the
+    backtest champion, so the policy inherits the champion's actual behaviour.
+    """
+    from slytrade.rl.dataset import persona_action_column
+
+    return [int(value) for value in persona_action_column(bars).to_numpy()]
+
+
+def collect_demonstrations(env, actions: list[int]) -> tuple[np.ndarray, np.ndarray]:
+    """Collect (observation, persona action) pairs by stepping the env.
+
+    Observations come from the SAME env used for training, so they are already
+    normalised with the fold's scaler — no leakage, no mismatch.
+    """
+    obs_list: list[np.ndarray] = []
+    act_list: list[int] = []
+    obs, _ = env.reset()
+    obs_list.append(np.asarray(obs, dtype=np.float32))
+    act_list.append(actions[0])
+    for i in range(1, min(len(actions), len(env.bars))):
+        obs, _, terminated, truncated, _ = env.step(actions[i - 1])
+        if terminated or truncated:
+            obs, _ = env.reset()
+        obs_list.append(np.asarray(obs, dtype=np.float32))
+        act_list.append(actions[i])
+    return np.stack(obs_list), np.asarray(act_list, dtype=np.int64)
+
+
+def behavioral_clone(model, obs: np.ndarray, act: np.ndarray, *, epochs: int = 5, lr: float = 1e-3, batch: int = 256) -> None:
+    """Supervised pretrain of the policy network to imitate the persona."""
+    import torch
+
+    policy = model.policy
+    optimizer = torch.optim.Adam(policy.parameters(), lr=lr)
+    loss_fn = torch.nn.CrossEntropyLoss()
+    x = torch.as_tensor(obs, dtype=torch.float32)
+    y = torch.as_tensor(act, dtype=torch.long)
+    n = len(x)
+    for _ in range(epochs):
+        perm = torch.randperm(n)
+        for start in range(0, n, batch):
+            idx = perm[start : start + batch]
+            features = policy.extract_features(x[idx])
+            latent, _ = policy.mlp_extractor(features)
+            logits = policy.action_net(latent)
+            loss = loss_fn(logits, y[idx])
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+
+# ---------------------------------------------------------------------------
 # Training (stable-baselines3, lazy import)
 # ---------------------------------------------------------------------------
 
@@ -190,6 +258,8 @@ def train_ppo(
     verbose: int = 0,
     progress_bar: bool = False,
     n_envs: int = 1,
+    warmstart_persona: bool = False,
+    bc_epochs: int = 5,
 ):
     """Train a PPO policy on the environment. Returns the trained model.
 
@@ -241,6 +311,15 @@ def train_ppo(
             policy_kwargs=policy_kwargs or {},
             verbose=verbose,
         )
+
+    if warmstart_persona and normalized != "lstm":
+        # Behavioural cloning warmstart: copy the profitable persona first, so
+        # PPO only fine-tunes an already-edge-bearing policy (no trade cap, no
+        # overtrading shaping — the policy inherits the persona's selectivity).
+        actions = persona_actions_for_bars(env.bars)
+        observations, demonstrations = collect_demonstrations(env, actions)
+        behavioral_clone(model, observations, demonstrations, epochs=bc_epochs)
+
     model.learn(total_timesteps=total_timesteps, progress_bar=progress_bar)
     if model_dir:
         model.save(model_dir)
@@ -444,6 +523,7 @@ def walk_forward_validation(
     n_seeds: int = 1,
     shaping_enabled: bool = False,
     max_trades_per_episode: int = 0,
+    warmstart_persona: bool = False,
 ) -> pd.DataFrame:
     """Train PPO on each fold's training window, evaluate on its test window.
 
@@ -502,6 +582,7 @@ def walk_forward_validation(
                 policy_type=policy_type,
                 progress_bar=progress_bar,
                 n_envs=n_envs,
+                warmstart_persona=warmstart_persona,
             )
 
             test_env = dataset.env_factory(

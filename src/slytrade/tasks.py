@@ -1077,6 +1077,7 @@ def train(
     n_envs: int = 1,
     shaping: bool = False,
     max_trades_per_episode: int = 0,
+    warmstart: bool = False,
 ) -> TaskResult:
     from slytrade.backtest.reporting import infer_symbol
     from slytrade.progress import info, stage
@@ -1149,6 +1150,7 @@ def train(
                 policy_type=policy,
                 progress_bar=True,
                 n_envs=n_envs,
+                warmstart_persona=warmstart,
             )
         else:
             model = train_policy(algorithm, env, total_timesteps=total_timesteps, seed=seed, policy_type=policy, progress_bar=True)
@@ -1215,6 +1217,7 @@ def walk_forward(
     n_seeds: int = 1,
     shaping: bool = False,
     max_trades_per_episode: int = 0,
+    warmstart: bool = False,
 ) -> TaskResult:
     from slytrade.backtest.reporting import infer_symbol
     from slytrade.progress import info, stage
@@ -1263,6 +1266,7 @@ def walk_forward(
             dataset, folds, total_timesteps=total_timesteps, seed=seed, reward_type=reward, policy_type=policy,
             progress=True, progress_bar=True, n_envs=n_envs, n_seeds=n_seeds,
             shaping_enabled=shaping, max_trades_per_episode=max_trades_per_episode,
+            warmstart_persona=warmstart,
         )
         if len(folds) < 2:
             console.print(

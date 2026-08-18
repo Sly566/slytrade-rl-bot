@@ -546,6 +546,7 @@ def train_rl(
     n_envs: int = typer.Option(1, help="Parallel rollout envs (1 = single process; >1 speeds up PPO data collection)"),
     max_trades_per_episode: int = typer.Option(0, help="Activity brake: max entries per episode (0 = unlimited)"),
     shaping: bool = typer.Option(False, "--shaping/--no-shaping", help="Enable activity-reward shaping (measured to cause overtrading; off by default)"),
+    warmstart: bool = typer.Option(False, "--warmstart/--no-warmstart", help="Behavioural-clone the persona first, then fine-tune (distillation; validated flat OOS, off by default)"),
     symbol: str | None = typer.Option(None, help="Symbol override if the file contains multiple symbols"),
     personality_file: str = typer.Option("configs/trader_personality.yaml", help="Trader personality YAML path"),
 ) -> None:
@@ -570,6 +571,7 @@ def train_rl(
         n_envs=n_envs,
         shaping=shaping,
         max_trades_per_episode=max_trades_per_episode,
+        warmstart=warmstart,
     )
     if not result.ok:
         console.print(f"[red]{result.message}[/red]")
@@ -580,10 +582,10 @@ def train_rl(
 @app.command()
 def walk_forward(
     bars_file: str = typer.Option(..., help="Aligned bars file with decision quote / ICT columns (.csv or .parquet)"),
-    train_window: int = typer.Option(60_000, help="Walk-forward train window (bars)"),
-    validation_window: int = typer.Option(15_000, help="Walk-forward validation window (bars)"),
-    test_window: int = typer.Option(15_000, help="Walk-forward test window (bars)"),
-    embargo: int = typer.Option(500, help="Embargo gap between train/val/test (bars)"),
+    train_window: int = typer.Option(10_000, help="Walk-forward train window (bars)"),
+    validation_window: int = typer.Option(2_000, help="Walk-forward validation window (bars)"),
+    test_window: int = typer.Option(2_000, help="Walk-forward test window (bars)"),
+    embargo: int = typer.Option(200, help="Embargo gap between train/val/test (bars)"),
     step: int | None = typer.Option(None, help="Step between folds (defaults to test_window)"),
     total_timesteps: int = typer.Option(20_000, help="PPO steps per fold"),
     seed: int = typer.Option(42, help="Random seed"),
@@ -594,6 +596,7 @@ def walk_forward(
     n_seeds: int = typer.Option(1, help="Independent PPO seeds per fold (average out-of-sample; >1 kills seed-variance flukes)"),
     max_trades_per_episode: int = typer.Option(0, help="Activity brake: max entries per episode (0 = unlimited)"),
     shaping: bool = typer.Option(False, "--shaping/--no-shaping", help="Enable activity-reward shaping (measured to cause overtrading; off by default)"),
+    warmstart: bool = typer.Option(False, "--warmstart/--no-warmstart", help="Behavioural-clone the persona first, then fine-tune (distillation; validated flat OOS, off by default)"),
     symbol: str | None = typer.Option(None, help="Symbol override if the file contains multiple symbols"),
     personality_file: str = typer.Option("configs/trader_personality.yaml", help="Trader personality YAML path"),
 ) -> None:
@@ -636,6 +639,7 @@ def walk_forward(
         dataset, folds, total_timesteps=total_timesteps, seed=seed, reward_type=reward, policy_type=policy,
         progress=True, progress_bar=True, dynamic_features=dynamic_features, n_envs=n_envs,
         n_seeds=n_seeds, shaping_enabled=shaping, max_trades_per_episode=max_trades_per_episode,
+        warmstart_persona=warmstart,
     )
     console.print(table.to_string(index=False))
 
