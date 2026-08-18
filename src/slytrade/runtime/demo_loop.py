@@ -83,6 +83,9 @@ class DemoTradingLoop:
     _side: str = field(default="flat", init=False)
     _point_value: float = field(default=1.0, init=False)
     _converter: CurrencyConverter = field(default_factory=lambda: CurrencyConverter(1.0), init=False)
+    _window_bars: list[dict[str, Any]] = field(default_factory=list, init=False)
+    _profile: Any = field(default=None, init=False)  # validated timeframe profile
+    _minlot_warned: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
         self.logger = setup_logging(self.settings.log_level, self.settings.log_dir, self.settings.json_logs)
@@ -132,9 +135,120 @@ class DemoTradingLoop:
             expected_positions={},
         )
         self.soak = SoakMonitor(DeploymentStage.SHADOW, min_samples=1, stale_after=timedelta(minutes=5))
+        from slytrade.config.timeframe_profiles import profile_for
+
+        self._profile = profile_for(self.settings.timeframe)
         self.bar_builder = BarBuilder(self.settings.symbol, self.settings.timeframe)
         if self.strategy is None:
-            self.strategy = PersonalityAdaptiveStrategy(symbol=self.settings.symbol, volume=0.1)
+            self.strategy = self._build_champion_strategy()
+
+    # -- strategy / features ---------------------------------------------------
+    def _build_champion_strategy(self) -> PersonalityAdaptiveStrategy:
+        """Build the persona strategy with the VALIDATED champion configuration.
+
+        The live loop must trade the same structure the backtest validated:
+        the per-timeframe profile (min confluence score, cooldown, H4-trend
+        gate, stop/target multiples) plus the footprint gates from
+        configs/risk.yaml. The dataclass defaults are NOT the champion —
+        e.g. ``htf_trend_timeframe`` is None by default, which would silently
+        skip the H4-trend gate that IS the measured edge.
+        """
+        from slytrade.config.timeframe_profiles import profile_for
+        from slytrade.strategies.personality_adaptive import PersonalityAdaptiveConfig
+
+        risk_cfg = load_config(self.settings.config_dir).risk
+        ict = risk_cfg.get("ict", {}) or {}
+        entry = ict.get("entry", {}) or {}
+        profile = profile_for(self.settings.timeframe)
+        symbol = (self.settings.symbol or "XAUUSD").upper()
+        point_value = 100.0 if symbol in ("XAUUSD", "XAGUSD") else 1.0
+        config = PersonalityAdaptiveConfig(
+            min_score=int(entry.get("min_score", profile.min_score)),
+            cooldown_bars=int(entry.get("cooldown_bars", profile.cooldown_bars)),
+            require_sweep_reversal=bool(entry.get("require_sweep_reversal", False)),
+            sweep_reversal_window=int(entry.get("sweep_reversal_window", 12)),
+            require_entry_momentum=bool(entry.get("require_entry_momentum", True)),
+            strict_mtf_direction=bool(entry.get("strict_mtf_direction", True)),
+            max_spread=(float(entry["max_spread"]) if entry.get("max_spread") is not None else None),
+            htf_trend_timeframe=(
+                str(entry["htf_trend_timeframe"]) if entry.get("htf_trend_timeframe") else profile.htf_trend_timeframe
+            ),
+            smc_displacement=int(entry.get("smc_displacement", 0)),
+            smc_ifvg=int(entry.get("smc_ifvg", 0)),
+            smc_breaker=int(entry.get("smc_breaker", 0)),
+            smc_vi=int(entry.get("smc_vi", 0)),
+            smc_dol_tap=int(entry.get("smc_dol_tap", 0)),
+            point_value=point_value,
+        )
+        return PersonalityAdaptiveStrategy(symbol=self.settings.symbol, volume=0.1, config=config)
+
+    def _higher_timeframe_features(self, frame: pd.DataFrame) -> dict[str, float]:
+        """Resample the rolling window to H4/D1 and merge higher-TF features.
+
+        Produces the ``htf_*`` columns plus ``mtf_bias`` / ``mtf_confluence_score``
+        that activate the champion's H4-trend alignment gate — the validated edge.
+        Returns {} while the window is too short to form a higher-TF bar.
+        """
+        if len(frame) < 2 or "time" not in frame.columns:
+            return {}
+        try:
+            from slytrade.data.resample import resample_bars_to_timeframe
+            from slytrade.features.mtf import compute_mtf_ict_features
+
+            higher = {
+                tf: df
+                for tf, df in (
+                    ("H4", resample_bars_to_timeframe(frame, "H4")),
+                    ("D1", resample_bars_to_timeframe(frame, "D1")),
+                )
+                if not df.empty
+            }
+            if not higher:
+                return {}
+            merged = compute_mtf_ict_features(frame, higher)
+        except Exception:  # pragma: no cover - feature degradation must never crash the loop
+            return {}
+        last = merged.iloc[-1]
+        out: dict[str, float] = {}
+        for column in merged.columns:
+            if column.startswith("htf_") or column in ("mtf_bias", "mtf_confluence_score"):
+                value = last[column]
+                if pd.isna(value):
+                    out[column] = 0.0
+                    continue
+                try:
+                    out[column] = float(value)
+                except (TypeError, ValueError):
+                    continue  # skip non-numeric htf columns (e.g. htf_h4_timeframe == "H4")
+        return out
+
+    def _warmup(self, resolved_symbol: str) -> None:
+        """Seed the feature window from stored bars before the first streamed bar.
+
+        Pre-fills ATR/EMA/H4/D1 context so the champion's gates are warm from
+        the first bar instead of cold for the first ``history_bars``.
+        """
+        path = self.settings.replay_bars_file
+        if not path:
+            return
+        try:
+            frame = pd.read_parquet(path)
+        except Exception:
+            try:
+                frame = pd.read_csv(path)
+            except Exception as exc:  # pragma: no cover
+                self.logger.warning("warmup skipped", extra={"event": "warmup_skip", "reason": str(exc)})
+                return
+        if frame is None or frame.empty:
+            return
+        if "symbol" in frame.columns:
+            frame = frame[frame["symbol"].astype(str) == resolved_symbol]
+        if frame.empty:
+            return
+        frame = frame.sort_values("time")
+        cap = max(64, int(self.settings.history_bars))
+        self._window_bars.extend(row.to_dict() for _, row in frame.tail(cap).iterrows())
+        self.logger.info("warmup loaded", extra={"event": "warmup", "bars": len(frame.tail(cap))})
 
     # -- main ------------------------------------------------------------------
     def run(self, *, max_bars: int | None = None, max_seconds: float = 0.0) -> DemoLoopSummary:
@@ -144,6 +258,7 @@ class DemoTradingLoop:
 
         self.adapter.connect()
         resolved = self.adapter.resolve_symbol(self.settings.symbol)
+        self._warmup(resolved)
         try:
             spec = self.adapter.symbol_spec(resolved)
             self._point_value = spec.point_value_per_price_unit
@@ -229,6 +344,23 @@ class DemoTradingLoop:
             self.logger.info("entry paused", extra={"event": "paused", "reason": decision.reason})
             return
 
+        self._window_bars.append(bar)
+        cap = max(64, int(self.settings.history_bars))
+        if len(self._window_bars) > cap:
+            self._window_bars.pop(0)
+
+        # Derive the live side from the BROKER (server-side SL/TP closes the
+        # position), and notify the strategy when a position closes so its own
+        # ``_side`` state resets — otherwise it would never re-enter the same
+        # direction, which the validated champion does (up to 69 in a row).
+        held = self._current_positions(resolved_symbol).get(resolved_symbol, 0.0)
+        side = "long" if held > 0 else ("short" if held < 0 else "flat")
+        if side == "flat" and self._side != "flat":
+            hook = getattr(self.strategy, "on_position_closed", None)
+            if hook is not None:
+                hook()
+        self._side = side
+
         if self._side == "flat":
             series = self._decision_series(bar)
             intent = self.strategy.on_bar(self._bar_index, series)
@@ -249,32 +381,69 @@ class DemoTradingLoop:
     def _decision_series(self, bar: dict[str, Any]) -> pd.Series:
         from slytrade.features.ict import compute_ict_features
 
-        frame = pd.DataFrame([bar])
+        if len(self._window_bars) < 2:
+            frame = pd.DataFrame([bar])
+        else:
+            frame = pd.DataFrame(self._window_bars)
         features = compute_ict_features(frame)
-        series = pd.Series(bar, dtype=object)
         last = features.iloc[-1]
+        series = pd.Series(bar, dtype=object)
         for column in features.columns:
             if column not in ("time", "symbol", "timeframe"):
                 series[column] = last[column]
+        # H4/D1 context so the champion's H4-trend alignment gate fires live
+        # exactly as it does in the validated backtest.
+        for column, value in self._higher_timeframe_features(frame).items():
+            series[column] = value
         series["quote_is_fresh"] = True
         series["quote_spread"] = float(bar.get("quote_spread", 0.0))
         return series
 
     def _sized_intent(self, intent: OrderIntent, bar: pd.Series, quote: Quote) -> OrderIntent:
         atr = float(bar.get("atr", 0.0) or 0.0)
-        stop_distance = max(atr, 0.10)
+        if atr <= 0:
+            # Cold start: the rolling window is too short for a real ATR, so
+            # estimate from the bar range (mirrors the RL env) instead of
+            # falling back to the $0.10 floor, which would stop out instantly.
+            high = float(bar.get("high", quote.mid) or quote.mid)
+            low = float(bar.get("low", quote.mid) or quote.mid)
+            atr = max(high - low, quote.mid * 0.0005)
+        profile = self._profile
+        # The champion's validated exit structure (M15 = 1xATR stop, 3xATR
+        # target). The 0.10 floor is a minimum absolute stop for thin markets.
+        stop_distance = max(atr * profile.stop_loss_atr, 0.10)
+        target_distance = atr * profile.take_profit_atr if atr > 0 else 2 * stop_distance
         # Convert account equity to USD before risk sizing (GAP-3): a ZAR
         # account's raw equity would otherwise undersize/oversize positions.
         equity = self._equity_usd()
+        risk_per_trade = self.breaker.limits.risk_per_trade
         volume = risk_based_volume(
             equity,
             stop_distance,
-            risk_per_trade=self.breaker.limits.risk_per_trade,
+            risk_per_trade=risk_per_trade,
             point_value=self._point_value,
             volume_max=self.guardrails.config.max_position_volume,
         )
         if volume <= 0:
             volume = intent.volume
+        # Honest small-account warning: when the broker's minimum lot already
+        # risks several times the configured budget, the min lot wins and each
+        # trade risks more than risk_per_trade. Log it once, never block it.
+        if not self._minlot_warned and equity > 0 and volume > 0:
+            implied_risk = volume * stop_distance * self._point_value
+            budget = equity * risk_per_trade
+            if budget > 0 and implied_risk > 2.0 * budget:
+                self._minlot_warned = True
+                self.alerter.alert(
+                    "warning",
+                    "min-lot risk exceeds budget",
+                    f"min lot {volume} risks ~${implied_risk:.2f} vs budget ${budget:.2f} ({risk_per_trade:.1%}); "
+                    "consider a larger demo balance to match the validated 0.5% risk/trade",
+                )
+                self.logger.warning(
+                    "min-lot risk exceeds budget",
+                    extra={"event": "minlot_warn", "implied_usd": implied_risk, "budget_usd": budget},
+                )
         # Margin guard (GAP-7): never enter a position the account cannot
         # comfortably margin.
         if not self._margin_ok(intent.symbol, volume):
@@ -284,7 +453,7 @@ class DemoTradingLoop:
                 symbol=intent.symbol, side=intent.side, volume=0.0, reason=intent.reason
             )
         sl = round(quote.mid - stop_distance, 5) if intent.side == Side.BUY else round(quote.mid + stop_distance, 5)
-        tp = round(quote.mid + 2 * stop_distance, 5) if intent.side == Side.BUY else round(quote.mid - 2 * stop_distance, 5)
+        tp = round(quote.mid + target_distance, 5) if intent.side == Side.BUY else round(quote.mid - target_distance, 5)
         return OrderIntent(
             symbol=intent.symbol,
             side=intent.side,
