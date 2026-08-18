@@ -112,6 +112,16 @@ class RLEnvironmentConfig:
     entry_quality_bonus: float = 0.05
     low_quality_entry_penalty: float = 0.05
     missed_setup_regret: float = 0.05
+    # Shaping master switch. The bonus/penalty/regret terms reward ACTIVITY,
+    # and measured on real data they drove the agent to overtrade (~150 trades
+    # per episode) and lose ~0.5R/trade with no directional edge — the exact
+    # "in-sample +30%, out-of-sample -62%" signature. OFF by default so
+    # r_multiple is pure realised R minus the true opening cost.
+    shaping_enabled: bool = False
+    # Activity brake: hard cap on entries per episode (0 = unlimited). Past the
+    # cap the agent may only hold or flatten — it can never open new risk. A
+    # sane value forces the agent to pick its best few setups, like a pro.
+    max_trades_per_episode: int = 0
 
 
 if gym is not None:
@@ -179,6 +189,7 @@ if gym is not None:
             self._last_exit_price = 0.0
             self._closed_r = []
             self._regret_charged = False
+            self._entries_this_episode = 0
             self.ledger.records.clear()
             return self._observation(), {}
 
@@ -199,6 +210,16 @@ if gym is not None:
                 target = -1
             elif action == 3:
                 target = 0
+            # Activity brake: past the entry cap the agent may only hold or
+            # flatten — it can never open new risk. This forces the policy to
+            # spend its scarce entries on its best setups instead of churning.
+            if (
+                target != 0
+                and (old_position == 0 or target != old_position)
+                and self.config.max_trades_per_episode > 0
+                and self._entries_this_episode >= self.config.max_trades_per_episode
+            ):
+                target = old_position
             turnover = abs(target - old_position)
 
             previous_equity = self._equity
@@ -327,24 +348,26 @@ if gym is not None:
             return realized
 
         def _r_multiple_reward(self, decision_bar: pd.Series, *, opened: bool) -> float:
-            """Production reward: realised R + ICT-footprint shaping.
+            """Production reward: realised R minus the true opening cost.
 
-            * realised R on every closure (sparse, risk-normalised),
-            * entry-quality shaping: +bonus for high-confluence entries,
-              −penalty for low-confluence entries,
-            * missed-setup regret: a small −R when a high-confluence setup
-              prints and the agent stays flat (kills the "never trade" trap).
+            With ``shaping_enabled`` it additionally adds entry-quality shaping
+            (+bonus for high-confluence entries, −penalty for low-quality ones,
+            −regret for staying flat on a setup). That shaping rewards activity,
+            so it is OFF by default: the default reward is purely the realised
+            R of closed legs minus the actual opening cost in R — the only terms
+            that correspond to money in the account.
             """
             from slytrade.rl.rewards import opening_cost_r
 
             reward = float(sum(self._closed_r))
 
             if opened:
-                score = self._setup_score(decision_bar)
-                if score >= self.config.setup_score_threshold:
-                    reward += self.config.entry_quality_bonus
-                else:
-                    reward -= self.config.low_quality_entry_penalty
+                if self.config.shaping_enabled:
+                    score = self._setup_score(decision_bar)
+                    if score >= self.config.setup_score_threshold:
+                        reward += self.config.entry_quality_bonus
+                    else:
+                        reward -= self.config.low_quality_entry_penalty
                 reward -= opening_cost_r(
                     self.config.transaction_cost,
                     self._entry_price if self._entry_price > 0 else float(decision_bar["close"]),
@@ -354,7 +377,7 @@ if gym is not None:
                 return reward
 
             # Flat: opportunity-cost regret for ignoring a high-confluence setup.
-            if self._position == 0:
+            if self._position == 0 and self.config.shaping_enabled:
                 score = self._setup_score(decision_bar)
                 if score >= self.config.setup_score_threshold:
                     if not self._regret_charged:
@@ -435,6 +458,7 @@ if gym is not None:
             return realized, exit_price
 
         def _record_entry(self, direction: int, price: float, bar: pd.Series) -> None:
+            self._entries_this_episode += 1
             intent = OrderIntent(
                 symbol=str(bar["symbol"]),
                 side=Side.BUY if direction > 0 else Side.SELL,

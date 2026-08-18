@@ -544,6 +544,8 @@ def train_rl(
     gae_lambda: float = typer.Option(0.95, help="PPO GAE lambda"),
     model_dir: str = typer.Option("models/rl", help="Directory to save the trained policy"),
     n_envs: int = typer.Option(1, help="Parallel rollout envs (1 = single process; >1 speeds up PPO data collection)"),
+    max_trades_per_episode: int = typer.Option(0, help="Activity brake: max entries per episode (0 = unlimited)"),
+    shaping: bool = typer.Option(False, "--shaping/--no-shaping", help="Enable activity-reward shaping (measured to cause overtrading; off by default)"),
     symbol: str | None = typer.Option(None, help="Symbol override if the file contains multiple symbols"),
     personality_file: str = typer.Option("configs/trader_personality.yaml", help="Trader personality YAML path"),
 ) -> None:
@@ -566,6 +568,8 @@ def train_rl(
         reward=reward,
         artifacts_dir=model_dir,
         n_envs=n_envs,
+        shaping=shaping,
+        max_trades_per_episode=max_trades_per_episode,
     )
     if not result.ok:
         console.print(f"[red]{result.message}[/red]")
@@ -587,6 +591,9 @@ def walk_forward(
     policy: str = typer.Option("mlp", help="Policy network: mlp or lstm"),
     dynamic_features: bool = typer.Option(True, "--dynamic-features/--no-dynamic-features", help="Footprint-driven per-fold feature selection"),
     n_envs: int = typer.Option(1, help="Parallel rollout envs (1 = single process; >1 speeds up PPO data collection)"),
+    n_seeds: int = typer.Option(1, help="Independent PPO seeds per fold (average out-of-sample; >1 kills seed-variance flukes)"),
+    max_trades_per_episode: int = typer.Option(0, help="Activity brake: max entries per episode (0 = unlimited)"),
+    shaping: bool = typer.Option(False, "--shaping/--no-shaping", help="Enable activity-reward shaping (measured to cause overtrading; off by default)"),
     symbol: str | None = typer.Option(None, help="Symbol override if the file contains multiple symbols"),
     personality_file: str = typer.Option("configs/trader_personality.yaml", help="Trader personality YAML path"),
 ) -> None:
@@ -628,6 +635,7 @@ def walk_forward(
     table = walk_forward_validation(
         dataset, folds, total_timesteps=total_timesteps, seed=seed, reward_type=reward, policy_type=policy,
         progress=True, progress_bar=True, dynamic_features=dynamic_features, n_envs=n_envs,
+        n_seeds=n_seeds, shaping_enabled=shaping, max_trades_per_episode=max_trades_per_episode,
     )
     console.print(table.to_string(index=False))
 

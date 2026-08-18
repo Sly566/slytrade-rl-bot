@@ -84,7 +84,7 @@ def test_r_multiple_rewards_managed_tp() -> None:
 
 def test_r_multiple_charges_regret_when_flat_on_setup() -> None:
     bars = make_bars(60, setup=True)
-    env = make_env(bars)
+    env = make_env(bars, shaping_enabled=True)
     env.reset()
     # Stay flat on a high-confluence setup → regret charges once.
     rewards = []
@@ -93,6 +93,17 @@ def test_r_multiple_charges_regret_when_flat_on_setup() -> None:
         rewards.append(reward)
     assert any(r < 0 for r in rewards)
     assert sum(rewards) < 0
+
+
+def test_r_multiple_default_no_shaping_no_regret() -> None:
+    # Shaping is OFF by default (it taught the agent to overtrade). Flat on a
+    # high-confluence setup must therefore yield zero reward, not regret.
+    bars = make_bars(60, setup=True)
+    env = make_env(bars)  # default: shaping_enabled=False
+    env.reset()
+    for _ in range(5):
+        _, reward, _, _, _ = env.step(0)
+        assert reward == 0.0
 
 
 def test_r_multiple_no_regret_without_setup() -> None:
@@ -106,7 +117,7 @@ def test_r_multiple_no_regret_without_setup() -> None:
 
 def test_r_multiple_entry_quality_bonus_on_high_setup() -> None:
     bars = make_bars(200, setup=True)
-    env = make_env(bars)
+    env = make_env(bars, shaping_enabled=True)
     env.reset()
     _, reward, _, _, _ = env.step(1)  # enter long on a high-confluence setup
     # Entry shaping: bonus for quality setup (minus opening cost) > 0.

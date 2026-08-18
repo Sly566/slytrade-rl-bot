@@ -441,6 +441,9 @@ def walk_forward_validation(
     dynamic_features: bool = True,
     correlation_threshold: float = 0.92,
     n_envs: int = 1,
+    n_seeds: int = 1,
+    shaping_enabled: bool = False,
+    max_trades_per_episode: int = 0,
 ) -> pd.DataFrame:
     """Train PPO on each fold's training window, evaluate on its test window.
 
@@ -448,11 +451,21 @@ def walk_forward_validation(
     only (no leakage). With ``dynamic_features`` the observation is restricted
     to the footprint-significant columns for that fold; the count emerges from
     the data (threshold-free shadow significance), never from a hardcoded size.
+
+    ``n_seeds > 1`` trains that many independent policies per fold (different
+    seeds) and reports the AVERAGE out-of-sample result. A single PPO run on a
+    noisy reward has huge seed variance — the champion-vs-RL decision should
+    never hinge on one random draw.
     """
     from slytrade.rl.environment import RLEnvironmentConfig
 
     rows: list[dict] = []
-    env_config = RLEnvironmentConfig(seed=seed, reward_type=reward_type)
+    env_config = RLEnvironmentConfig(
+        seed=seed,
+        reward_type=reward_type,
+        shaping_enabled=shaping_enabled,
+        max_trades_per_episode=max_trades_per_episode,
+    )
 
     for index, fold in enumerate(folds):
         if progress:
@@ -468,32 +481,41 @@ def walk_forward_validation(
                 from slytrade.progress import info as _info
 
                 _info(f"  selected {len(selected)}/{len(dataset.features.columns)} features (footprint significance)")
-        train_env = dataset.env_factory(
-            fold.train_start,
-            fold.train_end,
-            seed=seed + fold.index,
-            scaler_params=scaler_params,
-            config=env_config,
-            feature_columns=selected,
-        )
-        model = train_ppo(
-            train_env,
-            total_timesteps=total_timesteps,
-            seed=seed + fold.index,
-            policy_type=policy_type,
-            progress_bar=progress_bar,
-            n_envs=n_envs,
-        )
 
-        test_env = dataset.env_factory(
-            fold.test_start,
-            fold.test_end,
-            seed=seed + fold.index,
-            scaler_params=scaler_params,
-            config=env_config,
-            feature_columns=selected,
-        )
-        results = evaluate_ppo(model, test_env, episodes=3, seed=seed + fold.index)
+        seed_returns: list[float] = []
+        seed_trades: list[float] = []
+        seed_drawdowns: list[float] = []
+        for seed_index in range(max(1, n_seeds)):
+            run_seed = seed + fold.index + seed_index * 1000
+            train_env = dataset.env_factory(
+                fold.train_start,
+                fold.train_end,
+                seed=run_seed,
+                scaler_params=scaler_params,
+                config=env_config,
+                feature_columns=selected,
+            )
+            model = train_ppo(
+                train_env,
+                total_timesteps=total_timesteps,
+                seed=run_seed,
+                policy_type=policy_type,
+                progress_bar=progress_bar,
+                n_envs=n_envs,
+            )
+
+            test_env = dataset.env_factory(
+                fold.test_start,
+                fold.test_end,
+                seed=run_seed,
+                scaler_params=scaler_params,
+                config=env_config,
+                feature_columns=selected,
+            )
+            results = evaluate_ppo(model, test_env, episodes=3, seed=run_seed)
+            seed_returns.append(float(results["mean_total_return"]))
+            seed_trades.append(float(results["mean_n_trades"]))
+            seed_drawdowns.append(float(results["mean_max_drawdown"]))
 
         row = {
             "fold": fold.index,
@@ -501,9 +523,9 @@ def walk_forward_validation(
             "train_end": fold.train_end,
             "test_start": fold.test_start,
             "test_end": fold.test_end,
-            "test_mean_total_return": results["mean_total_return"],
-            "test_mean_n_trades": results["mean_n_trades"],
-            "test_mean_max_drawdown": results["mean_max_drawdown"],
+            "test_mean_total_return": float(np.mean(seed_returns)),
+            "test_mean_n_trades": float(np.mean(seed_trades)),
+            "test_mean_max_drawdown": float(np.mean(seed_drawdowns)),
         }
         rows.append(row)
 

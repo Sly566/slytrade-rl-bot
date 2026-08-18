@@ -206,6 +206,57 @@ class RLDataset:
         return selection.selected
 
 
+def _num(bars: pd.DataFrame, column: str) -> pd.Series:
+    if column in bars.columns:
+        return pd.to_numeric(bars[column], errors="coerce").fillna(0.0)
+    return pd.Series(0.0, index=bars.index)
+
+
+def persona_signal_columns(bars: pd.DataFrame) -> pd.DataFrame:
+    """The persona-adaptive strategy's confluence score, pre-computed per bar.
+
+    Mirrors ``SlyTradeRLEnvironment._setup_score`` / ``ICTConfluenceStrategy``
+    exactly (BOS ±2, CHOCH ±1, sweep ±1, FVG ±1, order block ±1, premium/
+    discount ±1, trend ±1), causally. ``persona_score`` is max(long, short);
+    ``persona_bias`` is sign(long − short) — the direction a pro would take.
+    """
+    bos = _num(bars, "bos_dir").to_numpy(dtype=float)
+    choch = _num(bars, "choch_dir").to_numpy(dtype=float)
+    sweep = _num(bars, "liquidity_sweep").to_numpy(dtype=float)
+    fvg_bull = _num(bars, "fvg_bullish").to_numpy(dtype=float)
+    fvg_bear = _num(bars, "fvg_bearish").to_numpy(dtype=float)
+    ob_bull = _num(bars, "order_block_bullish").to_numpy(dtype=float)
+    ob_bear = _num(bars, "order_block_bearish").to_numpy(dtype=float)
+    pd_ = _num(bars, "premium_discount").to_numpy(dtype=float)
+    trend = _num(bars, "trend_strength").to_numpy(dtype=float)
+
+    long_score = (
+        (bos > 0) * 2.0
+        + (choch > 0)
+        + (sweep < 0)
+        + (fvg_bull > 0)
+        + (ob_bull > 0)
+        + (pd_ <= -0.15)
+        + (trend > 0)
+    )
+    short_score = (
+        (bos < 0) * 2.0
+        + (choch < 0)
+        + (sweep > 0)
+        + (fvg_bear > 0)
+        + (ob_bear > 0)
+        + (pd_ >= 0.15)
+        + (trend < 0)
+    )
+    return pd.DataFrame(
+        {
+            "persona_score": np.maximum(long_score, short_score).astype(np.float32),
+            "persona_bias": np.sign(long_score - short_score).astype(np.float32),
+        },
+        index=bars.index,
+    )
+
+
 def build_rl_dataset(bars: pd.DataFrame, personality: TraderPersonality | None = None) -> RLDataset:
     """Build a raw (unscaled) dataset from validated bars sorted by time.
 
@@ -250,6 +301,13 @@ def build_rl_dataset(bars: pd.DataFrame, personality: TraderPersonality | None =
         adopted_frame = bars[adopted].reset_index(drop=True)
         adopted_frame = adopted_frame.apply(pd.to_numeric, errors="coerce").astype(np.float32)
         frames.append(adopted_frame)
+    # Persona confluence signal: the SAME score + direction the rule-based
+    # champion trades from, pre-computed causally per bar. Giving the RL this
+    # composed signal (instead of expecting a small MLP to re-derive it from
+    # 200+ raw columns) turns its job from "rediscover the edge" into "learn
+    # when to filter the edge" — the only RL task that has beaten the champion
+    # on real data.
+    frames.append(persona_signal_columns(bars))
     frames.append(mode.astype(np.float32))
     features = pd.concat(frames, axis=1)
     features = features.fillna(0.0)

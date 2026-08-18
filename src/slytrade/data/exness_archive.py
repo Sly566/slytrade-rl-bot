@@ -80,15 +80,18 @@ def parse_exness_timestamps(values: pd.Series) -> pd.Series:
         return pd.to_datetime(values, utc=True, errors="coerce")
     total = len(values)
 
-    # Fast path for the real archive layout ("YYYY-MM-DD HH:MM:SS.mmmZ"): the
-    # trailing "Z" is what trips pandas' inference on some versions. Detect it
-    # on the first row, strip it with the C-level rstrip (no regex), and parse
-    # plain ISO-8601 on the vectorized path (~3M rows/s vs ~300k via dateutil).
+    # Fast path for the real archive layout ("YYYY-MM-DD HH:MM:SS.mmmZ"). The
+    # trailing "Z" AND the space separator trip pandas' inference on some
+    # versions (falling back to per-element dateutil — minutes for a 40M-tick
+    # month). Strip the "Z" with the C-level rstrip, then parse with an
+    # EXPLICIT format so every pandas version takes the vectorized path.
     head = values.iloc[0]
     if isinstance(head, str) and head.rstrip().endswith(("Z", "z")):
-        parsed = pd.to_datetime(values.str.rstrip("Zz"), utc=True, errors="coerce")
-        if float(parsed.notna().sum()) >= total * 0.995:
-            return parsed
+        stripped = values.str.rstrip("Zz")
+        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+            parsed = pd.to_datetime(stripped, utc=True, errors="coerce", format=fmt)
+            if float(parsed.notna().sum()) >= total * 0.995:
+                return parsed
 
     for fmt in _EXNESS_TIME_FORMATS:
         parsed = pd.to_datetime(values, utc=True, errors="coerce", format=fmt)

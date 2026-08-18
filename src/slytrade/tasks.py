@@ -1075,6 +1075,8 @@ def train(
     artifacts_dir: str | Path = "models/artifacts",
     registry_path: str | Path = "models/registry.jsonl",
     n_envs: int = 1,
+    shaping: bool = False,
+    max_trades_per_episode: int = 0,
 ) -> TaskResult:
     from slytrade.backtest.reporting import infer_symbol
     from slytrade.progress import info, stage
@@ -1118,6 +1120,10 @@ def train(
     except ImportError as exc:
         return TaskResult(False, f"RL dependencies not installed: {exc}")
     env.config = _with_reward(env.config, reward)
+    # Reward shaping off by default (it taught overtrading); activity brake.
+    from dataclasses import replace as _replace
+
+    env.config = _replace(env.config, shaping_enabled=shaping, max_trades_per_episode=max_trades_per_episode)
     info(f"reward: {reward} | managed exits: {env.config.use_managed_exits} "
          f"(SL {env.config.stop_loss_atr}×ATR, TP {env.config.take_profit_atr}×ATR) | "
          f"episode length: {env.config.episode_length_bars} bars")
@@ -1206,6 +1212,9 @@ def walk_forward(
     reward: str = "r_multiple",
     policy: str = "mlp",
     n_envs: int = 1,
+    n_seeds: int = 1,
+    shaping: bool = False,
+    max_trades_per_episode: int = 0,
 ) -> TaskResult:
     from slytrade.backtest.reporting import infer_symbol
     from slytrade.progress import info, stage
@@ -1252,7 +1261,8 @@ def walk_forward(
         info(f"{len(folds)} folds · reward={reward} · policy={policy} · {total_timesteps} steps/fold")
         table = walk_forward_validation(
             dataset, folds, total_timesteps=total_timesteps, seed=seed, reward_type=reward, policy_type=policy,
-            progress=True, progress_bar=True, n_envs=n_envs,
+            progress=True, progress_bar=True, n_envs=n_envs, n_seeds=n_seeds,
+            shaping_enabled=shaping, max_trades_per_episode=max_trades_per_episode,
         )
         if len(folds) < 2:
             console.print(
