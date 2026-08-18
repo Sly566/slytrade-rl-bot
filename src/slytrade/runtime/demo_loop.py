@@ -34,7 +34,7 @@ import pandas as pd
 from slytrade.backtest.execution import Quote
 from slytrade.core.config import load_config
 from slytrade.currency import CurrencyConverter, load_converter
-from slytrade.execution.models import OrderIntent, OrderStatus, Side
+from slytrade.execution.models import OrderIntent, OrderKind, OrderStatus, Side
 from slytrade.execution.oms import OrderManagementSystem
 from slytrade.monitoring.gates import DeploymentStage
 from slytrade.monitoring.operations import SoakMonitor
@@ -97,6 +97,7 @@ class LiveTradingLoop:
     _profile: Any = field(default=None, init=False)  # validated timeframe profile
     _minlot_warned: bool = field(default=False, init=False)
     _journal_open: dict[str, Any] | None = field(default=None, init=False)
+    _pending_limit: dict[str, Any] | None = field(default=None, init=False)  # working limit order
 
     def __post_init__(self) -> None:
         self.logger = setup_logging(self.settings.log_level, self.settings.log_dir, self.settings.json_logs)
@@ -189,6 +190,7 @@ class LiveTradingLoop:
             smc_breaker=int(entry.get("smc_breaker", 0)),
             smc_vi=int(entry.get("smc_vi", 0)),
             smc_dol_tap=int(entry.get("smc_dol_tap", 0)),
+            limit_entry_atr=float(entry.get("limit_entry_atr", 0.0) or 0.0),
             point_value=point_value,
         )
         return PersonalityAdaptiveStrategy(symbol=self.settings.symbol, volume=0.1, config=config)
@@ -289,7 +291,7 @@ class LiveTradingLoop:
                 "time": pd.Timestamp(quote.time).isoformat(),
                 "symbol": sized.symbol,
                 "side": "buy" if sized.side == Side.BUY else "sell",
-                "entry": float(quote.mid),
+                "entry": float(sized.limit_price) if sized.kind == OrderKind.LIMIT and sized.limit_price is not None else float(quote.mid),
                 "stop": float(sized.stop_loss or 0.0),
                 "target": float(sized.take_profit or 0.0),
                 "volume": float(sized.volume),
@@ -473,6 +475,25 @@ class LiveTradingLoop:
             self._journal_exit(resolved_symbol, bar, quote)
         self._side = side
 
+        # Working limit order: the broker fills it into a position, or it sits
+        # until its hold window expires and we cancel it. Never stack a second
+        # order while one is resting.
+        if self._pending_limit is not None:
+            if side != "flat":
+                # The broker filled our limit — a position now exists.
+                self._journal_entry_from_pending(resolved_symbol, quote)
+                self._pending_limit = None
+                return
+            self._pending_limit["bars"] = int(self._pending_limit.get("bars", 0)) + 1
+            ttl = int(self._profile.max_bars_in_trade or 60)
+            if self._pending_limit["bars"] >= ttl:
+                self._cancel_pending(resolved_symbol)
+                self._pending_limit = None
+                hook = getattr(self.strategy, "on_position_closed", None)
+                if hook is not None:
+                    hook()  # let the champion try again on a fresh setup
+            return
+
         if self._side == "flat":
             series = self._decision_series(bar)
             intent = self.strategy.on_bar(self._bar_index, series)
@@ -487,9 +508,48 @@ class LiveTradingLoop:
                 self._side = "long" if sized.side == Side.BUY else "short"
                 self._journal_entry(series, sized, quote)
                 self.logger.info("live order filled", extra={"event": "live_fill", "order_id": sized.client_order_id})
+            elif sized.kind == OrderKind.LIMIT and report.status == OrderStatus.ACCEPTED:
+                self._pending_limit = {
+                    "symbol": sized.symbol,
+                    "side": sized.side.value,
+                    "entry": float(sized.limit_price or quote.mid),
+                    "volume": sized.volume,
+                    "bars": 0,
+                    "ticket": report.broker_order_id,
+                    "features": {c: self._journal_feature(series, c) for c in
+                                 ("persona_score", "persona_bias", "bos_dir", "choch_dir", "liquidity_sweep",
+                                  "premium_discount", "trend_strength", "htf_h4_bos_dir", "mtf_bias")},
+                }
+                self.logger.info("limit order resting", extra={"event": "limit_resting",
+                                                               "price": sized.limit_price, "ticket": report.broker_order_id})
             elif report.status == OrderStatus.REJECTED:
                 self.logger.warning("live order rejected", extra={"event": "live_reject", "reason": report.message})
                 self.alerter.alert("warning", "live order rejected", report.message)
+
+    def _cancel_pending(self, resolved_symbol: str) -> None:
+        """Cancel the resting limit order once its hold window has elapsed."""
+        ticket = (self._pending_limit or {}).get("ticket")
+        if ticket:
+            try:
+                cancel = getattr(self.adapter, "cancel_order", None)
+                if cancel is not None:
+                    cancel(int(ticket))
+            except Exception as exc:  # pragma: no cover - broker dependent
+                self.logger.warning("limit cancel failed", extra={"event": "limit_cancel_fail", "reason": str(exc)})
+        self.logger.info("limit order cancelled (expired)", extra={"event": "limit_expired", "symbol": resolved_symbol})
+
+    def _journal_entry_from_pending(self, resolved_symbol: str, quote: Quote) -> None:
+        """Journal a broker-filled limit entry (fill price = the resting limit)."""
+        pending = self._pending_limit
+        if pending is None:
+            return
+        side = Side.BUY if pending["side"] == "buy" else Side.SELL
+        sized = OrderIntent(
+            symbol=resolved_symbol, side=side, volume=float(pending["volume"]),
+            limit_price=float(pending["entry"]), stop_loss=0.0, take_profit=0.0, reason="persona_limit_fill",
+        )
+        features = pd.Series(pending.get("features", {}), dtype=object)
+        self._journal_entry(features, sized, quote)
 
     def _decision_series(self, bar: dict[str, Any]) -> pd.Series:
         from slytrade.features.ict import compute_ict_features
@@ -565,12 +625,21 @@ class LiveTradingLoop:
             return OrderIntent(
                 symbol=intent.symbol, side=intent.side, volume=0.0, reason=intent.reason
             )
-        sl = round(quote.mid - stop_distance, 5) if intent.side == Side.BUY else round(quote.mid + stop_distance, 5)
-        tp = round(quote.mid + target_distance, 5) if intent.side == Side.BUY else round(quote.mid - target_distance, 5)
+        # Entry reference: a resting limit fills at its limit price, a market
+        # order at the quote mid — SL/TP must be anchored to THAT price.
+        entry_ref = (
+            float(intent.limit_price)
+            if intent.kind == OrderKind.LIMIT and intent.limit_price is not None
+            else float(quote.mid)
+        )
+        sl = round(entry_ref - stop_distance, 5) if intent.side == Side.BUY else round(entry_ref + stop_distance, 5)
+        tp = round(entry_ref + target_distance, 5) if intent.side == Side.BUY else round(entry_ref - target_distance, 5)
         return OrderIntent(
             symbol=intent.symbol,
             side=intent.side,
             volume=volume,
+            kind=intent.kind,
+            limit_price=intent.limit_price,
             stop_loss=sl,
             take_profit=tp,
             reason=intent.reason,

@@ -9,7 +9,7 @@ from slytrade.backtest.aligned_engine import quote_from_aligned_bar
 from slytrade.backtest.engine import BacktestConfig, BacktestResult, BarStrategy
 from slytrade.backtest.execution import Quote
 from slytrade.backtest.metrics import compute_performance_metrics
-from slytrade.execution.models import ExecutionReport, OrderIntent, Side
+from slytrade.execution.models import ExecutionReport, OrderIntent, OrderKind, Side
 from slytrade.execution.paper_broker import PaperBroker
 
 ExitReason = Literal[
@@ -276,6 +276,10 @@ class ManagedAlignedBacktestEngine:
         equity_curve = [self.config.initial_balance]
         reports: list[ExecutionReport] = []
         trade_state: ManagedTradeState | None = None
+        pending: OrderIntent | None = None
+        pending_setup_bar: pd.Series | None = None
+        pending_bars = 0
+        limit_ttl = self.trade_config.max_bars_in_trade or 60
 
         for index, bar in ordered.iterrows():
             quote = quote_from_aligned_bar(bar)
@@ -313,19 +317,55 @@ class ManagedAlignedBacktestEngine:
                             trade_state = None
                             self._notify_position_closed(strategy)
 
-            if trade_state is None and not broker.guardrails.kill_switch:
+            # Resting limit order: fill on touch, expire after the hold window.
+            if trade_state is None and pending is not None:
+                assert pending.limit_price is not None
+                high, low = _bar_high_low(bar)
+                crossed = (pending.side == Side.BUY and low <= pending.limit_price) or (
+                    pending.side == Side.SELL and high >= pending.limit_price
+                )
+                if crossed:
+                    limit_price = pending.limit_price
+                    spread = max(quote.spread, 0.0)
+                    if pending.side == Side.BUY:
+                        fill_quote = Quote(symbol=pending.symbol, bid=limit_price - spread, ask=limit_price, time=quote.time)
+                    else:
+                        fill_quote = Quote(symbol=pending.symbol, bid=limit_price, ask=limit_price + spread, time=quote.time)
+                    entry_result = broker.submit_order(pending, fill_quote)
+                    reports.append(entry_result.report)
+                    if entry_result.report.filled_volume > 0 and pending_setup_bar is not None:
+                        # SL/TP from the SETUP bar's ATR (the risk the setup
+                        # defined), entry at the limit fill price.
+                        trade_state = create_trade_state(pending, limit_price, pending_setup_bar, index, self.trade_config)
+                    pending = None
+                    pending_setup_bar = None
+                    pending_bars = 0
+                else:
+                    pending_bars += 1
+                    if pending_bars >= limit_ttl:
+                        pending = None
+                        pending_setup_bar = None
+                        pending_bars = 0
+                        self._notify_position_closed(strategy)
+
+            if trade_state is None and pending is None and not broker.guardrails.kill_switch:
                 intent = strategy.on_bar(index, bar)
                 if intent is not None:
-                    entry_result = broker.submit_order(intent, quote)
-                    reports.append(entry_result.report)
-                    if entry_result.report.avg_fill_price is not None and entry_result.report.filled_volume > 0:
-                        trade_state = create_trade_state(
-                            intent,
-                            entry_result.report.avg_fill_price,
-                            bar,
-                            index,
-                            self.trade_config,
-                        )
+                    if intent.kind == OrderKind.LIMIT and intent.limit_price is not None:
+                        pending = intent
+                        pending_setup_bar = bar
+                        pending_bars = 0
+                    else:
+                        entry_result = broker.submit_order(intent, quote)
+                        reports.append(entry_result.report)
+                        if entry_result.report.avg_fill_price is not None and entry_result.report.filled_volume > 0:
+                            trade_state = create_trade_state(
+                                intent,
+                                entry_result.report.avg_fill_price,
+                                bar,
+                                index,
+                                self.trade_config,
+                            )
 
             equity_curve.append(broker.portfolio.mark_to_market(broker.last_marks))
 

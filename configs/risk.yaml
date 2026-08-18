@@ -65,3 +65,8 @@ ict:
     # Max spread gate, in PRICE units (e.g. 0.30 = $0.30 on gold). Applies to
     # both the scorer and the entry-quality gate. null = off.
     max_spread: null
+    # Limit-entry: >0 rests a limit order at this many ATR below the close
+    # (longs) / above it (shorts) instead of market-entering. Validated on
+    # 25mo real XAUUSD M15: 0.25 fills ~97% of setups and lifts net edge ~+72%
+    # (gold retraces 0.25ATR after a setup almost always). 0 = market orders.
+    limit_entry_atr: 0.25

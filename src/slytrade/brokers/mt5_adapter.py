@@ -8,7 +8,7 @@ from typing import Any
 
 from slytrade.backtest.execution import Quote
 from slytrade.brokers.specs import SymbolSpec, symbol_spec_from_mt5_info
-from slytrade.execution.models import ExecutionReport, OrderIntent, OrderStatus, Side
+from slytrade.execution.models import ExecutionReport, OrderIntent, OrderKind, OrderStatus, Side
 from slytrade.execution.oms import OrderManagementSystem
 from slytrade.monitoring.health import HealthRegistry
 from slytrade.monitoring.metrics import ExecutionMetrics
@@ -175,6 +175,8 @@ class MT5BrokerAdapter:
         return result
 
     def submit(self, intent: OrderIntent, quote: Quote) -> ExecutionReport:
+        if intent.kind == OrderKind.LIMIT and intent.limit_price is not None:
+            return self._submit_pending(intent, quote)
         if self.oms.get(intent.client_order_id) is not None:
             state = self.oms.get(intent.client_order_id)
             assert state is not None
@@ -246,6 +248,93 @@ class MT5BrokerAdapter:
         )
         self.oms.apply_report(report)
         return report
+
+    def _submit_pending(self, intent: OrderIntent, quote: Quote) -> ExecutionReport:
+        """Place a resting limit order (BUY_LIMIT / SELL_LIMIT) on the broker."""
+        if self.oms.get(intent.client_order_id) is not None:
+            state = self.oms.get(intent.client_order_id)
+            assert state is not None
+            return ExecutionReport(
+                client_order_id=intent.client_order_id,
+                status=state.status,
+                filled_volume=state.filled_volume,
+                avg_fill_price=state.avg_fill_price,
+                broker_order_id=state.broker_order_id,
+                message="idempotent existing order",
+                event_time=datetime.now(UTC),
+            )
+        if not self.allow_trading:
+            return self._reject(intent, "MT5 trading adapter disabled")
+        if not self.reconciled:
+            return self._reject(intent, "MT5 reconciliation required before trading")
+        if intent.limit_price is None or intent.limit_price <= 0:
+            return self._reject(intent, "limit order missing a valid limit_price")
+
+        equity = float(self.account_info().equity)
+        decision = self.guardrails.approve_order(
+            intent,
+            equity=equity,
+            spread_points=quote.spread / max(self.symbol_spec(intent.symbol).point, 1e-12),
+            live=True,
+            current_date=quote.time.date(),
+        )
+        if not decision.approved:
+            return self._reject(intent, decision.reason)
+
+        self.oms.create_order(intent)
+        request = {
+            "action": self.mt5.TRADE_ACTION_PENDING,
+            "symbol": intent.symbol,
+            "volume": intent.volume,
+            "type": getattr(self.mt5, "ORDER_TYPE_BUY_LIMIT" if intent.side == Side.BUY else "ORDER_TYPE_SELL_LIMIT"),
+            "price": intent.limit_price,
+            "sl": intent.stop_loss or 0.0,
+            "tp": intent.take_profit or 0.0,
+            "deviation": 20,
+            "magic": self.magic,
+            "comment": intent.reason[:31],
+            "type_time": self.mt5.ORDER_TIME_GTC,
+            "type_filling": getattr(self.mt5, "ORDER_FILLING_RETURN", 0),
+        }
+        self.metrics.submitted()
+        result = self._call_remote("order_send", f"mt5.order_send({json.dumps(request)})._asdict()", request)
+        if result is None:
+            self.metrics.broker_error()
+            return self._reject(intent, "MT5 order_send returned None")
+        retcode = int(_field(result, "retcode", -1))
+        placed = retcode in {
+            int(getattr(self.mt5, "TRADE_RETCODE_DONE", 10009)),
+            int(getattr(self.mt5, "TRADE_RETCODE_PLACED", 10008)),
+        }
+        ticket = _field(result, "order", 0)
+        status = OrderStatus.ACCEPTED if placed else OrderStatus.REJECTED
+        if not placed:
+            self.metrics.rejected()
+        report = ExecutionReport(
+            client_order_id=intent.client_order_id,
+            status=status,
+            filled_volume=0.0,
+            avg_fill_price=None,
+            broker_order_id=str(ticket) if ticket else None,
+            message=str(_field(result, "comment", "")) or f"MT5 pending retcode {retcode}",
+            event_time=quote.time,
+        )
+        self.oms.apply_report(report)
+        return report
+
+    def cancel_order(self, ticket: int) -> bool:
+        """Cancel a resting pending order by ticket. Returns True on success."""
+        if not self.allow_trading:
+            return False
+        result = self._call_remote(
+            "order_send",
+            f"mt5.order_send({{'action': mt5.TRADE_ACTION_REMOVE, 'order': {int(ticket)}}})._asdict()",
+            {"action": getattr(self.mt5, "TRADE_ACTION_REMOVE", 1), "order": int(ticket)},
+        )
+        if result is None:
+            return False
+        retcode = int(_field(result, "retcode", -1))
+        return retcode == int(getattr(self.mt5, "TRADE_RETCODE_DONE", 10009))
 
     def _reject(self, intent: OrderIntent, message: str) -> ExecutionReport:
         self.metrics.rejected()

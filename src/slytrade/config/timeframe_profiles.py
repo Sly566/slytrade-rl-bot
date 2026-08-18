@@ -44,9 +44,9 @@ TIMEFRAME_PROFILES: dict[str, TimeframeProfile] = {
         note="+17.7% 1stY / +9.1% 2ndY OOS, PF 1.66/1.32, max DD 4.2% — the champion",
     ),
     "M15": TimeframeProfile(
-        min_score=3, cooldown_bars=10, stop_loss_atr=1.0, take_profit_atr=3.0,
+        min_score=3, cooldown_bars=3, stop_loss_atr=1.0, take_profit_atr=3.0,
         max_bars_in_trade=60, htf_trend_timeframe="h4", cost_per_trade_r=0.043,
-        note="+12.7% 1stY / +25.7% 2ndY OOS, PF 1.13/1.24 — the profitable scalping timeframe",
+        note="cooldown 3 (validated 2y): +25.4%/+20.8% net vs +12.7%/+25.7% at cooldown 10; PF 1.15, DD 16.8% — continuous trading of setups beats the old gated version",
     ),
     "M5": TimeframeProfile(
         min_score=3, cooldown_bars=20, stop_loss_atr=1.0, take_profit_atr=2.0,

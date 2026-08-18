@@ -34,7 +34,7 @@ def test_config_loaders_apply_profiles() -> None:
     h1_pc = _persona_config_from_risk("XAUUSD", "H1")
     m15_pc = _persona_config_from_risk("XAUUSD", "M15")
     assert h1_pc.min_score == 4 and h1_pc.cooldown_bars == 20
-    assert m15_pc.min_score == 3 and m15_pc.cooldown_bars == 10
+    assert m15_pc.min_score == 3 and m15_pc.cooldown_bars == 3
     # Timeframe-insensitive gates still come from risk.yaml.
     assert h1_pc.strict_mtf_direction is True
     assert m15_pc.require_entry_momentum is True
