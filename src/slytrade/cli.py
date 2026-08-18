@@ -1441,48 +1441,60 @@ def full_pipeline(
 
 
 @app.command()
-def demo() -> None:
-    """Run the guarded live demo-account trading loop.
+def live() -> None:
+    """Run the live trading loop — places real orders on the connected MT5 account.
 
-    Requires SLYTRADE_ALLOW_LIVE=1 and SLYTRADE_STAGE=demo. Real orders are
-    placed on the demo account through the MT5 adapter after reconciliation.
+    This is the LIVE deployment. It places real orders on whatever account the
+    terminal is logged into (a demo account now, the live account later once
+    the deployment gate is approved). Requires SLYTRADE_ALLOW_LIVE=1 and
+    SLYTRADE_STAGE=demo (the account currently attached is a demo account).
     """
-    from slytrade.runtime.demo_loop import DemoTradingLoop
+    from slytrade.runtime.demo_loop import LiveTradingLoop
     from slytrade.runtime.settings import RuntimeSettings
 
     settings = RuntimeSettings()
     if not settings.allow_live or settings.stage.value != "demo":
-        console.print("[bold red]Demo trading is disabled.[/bold red]")
+        console.print("[bold red]Live trading is disabled.[/bold red]")
         console.print("Set SLYTRADE_ALLOW_LIVE=1 and SLYTRADE_STAGE=demo in your environment first.")
         raise typer.Exit(code=1)
 
-    loop = DemoTradingLoop(settings, load_mt5())
-    console.print("[bold red]LIVE DEMO TRADING — real orders on the demo account.[/bold red]")
+    loop = LiveTradingLoop(settings, load_mt5())
+    console.print("[bold red]LIVE TRADING — real orders on the connected MT5 account.[/bold red]")
     try:
         loop.run()
     except KeyboardInterrupt:
-        console.print("[yellow]Demo loop stopped.[/yellow]")
+        console.print("[yellow]Live loop stopped.[/yellow]")
 
 
 @app.command()
-def live() -> None:
-    """Live trading entry point (fail-closed by design).
+def demo() -> None:
+    """Alias of `slytrade live` (kept for backward compatibility)."""
+    live()
 
-    Live trading stays disabled until the deployment gate in
-    ``slytrade.monitoring.gates`` is satisfied AND ``SLYTRADE_ALLOW_LIVE=1`` is
-    set. Use ``slytrade paper`` for supervised paper trading first, then
-    ``slytrade demo`` for live demo-account testing.
+
+@app.command()
+def learn(
+    bars_file: str = typer.Option(..., help="Aligned bars file to (re)learn from"),
+    symbol: str | None = typer.Option(None, help="Symbol override (default: inferred from the bars)"),
+    total_timesteps: int = typer.Option(20_000, help="PPO fine-tune steps per fold (0 = clone only)"),
+    n_seeds: int = typer.Option(3, help="Independent seeds per fold"),
+) -> None:
+    """Re-distill the champion from the latest data and check if the RL has caught up.
+
+    The ever-learning step: behavioural-clones the persona champion on the
+    freshest bars, runs the embargoed walk-forward, and reports the honest
+    champion-vs-RL comparison. The RL is only promoted when it beats the
+    champion net of cost — the deployment gate enforces it, this command shows
+    the numbers.
     """
-    from slytrade.runtime.settings import RuntimeSettings
+    from slytrade.tasks import learn as run_learn
 
-    settings = RuntimeSettings()
-    if not settings.allow_live:
-        console.print("[bold red]Live trading is disabled.[/bold red]")
-        console.print("Set SLYTRADE_ALLOW_LIVE=1 only after the deployment gate is approved.")
-        console.print("Run `slytrade paper` for supervised paper trading, then `slytrade demo`.")
-        raise typer.Exit(code=1)
-    console.print("[bold yellow]Live trading requires the approved deployment gate.[/bold yellow]")
-    raise typer.Exit(code=1)
+    result = run_learn(bars_file, symbol=symbol, total_timesteps=total_timesteps, n_seeds=n_seeds)
+    if result.ok and result.data:
+        console.print(f"[green]{result.message}[/green]")
+    elif not result.ok:
+        console.print(f"[red]{result.message}[/red]")
+        _hint_if_bridge(result.message)
 
 
 @app.command()

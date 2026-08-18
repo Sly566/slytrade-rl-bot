@@ -1354,6 +1354,112 @@ def _add_champion_comparison(table: pd.DataFrame, dataset, folds, symbol: str) -
 
 
 # ---------------------------------------------------------------------------
+# Task: learn (continuous learning — re-distill the champion, gate the RL)
+# ---------------------------------------------------------------------------
+
+
+def learn(
+    bars_file: str,
+    *,
+    symbol: str | None = None,
+    total_timesteps: int = 20_000,
+    n_seeds: int = 3,
+    train_window: int = 10_000,
+    validation_window: int = 2_000,
+    test_window: int = 2_000,
+    embargo: int = 200,
+) -> TaskResult:
+    """Re-distill the champion from the latest bars and gate the RL honestly.
+
+    The "ever-evolving" step. Each run: behavioural-clones the persona champion
+    on the freshest bars (warmstart), runs the embargoed walk-forward, and
+    reports the honest champion-vs-RL comparison. The RL only earns promotion
+    when it beats the champion net-of-cost in a majority of folds — this
+    command SHOWS the numbers; the deployment gate ENFORCES the decision.
+
+    Run it on a schedule (after ``collect_incremental``) and the bot gets
+    smarter every cycle: more data -> better distillation -> the RL is promoted
+    the moment it genuinely wins, never before.
+    """
+    from slytrade.backtest.reporting import infer_symbol
+    from slytrade.progress import info, stage
+    from slytrade.rl.dataset import build_rl_dataset
+    from slytrade.rl.walkforward import make_walk_forward_folds, resolve_fold_windows, walk_forward_validation
+
+    stage("Learn — re-distill the champion from the latest data")
+    bars, load_error = _load_bars_or_error(bars_file)
+    if load_error is not None:
+        return load_error
+    assert bars is not None
+    resolved = infer_symbol(bars, symbol)
+    try:
+        dataset = build_rl_dataset(bars)
+    except ImportError as exc:
+        return TaskResult(False, f"RL dependencies not installed: {exc}")
+
+    windows = resolve_fold_windows(
+        len(dataset.bars),
+        train_window=train_window,
+        validation_window=validation_window,
+        test_window=test_window,
+        embargo=embargo,
+    )
+    folds = make_walk_forward_folds(
+        len(dataset.bars),
+        train_window=windows.train_window,
+        validation_window=windows.validation_window,
+        test_window=windows.test_window,
+        embargo=windows.embargo,
+        step=windows.step,
+    )
+    info(f"{len(folds)} folds · warmstart distillation · {n_seeds} seeds · {total_timesteps} fine-tune steps")
+    try:
+        table = walk_forward_validation(
+            dataset,
+            folds,
+            total_timesteps=total_timesteps,
+            seed=42,
+            reward_type="r_multiple",
+            policy_type="mlp",
+            progress=True,
+            progress_bar=True,
+            dynamic_features=False,
+            n_envs=1,
+            n_seeds=n_seeds,
+            shaping_enabled=False,
+            max_trades_per_episode=0,
+            warmstart_persona=True,
+        )
+    except ImportError as exc:
+        return TaskResult(False, f"RL dependencies not installed: {exc}")
+    table = _add_champion_comparison(table, dataset, folds, resolved)
+    console.print(table.to_string(index=False))
+
+    fold_rows = table[table["fold"] != "AGGREGATE"]
+    diff = fold_rows["rl_minus_persona"].dropna()
+    agg_series = table.loc[table["fold"] == "AGGREGATE", "rl_minus_persona"]
+    aggregate = float(agg_series.iloc[0]) if len(agg_series) else float("nan")
+    wins = int((diff > 0).sum())
+    n = int(len(diff))
+    beats = n > 0 and wins >= (n + 1) // 2 and aggregate > 0
+
+    _write_champion_baseline(resolved, float(fold_rows["persona_return"].mean()) if len(fold_rows) else 0.0)
+
+    if beats:
+        verdict = (
+            f"RL BEATS the champion out-of-sample ({wins}/{n} folds, aggregate {aggregate:+.2f}). "
+            "Train a final distilled model and promote it (the gate will still re-check the evidence)."
+        )
+    else:
+        verdict = (
+            f"champion remains in charge — RL gap {aggregate:+.2f} ({wins}/{n} folds positive). "
+            "Keep trading the rule; the RL needs more data to overtake it."
+        )
+    info(verdict)
+    return TaskResult(True, verdict, {"folds": n, "wins": wins, "aggregate_rl_minus_persona": aggregate})
+
+
+# ---------------------------------------------------------------------------
 # Task: promote
 # ---------------------------------------------------------------------------
 

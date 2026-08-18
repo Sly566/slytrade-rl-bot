@@ -88,23 +88,47 @@ class MT5BrokerAdapter:
         return symbol_spec_from_mt5_info(info)
 
     def resolve_symbol(self, requested: str) -> str:
-        names = self._call_remote("symbols_get", "[s.name for s in (mt5.symbols_get() or [])]")
+        # The bridge may return SymbolInfo objects, dicts, or name strings
+        # depending on which path ``_call_remote`` took — normalise to names.
+        raw = self._call_remote("symbols_get", "[s.name for s in (mt5.symbols_get() or [])]")
+        names: list[str] = []
+        for item in raw:
+            name = _field(item, "name")
+            names.append(str(name) if name else str(item))
         requested_lower = requested.strip().lower()
-        candidates = sorted(
-            (name for name in names if requested_lower in str(name).lower()),
-            key=lambda name: (str(name).lower() != requested_lower, len(str(name)), str(name)),
-        )
+
+        def _rank(name: str) -> tuple[object, ...]:
+            lower = name.lower()
+            return (
+                lower != requested_lower,  # exact match first
+                "247" in lower,  # 24/7 weekend contract last (XAUUSDm over XAUUSD247m)
+                len(name),
+                name,
+            )
+
+        candidates = sorted((n for n in names if requested_lower in n.lower()), key=_rank)
         if not candidates:
-            raise RuntimeError(f"no MT5 symbol matches {requested}; available symbols: {list(names)[:20]}")
-        resolved = str(candidates[0])
-        selected = self._call_remote(
-            "symbol_select",
-            f"mt5.symbol_select({json.dumps(resolved)}, True)",
-            resolved,
-            True,
-        )
+            raise RuntimeError(f"no MT5 symbol matches {requested}; available symbols: {sorted(names)[:20]}")
+        resolved = candidates[0]
+        # symbol_select can return False when the symbol can't be added to the
+        # Market Watch (e.g. the 24/7 contract, or a full watchlist) — the
+        # symbol is still quotable and tradable via order_send, so degrade to a
+        # warning instead of a fatal error.
+        try:
+            selected = self._call_remote(
+                "symbol_select",
+                f"mt5.symbol_select({json.dumps(resolved)}, True)",
+                resolved,
+                True,
+            )
+        except Exception:  # pragma: no cover - bridge dependent
+            selected = False
         if selected is False:
-            raise RuntimeError(f"MT5 symbol_select failed for {resolved}")
+            self.health.report(
+                "mt5",
+                True,
+                f"symbol_select({resolved}) returned False (not visible in Market Watch; still tradable)",
+            )
         return resolved
 
     def quote(self, symbol: str) -> Quote:

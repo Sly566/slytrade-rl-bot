@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from slytrade.runtime.demo_loop import DemoTradingLoop
+from slytrade.runtime.demo_loop import DemoTradingLoop, LiveTradingLoop
 from slytrade.runtime.settings import RuntimeSettings, TradingStage
 
 
@@ -112,3 +112,59 @@ def test_demo_decision_series_carries_mtf_context(tmp_path) -> None:
     decision = loop._decision_series(loop._window_bars[-1])
     assert "mtf_bias" in decision.index
     assert any(c.startswith("htf_") for c in decision.index)
+
+
+def test_live_journal_records_entry_then_outcome(tmp_path) -> None:
+    import pandas as pd
+
+    from slytrade.backtest.execution import Quote
+    from slytrade.execution.models import OrderIntent, Side
+
+    settings = _settings(tmp_path)
+    settings.allow_live = True
+    settings.stage = TradingStage.DEMO
+    settings.timeframe = "M15"
+    loop = LiveTradingLoop(settings, FakeMT5())
+
+    series = pd.Series(
+        {"persona_score": 4.0, "persona_bias": 1.0, "bos_dir": 1.0, "atr": 3.0,
+         "htf_h4_bos_dir": 1.0, "mtf_bias": 1.0, "trend_strength": 0.5,
+         "premium_discount": -0.3, "liquidity_sweep": -1.0, "choch_dir": 1.0},
+    )
+    quote = Quote(symbol="XAUUSDm", bid=3999.9, ask=4000.1, time=pd.Timestamp("2026-08-18T12:00:00").to_pydatetime())
+    sized = OrderIntent(symbol="XAUUSDm", side=Side.BUY, volume=0.1,
+                        stop_loss=3997.0, take_profit=4009.0, reason="persona_long")
+
+    loop._journal_entry(series, sized, quote)
+    assert loop._journal_open is not None
+    assert loop._journal_path().exists()
+
+    # Simulate the position closing at take-profit (bar traded up through TP).
+    close_bar = {"high": 4010.0, "low": 4001.0}
+    loop._journal_exit("XAUUSDm", close_bar, quote)
+    frame = pd.read_parquet(loop._journal_path())
+    assert len(frame) == 1  # entry row replaced by closed row
+    assert frame["outcome_r"].iloc[0] == 3.0  # (4009 - 4000) / (4000 - 3997)
+    assert frame["exit_reason"].iloc[0] == "take_profit"
+
+
+def test_live_journal_records_stop_loss(tmp_path) -> None:
+    import pandas as pd
+
+    from slytrade.backtest.execution import Quote
+    from slytrade.execution.models import OrderIntent, Side
+
+    settings = _settings(tmp_path)
+    settings.allow_live = True
+    settings.stage = TradingStage.DEMO
+    loop = LiveTradingLoop(settings, FakeMT5())
+
+    series = pd.Series({"persona_score": 4.0, "atr": 3.0})
+    quote = Quote(symbol="XAUUSDm", bid=4000.0, ask=4000.2, time=pd.Timestamp("2026-08-18T12:00:00").to_pydatetime())
+    sized = OrderIntent(symbol="XAUUSDm", side=Side.BUY, volume=0.1,
+                        stop_loss=3997.0, take_profit=4009.0, reason="persona_long")
+    loop._journal_entry(series, sized, quote)
+    loop._journal_exit("XAUUSDm", {"high": 4005.0, "low": 3996.0}, quote)
+    frame = pd.read_parquet(loop._journal_path())
+    assert frame["outcome_r"].iloc[0] == -1.0
+    assert frame["exit_reason"].iloc[0] == "stop_loss"

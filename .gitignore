@@ -13,6 +13,9 @@ data/processed/
 data/features/
 data/models/
 data/journal/
+data/exness_derived/
+data/samples/
+data/live_journal/
 logs/
 state/
 reports/
@@ -25,6 +28,9 @@ mlruns/
 *.zip
 *.csv.gz
 *.db
+
+# IDE / agent dirs
+.qodo/
 
 # Secrets
 .env

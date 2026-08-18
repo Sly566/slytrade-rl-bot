@@ -1,14 +1,19 @@
-"""Live demo-account trading loop.
+"""Live trading loop — places real orders on the connected MT5 account.
 
-The final stage before real capital: real orders on a **demo** broker account,
-routed through the guarded MT5 adapter. This loop is deliberately paranoid:
+This is the LIVE deployment loop. It places real orders on whatever MT5
+account the terminal is logged into (a demo account in the current setup, the
+live account later). The stage setting only records which account type is
+attached — the loop itself is the live run:
 
-* refuses to start unless ``SLYTRADE_ALLOW_LIVE=1`` AND stage is ``demo``;
+* refuses to start unless ``SLYTRADE_ALLOW_LIVE=1`` AND stage is ``demo``
+  (the account currently attached is a demo account);
 * refuses to trade until broker reconciliation succeeds;
 * entries only (never exits) are gated by session window, news gate, circuit
   breaker and risk sizing;
 * every order still passes the guardrails + OMS + adapter path;
-* stop-loss/take-profit are attached to the broker order (server-side).
+* stop-loss/take-profit are attached to the broker order (server-side);
+* every fill and every close is journaled to ``data/live_journal`` so the bot
+  learns from what actually worked live.
 
 If reconciliation fails or the kill switch trips, the loop stops placing new
 orders but keeps streaming quotes so the operator can observe and intervene.
@@ -21,6 +26,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import timedelta
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -46,7 +52,7 @@ from slytrade.strategies.personality_adaptive import PersonalityAdaptiveStrategy
 
 
 @dataclass(frozen=True)
-class DemoLoopSummary:
+class LiveLoopSummary:
     bars_processed: int
     orders_submitted: int
     orders_filled: int
@@ -56,9 +62,13 @@ class DemoLoopSummary:
     final_equity: float | None
 
 
+# Backward-compatible aliases (older scripts/tests import these names).
+DemoLoopSummary = LiveLoopSummary
+
+
 @dataclass
-class DemoTradingLoop:
-    """Guarded live trading loop against an MT5 demo account."""
+class LiveTradingLoop:
+    """Guarded live trading loop against the connected MT5 account."""
 
     settings: RuntimeSettings
     mt5: Any
@@ -86,6 +96,7 @@ class DemoTradingLoop:
     _window_bars: list[dict[str, Any]] = field(default_factory=list, init=False)
     _profile: Any = field(default=None, init=False)  # validated timeframe profile
     _minlot_warned: bool = field(default=False, init=False)
+    _journal_open: dict[str, Any] | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         self.logger = setup_logging(self.settings.log_level, self.settings.log_dir, self.settings.json_logs)
@@ -250,11 +261,111 @@ class DemoTradingLoop:
         self._window_bars.extend(row.to_dict() for _, row in frame.tail(cap).iterrows())
         self.logger.info("warmup loaded", extra={"event": "warmup", "bars": len(frame.tail(cap))})
 
+    # -- live journal (the bot's memory) --------------------------------------
+    def _journal_path(self) -> Path:
+        return Path(self.settings.data_dir) / "live_journal" / "trades.parquet"
+
+    @staticmethod
+    def _journal_feature(series: pd.Series, name: str, default: float = 0.0) -> float:
+        if name not in series.index:
+            return default
+        value = series[name]
+        if pd.isna(value):
+            return default
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _journal_entry(self, series: pd.Series, sized: OrderIntent, quote: Quote) -> None:
+        """Record an entry snapshot: the features the champion saw + the trade.
+
+        This is the bot's live memory — every real fill is journaled with the
+        causal features that produced it, so ``slytrade learn`` can later see
+        what actually worked live vs what the backtest predicted.
+        """
+        try:
+            row = {
+                "time": pd.Timestamp(quote.time).isoformat(),
+                "symbol": sized.symbol,
+                "side": "buy" if sized.side == Side.BUY else "sell",
+                "entry": float(quote.mid),
+                "stop": float(sized.stop_loss or 0.0),
+                "target": float(sized.take_profit or 0.0),
+                "volume": float(sized.volume),
+                "persona_score": self._journal_feature(series, "persona_score"),
+                "persona_bias": self._journal_feature(series, "persona_bias"),
+                "bos_dir": self._journal_feature(series, "bos_dir"),
+                "choch_dir": self._journal_feature(series, "choch_dir"),
+                "liquidity_sweep": self._journal_feature(series, "liquidity_sweep"),
+                "premium_discount": self._journal_feature(series, "premium_discount"),
+                "trend_strength": self._journal_feature(series, "trend_strength"),
+                "atr": self._journal_feature(series, "atr"),
+                "htf_h4_bos_dir": self._journal_feature(series, "htf_h4_bos_dir"),
+                "mtf_bias": self._journal_feature(series, "mtf_bias"),
+                "outcome_r": float("nan"),
+                "exit": float("nan"),
+                "exit_reason": "",
+            }
+            self._journal_open = row
+            self._journal_append(row)
+        except Exception as exc:  # pragma: no cover - journaling must never stop trading
+            self.logger.warning("journal entry failed", extra={"event": "journal_error", "reason": str(exc)})
+
+    def _journal_exit(self, resolved_symbol: str, bar: dict[str, Any], quote: Quote) -> None:
+        """Close the journal row for the trade that just ended (server-side)."""
+        open_row = self._journal_open
+        if not open_row or open_row.get("symbol") != resolved_symbol:
+            self._journal_open = None
+            return
+        self._journal_open = None
+        try:
+            direction = 1.0 if open_row["side"] == "buy" else -1.0
+            entry = float(open_row["entry"])
+            stop = float(open_row["stop"] or 0.0)
+            target = float(open_row["target"] or 0.0)
+            high = float(bar.get("high", quote.mid) or quote.mid)
+            low = float(bar.get("low", quote.mid) or quote.mid)
+            if direction > 0:
+                hit_sl, hit_tp = low <= stop, high >= target
+            else:
+                hit_sl, hit_tp = high >= stop, low <= target
+            if hit_sl:
+                exit_price, reason = stop, "stop_loss"
+            elif hit_tp:
+                exit_price, reason = target, "take_profit"
+            else:
+                exit_price, reason = float(quote.mid), "unknown"
+            risk = abs(entry - stop)
+            r = direction * (exit_price - entry) / risk if risk > 0 else 0.0
+            row = dict(open_row)
+            row["exit"] = exit_price
+            row["exit_reason"] = reason
+            row["outcome_r"] = round(r, 4)
+            self._journal_append(row, replace=open_row["time"])
+        except Exception as exc:  # pragma: no cover
+            self.logger.warning("journal exit failed", extra={"event": "journal_error", "reason": str(exc)})
+
+    def _journal_append(self, row: dict[str, Any], replace: str | None = None) -> None:
+        path = self._journal_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            try:
+                frame = pd.read_parquet(path)
+            except Exception:  # pragma: no cover
+                frame = pd.DataFrame()
+        else:
+            frame = pd.DataFrame()
+        if replace is not None and not frame.empty and "time" in frame.columns:
+            frame = frame[frame["time"] != replace]
+        frame = pd.concat([frame, pd.DataFrame([row])], ignore_index=True)
+        frame.to_parquet(path, index=False)
+
     # -- main ------------------------------------------------------------------
-    def run(self, *, max_bars: int | None = None, max_seconds: float = 0.0) -> DemoLoopSummary:
+    def run(self, *, max_bars: int | None = None, max_seconds: float = 0.0) -> LiveLoopSummary:
         self._install_signal_handlers()
         start = time.monotonic()
-        self.logger.info("demo loop starting", extra={"event": "demo_start", "symbol": self.settings.symbol})
+        self.logger.info("live loop starting", extra={"event": "live_start", "symbol": self.settings.symbol})
 
         self.adapter.connect()
         resolved = self.adapter.resolve_symbol(self.settings.symbol)
@@ -272,7 +383,7 @@ class DemoTradingLoop:
             extra={"event": "reconcile", "status": "ok" if reconciliation.reconciled else "blocked"},
         )
         if not reconciliation.reconciled:
-            self.alerter.alert("critical", "demo loop blocked", reconciliation.detail)
+            self.alerter.alert("critical", "live loop blocked", reconciliation.detail)
 
         try:
             while not self._stop.is_set():
@@ -316,10 +427,10 @@ class DemoTradingLoop:
 
         self.alerter.alert(
             "info",
-            "demo loop stopped",
+            "live loop stopped",
             f"bars={self._bar_index} orders={self._orders} fills={self._fills} errors={self._errors}",
         )
-        return DemoLoopSummary(
+        return LiveLoopSummary(
             bars_processed=self._bar_index,
             orders_submitted=self._orders,
             orders_filled=self._fills,
@@ -359,6 +470,7 @@ class DemoTradingLoop:
             hook = getattr(self.strategy, "on_position_closed", None)
             if hook is not None:
                 hook()
+            self._journal_exit(resolved_symbol, bar, quote)
         self._side = side
 
         if self._side == "flat":
@@ -373,10 +485,11 @@ class DemoTradingLoop:
             if report.status == OrderStatus.FILLED:
                 self._fills += 1
                 self._side = "long" if sized.side == Side.BUY else "short"
-                self.logger.info("demo order filled", extra={"event": "demo_fill", "order_id": sized.client_order_id})
+                self._journal_entry(series, sized, quote)
+                self.logger.info("live order filled", extra={"event": "live_fill", "order_id": sized.client_order_id})
             elif report.status == OrderStatus.REJECTED:
-                self.logger.warning("demo order rejected", extra={"event": "demo_reject", "reason": report.message})
-                self.alerter.alert("warning", "demo order rejected", report.message)
+                self.logger.warning("live order rejected", extra={"event": "live_reject", "reason": report.message})
+                self.alerter.alert("warning", "live order rejected", report.message)
 
     def _decision_series(self, bar: dict[str, Any]) -> pd.Series:
         from slytrade.features.ict import compute_ict_features
@@ -438,7 +551,7 @@ class DemoTradingLoop:
                     "warning",
                     "min-lot risk exceeds budget",
                     f"min lot {volume} risks ~${implied_risk:.2f} vs budget ${budget:.2f} ({risk_per_trade:.1%}); "
-                    "consider a larger demo balance to match the validated 0.5% risk/trade",
+                    "consider a larger account balance to match the validated 0.5% risk/trade",
                 )
                 self.logger.warning(
                     "min-lot risk exceeds budget",
@@ -544,3 +657,7 @@ class DemoTradingLoop:
 
     def stop(self) -> None:
         self._stop.set()
+
+
+# Backward-compatible alias (older scripts/tests import the old name).
+DemoTradingLoop = LiveTradingLoop
