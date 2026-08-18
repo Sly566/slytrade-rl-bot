@@ -342,6 +342,22 @@ def build_rl_dataset(bars: pd.DataFrame, personality: TraderPersonality | None =
     features = pd.concat(frames, axis=1)
     features = features.fillna(0.0)
 
+    # Drop near-constant columns (dead input channels). A constant column
+    # carries zero information for a gradient-based policy and — worse —
+    # fit_scaler's variance floor swaps it for random noise, handing the agent
+    # channels of pure noise it can overfit (measured on real M15 data: 28 of
+    # 188 columns are constant — the fixed personality mode matrix plus a few
+    # one-shot indicators). Selection is variance-driven (data-adaptive), never
+    # a hardcoded column list.
+    variances = features.var(numeric_only=True)
+    kept = variances[variances > 1e-6].index.tolist()
+    # The persona confluence summary is the composed signal the RL learns to
+    # filter; keep it even if a degenerate slice ever renders it constant.
+    for required_col in ("persona_score", "persona_bias"):
+        if required_col in features.columns and required_col not in kept:
+            kept.append(required_col)
+    features = features[kept]
+
     return RLDataset(
         bars=bars,
         features=features,

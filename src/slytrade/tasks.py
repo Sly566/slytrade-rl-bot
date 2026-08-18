@@ -1230,7 +1230,7 @@ def walk_forward(
     reward: str = "r_multiple",
     policy: str = "mlp",
     n_envs: int = 1,
-    n_seeds: int = 1,
+    n_seeds: int = 3,
     shaping: bool = False,
     max_trades_per_episode: int = 0,
     warmstart: bool = False,

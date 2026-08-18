@@ -593,7 +593,7 @@ def walk_forward(
     policy: str = typer.Option("mlp", help="Policy network: mlp or lstm"),
     dynamic_features: bool = typer.Option(True, "--dynamic-features/--no-dynamic-features", help="Footprint-driven per-fold feature selection"),
     n_envs: int = typer.Option(1, help="Parallel rollout envs (1 = single process; >1 speeds up PPO data collection)"),
-    n_seeds: int = typer.Option(1, help="Independent PPO seeds per fold (average out-of-sample; >1 kills seed-variance flukes)"),
+    n_seeds: int = typer.Option(3, help="Independent PPO seeds per fold (average out-of-sample; >1 kills seed-variance flukes)"),
     max_trades_per_episode: int = typer.Option(0, help="Activity brake: max entries per episode (0 = unlimited)"),
     shaping: bool = typer.Option(False, "--shaping/--no-shaping", help="Enable activity-reward shaping (measured to cause overtrading; off by default)"),
     warmstart: bool = typer.Option(False, "--warmstart/--no-warmstart", help="Behavioural-clone the persona first, then fine-tune (distillation; validated flat OOS, off by default)"),

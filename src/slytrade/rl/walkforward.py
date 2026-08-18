@@ -679,7 +679,7 @@ def walk_forward_validation(
     dynamic_features: bool = True,
     correlation_threshold: float = 0.92,
     n_envs: int = 1,
-    n_seeds: int = 1,
+    n_seeds: int = 3,
     shaping_enabled: bool = False,
     max_trades_per_episode: int = 0,
     warmstart_persona: bool = False,

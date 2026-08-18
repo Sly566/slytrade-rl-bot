@@ -95,15 +95,18 @@ def test_feature_columns_adopted_from_aligned_bars() -> None:
     from slytrade.rl.dataset import build_rl_dataset
 
     bars = make_bars(120, drift=0.01)
-    # Simulate aligned bars that carry ICT/MTF/tick columns.
-    bars["bos_dir"] = 1.0
-    bars["premium_discount"] = 0.0
-    bars["mtf_bias"] = 1.0
-    bars["mtf_confluence_score"] = 3.0
-    bars["session_london"] = 1.0
-    bars["htf_h1_bos_dir"] = 1.0
-    bars["tick_rate_per_second"] = 2.0
-    bars["tick_mid_return"] = 0.001
+    # Simulate aligned bars that carry ICT/MTF/tick columns (values vary so the
+    # adoption is exercised; constant columns are dropped by design).
+    n = len(bars)
+    rng = np.arange(n)
+    bars["bos_dir"] = np.where(rng % 3 == 0, 1.0, 0.0)
+    bars["premium_discount"] = np.linspace(-0.5, 0.5, n)
+    bars["mtf_bias"] = np.where(rng % 2 == 0, 1.0, -1.0)
+    bars["mtf_confluence_score"] = rng.astype(float)
+    bars["session_london"] = np.where(rng % 5 == 0, 1.0, 0.0)
+    bars["htf_h1_bos_dir"] = np.where(rng % 4 == 0, 1.0, -1.0)
+    bars["tick_rate_per_second"] = np.linspace(1.0, 3.0, n)
+    bars["tick_mid_return"] = np.linspace(-0.001, 0.001, n)
 
     dataset = build_rl_dataset(bars)
     columns = set(dataset.features.columns)
@@ -112,8 +115,8 @@ def test_feature_columns_adopted_from_aligned_bars() -> None:
     assert "htf_h1_bos_dir" in columns
     assert "session_london" in columns
     assert "tick_rate_per_second" in columns
-    # ML features are always present too.
-    assert "ml_ret_1" in columns
+    # A varying ML feature is always present too.
+    assert "ml_ema_fast" in columns
 
 
 def test_observation_includes_mode_vector_dimension() -> None:

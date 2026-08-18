@@ -40,9 +40,12 @@ def test_dataset_build_emits_no_fragmentation_warning() -> None:
         warnings.simplefilter("error", pd.errors.PerformanceWarning)
         dataset = build_rl_dataset(bars, TraderPersonality())
     assert len(dataset.features) == len(bars)
-    # ML + adopted (incl. many htf_*) + mode columns all present.
+    # Constant columns (fixed persona traits, all-zero synthetic flags) are
+    # dropped by design — they carry no signal. Varying columns must survive.
     for column in mode_matrix_columns():
-        assert column in dataset.features.columns
+        if column.startswith("mode_p_"):
+            assert column not in dataset.features.columns, column
+    assert "htf_h1_f0" in dataset.features.columns
 
 
 def test_dataset_adopts_all_htf_columns() -> None:

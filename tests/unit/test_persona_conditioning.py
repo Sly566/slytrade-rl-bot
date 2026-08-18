@@ -83,12 +83,19 @@ def test_build_mode_matrix_captures_trend_regime() -> None:
     assert (bear["mode_trend_bear"] == 1.0).mean() > 0.9
 
 
-def test_dataset_includes_mode_columns() -> None:
+def test_dataset_drops_constant_mode_columns_keeps_varying() -> None:
     from slytrade.rl.dataset import build_rl_dataset
 
     bars = _bars(150)
     dataset = build_rl_dataset(bars, TraderPersonality())
+    # Fixed-persona columns are constant by design (single personality) and
+    # carry zero signal, so the dataset drops them instead of letting the
+    # scaler inject noise channels the policy could overfit.
     for column in mode_matrix_columns():
-        assert column in dataset.features.columns, column
-    # Feature count = ML + adopted ICT + mode columns.
-    assert len(dataset.features.columns) >= len(mode_matrix_columns())
+        if column.startswith("mode_p_"):
+            assert column not in dataset.features.columns, column
+    # The continuous regime score varies and is kept.
+    assert "mode_regime_score" in dataset.features.columns
+    # The persona confluence summary is always kept.
+    assert "persona_score" in dataset.features.columns
+    assert "persona_bias" in dataset.features.columns
