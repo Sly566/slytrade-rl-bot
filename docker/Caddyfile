@@ -1,0 +1,18 @@
+# Caddy reverse proxy — HTTPS edge for the SlyTrade dashboard.
+# Used by the optional `https` compose profile. Requires a public domain name
+# pointed at this host; Caddy obtains + renews the TLS certificate automatically.
+#
+# If you don't have a domain, use Tailscale instead: run the dashboard behind
+# your tailnet and reach it at https://<machine>.ts.net — no Caddy needed.
+
+{$DOMAIN} {
+    encode gzip
+
+    # Dashboard (HTML + JSON APIs).
+    reverse_proxy dashboard:8080
+
+    # Prometheus metrics (optional, keep private or behind auth).
+    handle /metrics {
+        reverse_proxy dashboard:9108
+    }
+}

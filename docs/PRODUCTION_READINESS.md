@@ -41,8 +41,21 @@ bar; walk-forward prints per-fold progress; robustness prints per-check lines.
   portfolio is a small extension of the same pattern.
 - Beat-the-baseline promotion gate (promote only if RL walk-forward beats
   persona-adaptive **net of costs**).
+- The demo/live loop's **intra-session loss breaker** (max consecutive losses /
+  daily-DD pause against the live broker) is still pending wiring — the paper
+  loop has it; the demo loop currently relies on server-side SL/TP + margin +
+  kill-switch file.
 
-## 5. Bottom line
+## 5. Deployment platform (added)
+
+The bot is now a self-hosted platform: `slytrade dashboard` serves a
+mobile-first web UI (heartbeat, position, pending limit, equity, trades, log
+tail) with start/stop/restart control over the supervised loop, bearer-token
+auth, `/healthz`/`/readyz`, and Docker/compose + Caddy packaging. See
+`docs/DEPLOYMENT_PLATFORM.md` for running it and reaching it from a phone
+(Tailscale or a domain).
+
+## 6. Bottom line
 
 The infrastructure and the integration are now production-grade: the RL brain
 adopts the validated feature stack, the trader persona, the MTF context, and the

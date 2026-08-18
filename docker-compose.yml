@@ -1,17 +1,12 @@
 services:
-  # Production paper-trading service (default). Runs the supervised loop with
-  # Prometheus metrics on :9108. Fail-closed: live trading stays disabled.
-  #
-  # IMPORTANT — host directory ownership:
-  # The container runs as YOUR host user (UID/GID passthrough below), NOT as a
-  # fixed container uid. Without this, files written into the ./data ./logs
-  # ./state bind mounts end up owned by the container's uid (10001) on the
-  # host, which then breaks native runs with "Permission denied".
-  #
-  # Docker also creates MISSING bind-mount directories as root. So before the
-  # first `docker compose up`, run once from the project root:
-  #     mkdir -p data logs state
-  slytrade:
+  # ---------------------------------------------------------------------------
+  # DEFAULT: the control platform — web dashboard (phone/tablet UI) that can
+  # supervise the trading loop as a child process. Start/stop/restart from the
+  # browser; watch heartbeat, position, pending limit, equity, trades, logs.
+  #   docker compose up -d
+  #   open http://<host>:8080  (set SLYTRADE_DASHBOARD_TOKEN before exposing!)
+  # ---------------------------------------------------------------------------
+  dashboard:
     build:
       context: .
       target: production
@@ -20,16 +15,59 @@ services:
     image: slytrade-rl-bot:production
     user: "${UID:-1000}:${GID:-1000}"
     init: true
-    read_only: true
-    tmpfs:
-      - /tmp:size=256m,noexec,nosuid
+    command: ["dashboard"]
+    environment:
+      SLYTRADE_ENV: production
+      SLYTRADE_ALLOW_LIVE: "0"
+      SLYTRADE_STAGE: paper
+      # Which loop the dashboard supervises: "paper" (safe) or "live" (real
+      # orders on the connected MT5 account; requires ALLOW_LIVE=1 + STAGE=demo).
+      SLYTRADE_DASHBOARD_COMMAND: "paper"
+      # REQUIRED before exposing to any network: a bearer token for the UI.
+      SLYTRADE_DASHBOARD_TOKEN: "${SLYTRADE_DASHBOARD_TOKEN:-}"
+      SLYTRADE_DASHBOARD_PORT: "8080"
+      SLYTRADE_DASHBOARD_BIND: "0.0.0.0"
+      SLYTRADE_METRICS_PORT: "9108"
+      SLYTRADE_METRICS_BIND: "0.0.0.0"
+      SLYTRADE_TIMEFRAME: "${SLYTRADE_TIMEFRAME:-M15}"
+      SLYTRADE_SYMBOL: "${SLYTRADE_SYMBOL:-XAUUSD}"
+    volumes:
+      - ./configs:/app/configs:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./state:/app/state
+    ports:
+      - "8080:8080"
+      - "9108:9108"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=5).status == 200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Bare supervised paper loop (metrics only, no UI). Opt-in profile.
+  #   docker compose --profile paper up -d paper
+  # ---------------------------------------------------------------------------
+  paper:
+    profiles: ["paper"]
+    build:
+      context: .
+      target: production
+      args:
+        EXTRAS: data,mt5
+    image: slytrade-rl-bot:production
+    user: "${UID:-1000}:${GID:-1000}"
+    init: true
     command: ["paper"]
     environment:
       SLYTRADE_ENV: production
       SLYTRADE_ALLOW_LIVE: "0"
       SLYTRADE_STAGE: paper
       SLYTRADE_SYMBOL: "${SLYTRADE_SYMBOL:-XAUUSD}"
-      SLYTRADE_TIMEFRAME: "${SLYTRADE_TIMEFRAME:-M1}"
+      SLYTRADE_TIMEFRAME: "${SLYTRADE_TIMEFRAME:-M15}"
       SLYTRADE_METRICS_PORT: "9108"
       SLYTRADE_METRICS_BIND: "0.0.0.0"
     volumes:
@@ -47,8 +85,57 @@ services:
       start_period: 20s
     restart: unless-stopped
 
-  # Development and CI image. It is opt-in so a production compose up never
-  # mounts source or test code into the runtime container.
+  # ---------------------------------------------------------------------------
+  # RL research / continuous learning image (CPU torch). Opt-in profile.
+  #   docker compose --profile research run --rm research learn \
+  #       --bars-file /app/data/processed/aligned/XAUUSD/m15/bars.parquet
+  # ---------------------------------------------------------------------------
+  research:
+    profiles: ["research"]
+    build:
+      context: .
+      target: research
+      args:
+        EXTRAS: data,mt5
+    image: slytrade-rl-bot:research
+    user: "${UID:-1000}:${GID:-1000}"
+    init: true
+    command: ["doctor"]
+    environment:
+      SLYTRADE_ENV: production
+      SLYTRADE_ALLOW_LIVE: "0"
+    volumes:
+      - ./configs:/app/configs:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./state:/app/state
+      - ./models:/app/models
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # Optional HTTPS edge (Caddy) for exposing the dashboard with a domain name
+  # + automatic Let's Encrypt TLS. Opt-in profile; only needed when NOT using
+  # Tailscale (which already gives you a *.ts.net HTTPS name).
+  #   docker compose --profile https up -d caddy
+  # ---------------------------------------------------------------------------
+  caddy:
+    profiles: ["https"]
+    image: caddy:2
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: "${SLYTRADE_DOMAIN:-localhost}"
+    volumes:
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - dashboard
+    restart: unless-stopped
+
+  # Development and CI image. Opt-in so a production compose up never mounts
+  # source or test code into the runtime container.
   dev:
     profiles: ["dev"]
     build:
@@ -68,3 +155,7 @@ services:
       - ./data:/app/data
       - ./logs:/app/logs
     restart: "no"
+
+volumes:
+  caddy_data:
+  caddy_config:

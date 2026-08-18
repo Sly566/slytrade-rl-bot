@@ -57,6 +57,12 @@ class RuntimeSettings(BaseSettings):
     log_dir: str = "logs"
     json_logs: bool = True
 
+    # --- Web dashboard / control platform ------------------------------------
+    dashboard_port: int = 8080
+    dashboard_bind: str = "0.0.0.0"
+    dashboard_token: str = ""  # empty = open (localhost only); set for remote
+    dashboard_command: str = "paper"  # loop the dashboard supervises (paper|live)
+
     # --- State / storage ----------------------------------------------------
     config_dir: str = "configs"
     state_dir: str = "state"

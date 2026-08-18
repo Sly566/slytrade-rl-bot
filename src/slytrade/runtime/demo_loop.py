@@ -21,11 +21,13 @@ orders but keeps streaming quotes so the operator can observe and intervene.
 
 from __future__ import annotations
 
+import json
+import os
 import signal
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -103,6 +105,7 @@ class LiveTradingLoop:
     _stale_quotes: int = field(default=0, init=False)
     _last_heartbeat_at: float = field(default=0.0, init=False)
     _last_quote: Quote | None = field(default=None, init=False)
+    _last_decision: str = field(default="", init=False)
 
     def __post_init__(self) -> None:
         self.logger = setup_logging(self.settings.log_level, self.settings.log_dir, self.settings.json_logs)
@@ -575,7 +578,9 @@ class LiveTradingLoop:
         if self._side == "flat":
             series = self._decision_series(bar)
             intent = self.strategy.on_bar(self._bar_index, series)
-            self.logger.info(self._decision_trace(series, quote, intent), extra={"event": "decision"})
+            self._last_decision = self._decision_trace(series, quote, intent)
+            self.logger.info(self._last_decision, extra={"event": "decision"})
+            self._publish_status()
             if intent is None:
                 return
             sized = self._sized_intent(intent, series, quote)
@@ -786,6 +791,59 @@ class LiveTradingLoop:
     def _heartbeat(self) -> None:
         self.soak.record(healthy=True)
 
+    def _publish_status(self) -> None:
+        """Write a tiny JSON status file the dashboard reads (atomic swap).
+
+        This is the contract between the live loop and the web platform:
+        ``state/live_status.json`` always carries the newest snapshot —
+        heartbeat, price, position, pending limit, equity, errors, last
+        decision — so a phone dashboard never needs to scrape logs.
+        """
+        try:
+            path = Path(self.settings.state_dir) / "live_status.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            equity = balance = None
+            try:
+                info = self.adapter.account_info()
+                equity = float(getattr(info, "equity", None) or 0.0)
+                balance = float(getattr(info, "balance", None) or 0.0)
+            except Exception:  # pragma: no cover - broker dependent
+                pass
+            pending = None
+            if self._pending_limit:
+                pending = {
+                    "side": self._pending_limit.get("side"),
+                    "price": self._pending_limit.get("entry"),
+                    "bars": self._pending_limit.get("bars"),
+                    "volume": self._pending_limit.get("volume"),
+                }
+            payload = {
+                "ts": datetime.now(UTC).isoformat(),
+                "pid": os.getpid(),
+                "symbol": self.settings.symbol,
+                "timeframe": self.settings.timeframe,
+                "tick": self._ticks,
+                "quotes_seen": self._quotes_seen,
+                "bars_built": self._bar_index,
+                "price": round(float(self._last_quote.mid), 2) if self._last_quote else None,
+                "side": self._side,
+                "pending_limit": pending,
+                "equity": round(equity, 2) if equity is not None else None,
+                "balance": round(balance, 2) if balance is not None else None,
+                "errors": self._errors,
+                "orders": self._orders,
+                "fills": self._fills,
+                "kill_switch": bool(self.guardrails.kill_switch),
+                "last_decision": self._last_decision,
+                "journal_path": str(self._journal_path()),
+                "log_path": str(Path(self.settings.log_dir) / "slytrade.jsonl"),
+            }
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(payload, default=str))
+            os.replace(tmp, path)
+        except Exception:  # pragma: no cover - status must never stop trading
+            return
+
     def _status_heartbeat(self, quote: Quote, resolved_symbol: str) -> None:
         """Periodic 'alive' line so the operator can SEE the loop working.
 
@@ -831,6 +889,7 @@ class LiveTradingLoop:
                 "errors": self._errors,
             },
         )
+        self._publish_status()
 
     def _decision_trace(self, series: pd.Series, quote: Quote, intent: OrderIntent | None) -> str:
         """Compact per-bar readout of WHAT the champion saw and WHY it decided.

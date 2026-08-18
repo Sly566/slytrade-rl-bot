@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -1464,6 +1465,52 @@ def live() -> None:
         loop.run()
     except KeyboardInterrupt:
         console.print("[yellow]Live loop stopped.[/yellow]")
+
+
+@app.command()
+def dashboard(
+    host: str = typer.Option("0.0.0.0", help="Bind address"),
+    port: int = typer.Option(8080, help="Dashboard HTTP port"),
+    command: str | None = typer.Option(None, help="Loop to supervise: paper or live (default from SLYTRADE_DASHBOARD_COMMAND)"),
+    token: str | None = typer.Option(None, help="Bearer token protecting the dashboard (default from SLYTRADE_DASHBOARD_TOKEN)"),
+    no_supervise: bool = typer.Option(False, "--no-supervise", help="Serve the dashboard only; do not spawn a trading loop"),
+) -> None:
+    """Run the web dashboard / control platform.
+
+    Serves a mobile dashboard on the given port showing the live loop's
+    heartbeat, position, pending limit, equity, recent trades and log tail, and
+    can start/stop/restart the trading loop. Reach it from a phone over
+    Tailscale or any VPN; set a token before exposing it to a network.
+    """
+    from slytrade.runtime.dashboard import run_dashboard
+    from slytrade.runtime.settings import RuntimeSettings
+
+    settings = RuntimeSettings()
+    resolved_token = token if token is not None else settings.dashboard_token
+    resolved_command = command if command is not None else settings.dashboard_command
+    if resolved_token:
+        console.print("[green]Dashboard token set (Bearer auth required).[/green]")
+    else:
+        console.print("[yellow]No dashboard token — bind it to localhost or set SLYTRADE_DASHBOARD_TOKEN before exposing it.[/yellow]")
+
+    server = run_dashboard(
+        host=host,
+        port=port,
+        command=resolved_command,
+        token=resolved_token,
+        supervise=not no_supervise,
+        state_dir=settings.state_dir,
+        data_dir=settings.data_dir,
+        log_dir=settings.log_dir,
+    )
+    console.print(f"[green]Dashboard on http://{host}:{server.bound_port}/  (supervising: {resolved_command})[/green]")
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        console.print("[yellow]Dashboard stopped.[/yellow]")
+    finally:
+        server.stop()
 
 
 @app.command()
