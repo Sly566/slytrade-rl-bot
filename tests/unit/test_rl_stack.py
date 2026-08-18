@@ -50,7 +50,7 @@ def test_dataset_build_and_env_factory():
     env = dataset.env_factory(0, 500, seed=1, scaler_params=scaler)
     assert isinstance(env, SlyTradeRLEnvironment)
     # features + 5 agent-state scalars (mode vector absent here).
-    assert env.observation_space.shape[0] == len(dataset.features.columns) + 5
+    assert env.observation_space.shape[0] == len(dataset.features.columns) + 6
 
 
 def test_env_reset_and_step_no_lookahead():

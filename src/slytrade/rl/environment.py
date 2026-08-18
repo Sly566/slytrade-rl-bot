@@ -141,6 +141,11 @@ class RLEnvironmentConfig:
     # even the champion barely broke even inside the env. This must match the
     # backtest's net-of-cost economics or the RL is learning a different game.
     round_trip_cost_r: float = 0.04
+    # Entry cooldown in bars, mirroring the persona's cooldown gate. The env
+    # exposes "cooldown remaining" as an observation scalar so a learned policy
+    # can reproduce the stateful entry gating (the part of the champion's edge a
+    # stateless observation cannot carry).
+    entry_cooldown_bars: int = 10
 
 
 if gym is not None:
@@ -186,8 +191,8 @@ if gym is not None:
             # entries-used, last-exit-R, episode progress. Without these the
             # policy cannot learn "I am already in a trade / I just lost" —
             # which is exactly the statefulness the persona exploits.
-            self._state_vector = np.zeros(5, dtype=np.float32)
-            self._n_state = 5
+            self._state_vector = np.zeros(6, dtype=np.float32)
+            self._n_state = 6
             shape = (
                 len(self.features.columns)
                 + (len(mode_vector) if mode_vector is not None else 0)
@@ -227,6 +232,7 @@ if gym is not None:
             self._regret_charged = False
             self._entries_this_episode = 0
             self._bars_in_trade = 0
+            self._bars_since_entry = 10_000
             self.ledger.records.clear()
             self._update_state_vector()
             return self._observation(), {}
@@ -287,8 +293,10 @@ if gym is not None:
                 self._open_leg(target, previous, decision_bar)
                 if old_position == 0:
                     self._record_entry(target, previous, decision_bar)
+                    self._bars_since_entry = 0
 
             self.current_step += 1
+            self._bars_since_entry = min(self._bars_since_entry + 1, 10_000)
             current_bar = self.bars.iloc[min(self.current_step, len(self.bars) - 1)]
             current_close = float(current_bar["close"])
 
@@ -549,11 +557,16 @@ if gym is not None:
             max_bars = self.config.max_bars_in_trade or 200
             max_entries = self.config.max_trades_per_episode or 200
             last_r = self._closed_r[-1] if self._closed_r else 0.0
+            cooldown = max(1, self.config.entry_cooldown_bars)
             self._state_vector[0] = float(np.clip(self._position, -1.0, 1.0))
             self._state_vector[1] = min(float(self._bars_in_trade) / max_bars, 1.0)
             self._state_vector[2] = min(float(self._entries_this_episode) / max_entries, 1.0)
             self._state_vector[3] = float(np.clip(last_r, -5.0, 5.0)) / 5.0
             self._state_vector[4] = float(self.current_step) / max(n, 1)
+            # Cooldown remaining: 0 = eligible to enter, rising to 1 = fully in
+            # cooldown. Mirrors the persona's stateful entry gating.
+            remaining = max(0.0, cooldown - float(self._bars_since_entry)) / cooldown
+            self._state_vector[5] = float(remaining)
 
 else:
 

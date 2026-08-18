@@ -241,27 +241,50 @@ def collect_demonstrations(env, actions: list[int]) -> tuple[np.ndarray, np.ndar
     return np.stack(obs_list), np.asarray(act_list, dtype=np.int64)
 
 
-def behavioral_clone(model, obs: np.ndarray, act: np.ndarray, *, epochs: int = 5, lr: float = 1e-3, batch: int = 256) -> None:
+def _clone_step(model, x: Any, y: Any, optimizer: Any, loss_fn: Any, batch: int) -> None:
+    """One minibatch of supervised imitation (shared by BC and DAgger)."""
+    import torch
+
+    policy = model.policy
+    n = len(x)
+    perm = torch.randperm(n)
+    for start in range(0, n, batch):
+        idx = perm[start : start + batch]
+        features = policy.extract_features(x[idx])
+        latent, _ = policy.mlp_extractor(features)
+        logits = policy.action_net(latent)
+        loss = loss_fn(logits, y[idx])
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+
+def behavioral_clone(model, obs: np.ndarray, act: np.ndarray, *, epochs: int = 10, lr: float = 1e-3, batch: int = 256,
+                     weight_decay: float = 1e-4) -> None:
     """Supervised pretrain of the policy network to imitate the persona.
 
-    Class-balanced: ~99% of bars are "hold", so plain cross-entropy collapses
-    to an always-hold policy (the earlier BC under-fitting). The loss is
-    weighted by inverse class frequency and the minority (entry) classes are
-    upsampled into each minibatch, so the policy actually learns the rare
-    entries that carry the persona's edge.
+    Top-tier imitation-learning practices for a heavy class imbalance
+    (~99% hold / ~1% entries):
+
+    * inverse-sqrt-freq class weights (milder than inverse-freq, so the rare
+      entry class is upweighted without over-amplifying label noise),
+    * class-balanced minibatch upsampling,
+    * AdamW with weight decay (regularisation that survives the imbalance),
+    * a linear learning-rate decay over the epochs (no overshooting the rare
+      classes late in training).
     """
     import torch
 
     policy = model.policy
-    optimizer = torch.optim.Adam(policy.parameters(), lr=lr)
     x = torch.as_tensor(obs, dtype=torch.float32)
     y = torch.as_tensor(act, dtype=torch.long)
 
     # 4 actions (hold/long/short/flatten); the persona only emits {0,1,2} but
     # the policy's action_net outputs 4 logits, so the weight tensor must match.
     counts = torch.bincount(y, minlength=4).float()
-    weights = (counts.sum() / (counts + 1e-6)).clamp(max=50.0)
+    weights = torch.sqrt(counts.sum() / (counts + 1e-6)).clamp(max=30.0)
     loss_fn = torch.nn.CrossEntropyLoss(weight=weights)
+    optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=weight_decay)
 
     # Upsample each class so every minibatch is roughly class-balanced.
     idx_by_class = [torch.nonzero(y == c, as_tuple=False).flatten() for c in range(4)]
@@ -275,17 +298,61 @@ def behavioral_clone(model, obs: np.ndarray, act: np.ndarray, *, epochs: int = 5
     flat = torch.cat(balanced)
     perm = torch.randperm(len(flat))
     flat = flat[perm]
+    xb, yb = x[flat], y[flat]
 
-    for _ in range(epochs):
-        for start in range(0, len(flat), batch):
-            idx = flat[start : start + batch]
-            features = policy.extract_features(x[idx])
-            latent, _ = policy.mlp_extractor(features)
-            logits = policy.action_net(latent)
-            loss = loss_fn(logits, y[idx])
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+    for epoch in range(epochs):
+        # Linear LR decay: halve the step size over the full schedule.
+        for g in optimizer.param_groups:
+            g["lr"] = lr * (1.0 - epoch / max(epochs, 1))
+        _clone_step(model, xb, yb, optimizer, loss_fn, batch)
+
+
+def dagger_refine(
+    model,
+    env: SlyTradeRLEnvironment,
+    actions: list[int],
+    *,
+    epochs: int = 5,
+    lr: float = 5e-4,
+    batch: int = 256,
+    weight_decay: float = 1e-4,
+) -> None:
+    """One DAgger-style refinement pass (fixes behavioural-cloning drift).
+
+    Rolls the current policy out through the env to see WHERE it actually goes
+    (its own state distribution), labels those visited states with the persona's
+    action, and retrains on that mixture. This attacks the compounding-error
+    problem — the reason a clone trained only on the persona's exact states
+    diverges the moment it makes one slightly-off decision at inference.
+    """
+    import torch
+
+    policy = model.policy
+    obs_list: list[np.ndarray] = []
+    act_list: list[int] = []
+    obs, _ = env.reset()
+    visited = 0
+    for i in range(min(len(actions), len(env.bars))):
+        obs_list.append(np.asarray(obs, dtype=np.float32))
+        act_list.append(actions[i])  # the persona's label at this bar
+        action, _ = model.predict(obs, deterministic=False)
+        obs, _, terminated, truncated, _ = env.step(int(action))
+        visited += 1
+        if terminated or truncated:
+            obs, _ = env.reset()
+    if visited == 0:
+        return
+
+    x = torch.as_tensor(np.stack(obs_list), dtype=torch.float32)
+    y = torch.as_tensor(np.asarray(act_list, dtype=np.int64), dtype=torch.long)
+    counts = torch.bincount(y, minlength=4).float()
+    weights = torch.sqrt(counts.sum() / (counts + 1e-6)).clamp(max=30.0)
+    loss_fn = torch.nn.CrossEntropyLoss(weight=weights)
+    optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=weight_decay)
+    for epoch in range(epochs):
+        for g in optimizer.param_groups:
+            g["lr"] = lr * (1.0 - epoch / max(epochs, 1))
+        _clone_step(model, x, y, optimizer, loss_fn, batch)
 
 
 # ---------------------------------------------------------------------------
@@ -335,7 +402,10 @@ def train_ppo(
     progress_bar: bool = False,
     n_envs: int = 1,
     warmstart_persona: bool = False,
-    bc_epochs: int = 5,
+    bc_epochs: int = 10,
+    dagger_passes: int = 0,
+    fine_tune_lr: float | None = None,
+    fine_tune_ent_coef: float = 0.02,
 ):
     """Train a PPO policy on the environment. Returns the trained model.
 
@@ -389,14 +459,27 @@ def train_ppo(
         )
 
     if warmstart_persona and normalized != "lstm":
-        # Behavioural cloning warmstart: copy the profitable persona first, so
-        # PPO only fine-tunes an already-edge-bearing policy (no trade cap, no
-        # overtrading shaping — the policy inherits the persona's selectivity).
+        # Superbrain distillation: behavioural-clone the profitable persona
+        # (top-tier BC: inverse-sqrt class weights, class-balanced minibatches,
+        # AdamW + weight decay, LR decay), then DAgger-refine to kill
+        # distribution shift, then a GENTLE RL fine-tune (small LR + entropy
+        # bonus) that can improve without unlearning the edge.
         actions = persona_actions_for_bars(env.bars)
         observations, demonstrations = collect_demonstrations(env, actions)
         behavioral_clone(model, observations, demonstrations, epochs=bc_epochs)
+        for _ in range(max(0, dagger_passes)):
+            dagger_refine(model, env, actions)
 
-    model.learn(total_timesteps=total_timesteps, progress_bar=progress_bar)
+    if warmstart_persona and normalized != "lstm" and fine_tune_lr is not None:
+        # Gentler fine-tune on top of the distilled policy: a low LR keeps the
+        # policy close to the profitable clone; a positive entropy coefficient
+        # keeps exploration from collapsing to a single deterministic action.
+        model.learning_rate = fine_tune_lr
+        if hasattr(model, "ent_coef"):
+            model.ent_coef = fine_tune_ent_coef
+        model.learn(total_timesteps=total_timesteps, progress_bar=progress_bar)
+    else:
+        model.learn(total_timesteps=total_timesteps, progress_bar=progress_bar)
     if model_dir:
         model.save(model_dir)
     return model
@@ -633,6 +716,7 @@ def walk_forward_validation(
         take_profit_atr=profile.take_profit_atr,
         max_bars_in_trade=profile.max_bars_in_trade or 0,
         round_trip_cost_r=profile.cost_per_trade_r,
+        entry_cooldown_bars=profile.cooldown_bars,
     )
 
     for index, fold in enumerate(folds):

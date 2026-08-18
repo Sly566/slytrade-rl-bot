@@ -1138,6 +1138,7 @@ def train(
         take_profit_atr=_profile.take_profit_atr,
         max_bars_in_trade=_profile.max_bars_in_trade or 0,
         round_trip_cost_r=_profile.cost_per_trade_r,
+        entry_cooldown_bars=_profile.cooldown_bars,
     )
     info(f"reward: {reward} | managed exits: {env.config.use_managed_exits} "
          f"(SL {env.config.stop_loss_atr}×ATR, TP {env.config.take_profit_atr}×ATR, "

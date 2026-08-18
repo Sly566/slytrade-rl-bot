@@ -123,7 +123,7 @@ def test_observation_includes_mode_vector_dimension() -> None:
     env = SlyTradeRLEnvironment(features=features, bars=bars, config=config, mode_vector=np.zeros(6, dtype=np.float32))
     obs, _ = env.reset()
     # 1 feature + 6 mode + 5 agent-state scalars.
-    assert obs.shape == (1 + 6 + 5,)
+    assert obs.shape == (1 + 6 + 6,)
 
 
 def test_observation_includes_agent_state() -> None:
@@ -133,6 +133,6 @@ def test_observation_includes_agent_state() -> None:
     env = SlyTradeRLEnvironment(features=features, bars=bars, config=config)
     obs, _ = env.reset()
     # The last 5 elements are the agent-state vector; position starts at 0.
-    assert obs.shape == (1 + 5,)
-    assert obs[-5] == 0.0  # position
-    assert obs[-1] == 0.0  # episode progress at reset (step 0)
+    assert obs.shape == (1 + 6,)
+    assert obs[-6] == 0.0  # position
+    assert obs[-2] == 0.0  # episode progress at reset (step 0)

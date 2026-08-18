@@ -47,9 +47,9 @@ def test_agent_state_vector_present_and_sized():
     bars = make_bars(100)
     env = SlyTradeRLEnvironment(features=features, bars=bars, config=RLEnvironmentConfig(reward_type="r_multiple"))
     obs, _ = env.reset()
-    # 1 feature + 5 agent-state scalars.
-    assert obs.shape == (1 + 5,)
-    assert env.observation_space.shape[0] == 1 + 5
+    # 1 feature + 6 agent-state scalars.
+    assert obs.shape == (1 + 6,)
+    assert env.observation_space.shape[0] == 1 + 6
 
 
 def test_candidate_mask_forces_hold_off_candidate_bars():

@@ -330,14 +330,14 @@ def build_rl_dataset(bars: pd.DataFrame, personality: TraderPersonality | None =
         adopted_frame = adopted_frame.apply(pd.to_numeric, errors="coerce").astype(np.float32)
         frames.append(adopted_frame)
     # Persona confluence signal: the SAME score + direction the rule-based
-    # champion trades from, pre-computed causally per bar. Giving the RL this
-    # composed signal (instead of expecting a small MLP to re-derive it from
-    # 200+ raw columns) turns its job from "rediscover the edge" into "learn
-    # when to filter the edge". ``persona_action`` additionally carries the
-    # champion's stateful decision (cooldown/side-aware), which is what makes
-    # behavioural cloning actually reproduce the champion.
+    # champion trades from, pre-computed causally per bar. These are legitimate
+    # SUMMARY statistics of the bar features (BOS/CHOCH/sweep/FVG/OB/premium/
+    # trend), not labels — giving the RL this composed signal turns its job from
+    # "rediscover the edge from 200 raw columns" into "learn WHEN to filter the
+    # edge". NOTE: ``persona_action`` is deliberately NOT a feature — it is the
+    # behavioural-cloning LABEL; putting it in the observation would make any
+    # trained policy circular (copying its own answer key instead of learning).
     frames.append(persona_signal_columns(bars))
-    frames.append(persona_action_column(bars).to_frame().astype(np.float32))
     frames.append(mode.astype(np.float32))
     features = pd.concat(frames, axis=1)
     features = features.fillna(0.0)
