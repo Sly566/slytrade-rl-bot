@@ -236,6 +236,7 @@ class PaperTradingLoop:
     settings: RuntimeSettings
     provider: QuoteProvider
     strategy: Any = None
+    portfolio_breaker: Any = None  # optional shared multi-symbol breaker
     logger: Any = field(default=None, init=False)
 
     # Runtime state
@@ -379,6 +380,7 @@ class PaperTradingLoop:
         start = time.monotonic()
         self.logger.info("paper loop starting", extra={"event": "start", "symbol": self.settings.symbol})
         self.provider.connect()
+        self._warmup()
         try:
             while not self._stop.is_set():
                 elapsed = time.monotonic() - start
@@ -454,7 +456,8 @@ class PaperTradingLoop:
     # -- per-bar logic ----------------------------------------------------------
     def _on_bar(self, bar: dict[str, Any]) -> None:
         self._window_bars.append(bar)
-        if len(self._window_bars) > 500:
+        cap = max(64, int(self.settings.history_bars))
+        if len(self._window_bars) > cap:
             self._window_bars.pop(0)
 
         decision_bar = self._decision_bar(bar)
@@ -469,7 +472,7 @@ class PaperTradingLoop:
         self.soak.record(healthy=True)
 
     def _decision_bar(self, bar: dict[str, Any]) -> pd.Series:
-        """Merge the raw bar with causally computed ICT features."""
+        """Merge the raw bar with causally computed ICT + multi-timeframe features."""
         if len(self._window_bars) < 2:
             frame = pd.DataFrame([bar])
         else:
@@ -480,11 +483,81 @@ class PaperTradingLoop:
         for column in features.columns:
             if column not in ("time", "symbol", "timeframe"):
                 series[column] = last[column]
+        # Multi-timeframe context (H4/D1) so the champion's H4-trend alignment
+        # gate — the validated edge — actually runs live instead of silently
+        # degrading to a single-timeframe strategy.
+        for column, value in self._higher_timeframe_features(frame).items():
+            series[column] = value
         duration = max(1.0, timeframe_duration(self.settings.timeframe).total_seconds())
         series["tick_rate_per_second"] = float(bar.get("tick_volume", 1)) / duration
         series["quote_spread"] = float(bar.get("quote_spread", 0.0))
         series["quote_is_fresh"] = True
         return series
+
+    def _higher_timeframe_features(self, frame: pd.DataFrame) -> dict[str, float]:
+        """Resample the rolling window to H4/D1 and merge higher-TF ICT features.
+
+        Produces the ``htf_*`` columns plus ``mtf_bias`` / ``mtf_confluence_score``
+        that activate the strategy's MTF alignment gate. Returns {} while the
+        window is too short to form a single higher-timeframe bar.
+        """
+        if len(frame) < 2 or "time" not in frame.columns:
+            return {}
+        try:
+            from slytrade.data.resample import resample_bars_to_timeframe
+            from slytrade.features.mtf import compute_mtf_ict_features
+
+            higher = {
+                tf: df
+                for tf, df in (
+                    ("H4", resample_bars_to_timeframe(frame, "H4")),
+                    ("D1", resample_bars_to_timeframe(frame, "D1")),
+                )
+                if not df.empty
+            }
+            if not higher:
+                return {}
+            merged = compute_mtf_ict_features(frame, higher)
+        except Exception:  # pragma: no cover - feature degradation must never crash the loop
+            return {}
+        last = merged.iloc[-1]
+        out: dict[str, float] = {}
+        for column in merged.columns:
+            if column.startswith("htf_") or column in ("mtf_bias", "mtf_confluence_score"):
+                value = last[column]
+                if pd.isna(value):
+                    out[column] = 0.0
+                    continue
+                try:
+                    out[column] = float(value)
+                except (TypeError, ValueError):
+                    continue  # skip non-numeric htf columns (e.g. htf_h4_timeframe == "H4")
+        return out
+
+    def _warmup(self) -> None:
+        """Seed the feature window from a stored bars file before streaming.
+
+        Pre-fills ATR/EMA/H4/D1 context so signals are warm from the first
+        streamed bar instead of cold for the first ``history_bars``. The file is
+        optional: without it the loop still runs (and warms up live).
+        """
+        path = self.settings.replay_bars_file
+        if not path:
+            return
+        try:
+            frame = pd.read_parquet(path)
+        except Exception:
+            try:
+                frame = pd.read_csv(path)
+            except Exception as exc:  # pragma: no cover
+                self.logger.warning("warmup skipped", extra={"event": "warmup_skip", "reason": str(exc)})
+                return
+        if frame is None or frame.empty:
+            return
+        frame = frame.sort_values("time")
+        cap = max(64, int(self.settings.history_bars))
+        self._window_bars.extend(row.to_dict() for _, row in frame.tail(cap).iterrows())
+        self.logger.info("warmup loaded", extra={"event": "warmup", "bars": len(frame.tail(cap))})
 
     @staticmethod
     def _quote_from_bar(bar: dict[str, Any]) -> Quote:
@@ -511,6 +584,12 @@ class PaperTradingLoop:
             )
             return
         self.metrics.news_paused.set(0)
+        if self.portfolio_breaker is not None and not self.portfolio_breaker.allowed():
+            self.logger.info(
+                "portfolio breaker tripped",
+                extra={"event": "portfolio_pause", "reason": self.portfolio_breaker.reason},
+            )
+            return
         breaker = self.breaker.check()
         if not breaker.allowed:
             self.logger.info("entry paused", extra={"event": "paused", "reason": breaker.reason})
@@ -606,6 +685,8 @@ class PaperTradingLoop:
         outcome = "win" if realized > 0 else ("loss" if realized < 0 else "breakeven")
         self.metrics.trades_total.labels(outcome=outcome).inc()
         self.breaker.record_trade(realized)
+        if self.portfolio_breaker is not None:
+            self.portfolio_breaker.record(self.settings.symbol, realized)
         self._trades_closed_count += 1
         self.logger.info(
             "trade closed",

@@ -1125,7 +1125,7 @@ def inspect_data(
 @app.command()
 def paper(
     symbol: str | None = typer.Option(None, help="Symbol override (default from SLYTRADE_SYMBOL / XAUUSD)"),
-    timeframe: str | None = typer.Option(None, help="Bar timeframe for signal decisions (default M1)"),
+    timeframe: str | None = typer.Option(None, help="Bar timeframe for signal decisions (default M15 — the validated champion)"),
     replay_ticks: str | None = typer.Option(None, help="Replay a canonical ticks file (.csv/.parquet) instead of live MT5"),
     max_bars: int = typer.Option(0, help="Stop after N bars (0 = run until stopped)"),
     max_seconds: float = typer.Option(0.0, help="Stop after N seconds (0 = run until stopped)"),
@@ -1323,7 +1323,8 @@ def robustness(
 
 @app.command()
 def paper_multi(
-    symbols: str = typer.Option("XAUUSD", help="Comma-separated symbols, e.g. XAUUSD,EURUSD"),
+    symbols: str = typer.Option("XAUUSD", help="Comma-separated symbols, e.g. XAUUSD,EURUSD,GBPUSD"),
+    timeframe: str | None = typer.Option(None, help="Bar timeframe for signal decisions (default M15 — the validated champion)"),
 ) -> None:
     """Run the supervised paper loop across multiple symbols in parallel."""
     from slytrade.runtime.metrics_server import MetricsServer
@@ -1331,6 +1332,8 @@ def paper_multi(
     from slytrade.runtime.settings import RuntimeSettings
 
     settings = RuntimeSettings()
+    if timeframe:
+        settings.timeframe = timeframe
     symbol_list = [symbol.strip().upper() for symbol in symbols.split(",") if symbol.strip()]
     portfolio = PaperPortfolio(symbol_list, settings)
     server = MetricsServer(port=settings.metrics_port, bind=settings.metrics_bind, metrics=portfolio.metrics) if settings.metrics_enabled else None
@@ -1349,6 +1352,46 @@ def paper_multi(
         portfolio.stop()
         if server:
             server.stop()
+
+
+@app.command()
+def admit(
+    symbols: str = typer.Option("XAUUSD", help="Comma-separated symbols to validate, e.g. XAUUSD,EURUSD,GBPUSD"),
+    lookback: str = typer.Option("1y", help="History to collect per symbol"),
+    timeframe: str = typer.Option("M15", help="Decision timeframe (the validated champion)"),
+) -> None:
+    """Validate the champion on each symbol and write the admitted watchlist.
+
+    A symbol must pass a net-profitable champion backtest (net of commission +
+    slippage) with enough trades before it is admitted to multi-symbol trading.
+    Results are written to state/admitted_symbols.json.
+    """
+    from slytrade.tasks import admit_symbols
+
+    result = admit_symbols(symbols, lookback=lookback, timeframe=timeframe)
+    if result.ok:
+        console.print(f"[green]{result.message}[/green]")
+    else:
+        console.print(f"[red]{result.message}[/red]")
+
+
+@app.command()
+def collect_incremental(
+    symbol: str = typer.Option("XAUUSD", help="Symbol to top up"),
+    lookback: str = typer.Option("7d", help="Trailing window to fetch (e.g. 1d, 7d, 30d)"),
+) -> None:
+    """Top up the local store with the newest bars + ticks only (online mode).
+
+    Pulls just the trailing window and merges it into the existing archive, so
+    the bot always runs on the latest data without re-downloading history.
+    """
+    from slytrade.tasks import collect_incremental as run_topup
+
+    result = run_topup(symbol, lookback=lookback)
+    if result.ok:
+        console.print(f"[green]{result.message}[/green]")
+    else:
+        console.print(f"[red]{result.message}[/red]")
 
 
 @app.command()

@@ -100,3 +100,53 @@ def _pandas_freq(timeframe: str) -> str:
         "D1": "1D",
         "W1": "1W",
     }[timeframe]
+
+
+def resample_bars_to_timeframe(
+    bars: pd.DataFrame,
+    timeframe: str,
+) -> pd.DataFrame:
+    """Resample lower-timeframe bars into a higher timeframe (MT5 conventions).
+
+    Buckets by the timeframe's calendar grid, timestamps at bar open, open =
+    first, high/low = max/min, close = last, tick_volume = sum, spread = mean.
+    The live paper loop uses this to build the H4/D1 context from the streamed
+    decision-timeframe bars so the champion's H4-trend gate runs live exactly as
+    it does in backtest (``compute_mtf_ict_features`` needs real higher-TF bars).
+    """
+    normalized_tf = timeframe.upper()
+    if normalized_tf not in TIMEFRAME_DURATIONS:
+        raise ValueError(f"unsupported timeframe: {timeframe}")
+    if bars.empty:
+        return pd.DataFrame(columns=BAR_COLUMNS)
+
+    required = {"time", "open", "high", "low", "close"}
+    missing = required.difference(bars.columns)
+    if missing:
+        raise ValueError(f"bars missing required columns: {sorted(missing)}")
+
+    frame = bars.copy()
+    frame["time"] = pd.to_datetime(frame["time"], utc=True)
+    frame = frame.sort_values("time")
+    symbol = str(frame["symbol"].iloc[0]) if "symbol" in frame.columns else "UNKNOWN"
+
+    grouped = frame.set_index("time").resample(_pandas_freq(normalized_tf))
+    out = pd.DataFrame(
+        {
+            "open": grouped["open"].first(),
+            "high": grouped["high"].max(),
+            "low": grouped["low"].min(),
+            "close": grouped["close"].last(),
+            "tick_volume": grouped["tick_volume"].sum() if "tick_volume" in frame.columns else grouped["close"].count(),
+            "spread": grouped["spread"].mean() if "spread" in frame.columns else 0.0,
+        }
+    )
+    out = out.dropna(subset=["open", "high", "low", "close"]).reset_index()
+    out["symbol"] = symbol
+    out["timeframe"] = normalized_tf
+    out["real_volume"] = 0.0
+    for column in ["open", "high", "low", "close", "tick_volume", "spread"]:
+        out[column] = pd.to_numeric(out[column], errors="coerce")
+    out["tick_volume"] = out["tick_volume"].fillna(0.0).astype(float)
+    out["spread"] = out["spread"].fillna(0.0)
+    return out[BAR_COLUMNS]

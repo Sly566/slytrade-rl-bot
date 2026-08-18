@@ -65,7 +65,7 @@ class RuntimeSettings(BaseSettings):
 
     # --- Paper loop ----------------------------------------------------------
     symbol: str = "XAUUSD"
-    timeframe: str = "M1"
+    timeframe: str = "M15"  # the validated champion timeframe (+38.3% net, 2y MT5)
     strategy: str = "persona-adaptive"
     initial_balance: float = 100_000.0
     # --- Account currency ------------------------------------------------------
@@ -83,6 +83,7 @@ class RuntimeSettings(BaseSettings):
     symbol_spec_file: str | None = None
     replay_ticks_file: str | None = None
     replay_bars_file: str | None = None
+    history_bars: int = 2000  # rolling bar context for ATR/EMA/H4/D1 features
 
     # --- Trading window (UTC) -------------------------------------------------
     trading_days: str = "mon,tue,wed,thu,fri"

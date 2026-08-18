@@ -1528,6 +1528,162 @@ def full_pipeline(
 
 
 # ---------------------------------------------------------------------------
+# Task: multi-symbol admission (validate the champion per symbol)
+# ---------------------------------------------------------------------------
+
+
+def admit_symbols(
+    symbols: str,
+    *,
+    lookback: str = "1y",
+    timeframe: str = "M15",
+    min_trades: int = 30,
+    min_return: float = 0.0,
+    max_drawdown: float = 0.20,
+    min_profit_factor: float = 1.0,
+    out_path: str | Path = "state/admitted_symbols.json",
+) -> TaskResult:
+    """Validate the champion on each symbol and admit only the profitable ones.
+
+    Multi-symbol trading is the diversification lever AND the path to more
+    trades, but a symbol must EARN its place: this runs collect -> align ->
+    champion backtest per symbol and admits it only when the backtest is
+    net-profitable (net of commission + slippage) with a sane drawdown and
+    enough trades to be meaningful. The result is written to ``out_path`` for
+    the portfolio loop to consume. No symbol trades until it passes this gate —
+    the same discipline as the RL promotion gate.
+    """
+    import json
+
+    from slytrade.backtest.engine import BacktestConfig
+    from slytrade.backtest.reporting import infer_symbol, run_managed_aligned_backtest_from_bars
+    from slytrade.core.config import load_config as _load_config
+    from slytrade.progress import info, stage
+
+    symbol_list = [symbol.strip().upper() for symbol in symbols.split(",") if symbol.strip()]
+    if not symbol_list:
+        return TaskResult(False, "no symbols given")
+
+    risk_cfg = _load_config("configs").risk
+    costs = risk_cfg.get("costs", {})
+    commission = float(costs.get("commission_per_volume", 0.0) or 0.0)
+    slippage = float(costs.get("slippage_points", 0.0) or 0.0)
+
+    admitted: list[dict] = []
+    rejected: list[dict] = []
+    for symbol in symbol_list:
+        stage(f"Admit-check {symbol} — collect → align → champion backtest")
+        collected = collect_all(symbol, lookback=lookback)
+        if not collected.ok:
+            rejected.append({"symbol": symbol, "reason": f"collect failed: {collected.message}"})
+            info(f"{symbol}: rejected ({collected.message})")
+            continue
+        aligned = align(symbol, timeframe=timeframe)
+        aligned_data = aligned.data or {}
+        bars_file = aligned_data.get("bars_file")
+        if not aligned.ok or not bars_file:
+            rejected.append({"symbol": symbol, "reason": "align failed"})
+            info(f"{symbol}: rejected (align failed)")
+            continue
+        bars, load_error = _load_bars_or_error(bars_file)
+        if load_error is not None:
+            rejected.append({"symbol": symbol, "reason": load_error.message})
+            continue
+        assert bars is not None
+        resolved = infer_symbol(bars, symbol)
+        try:
+            result = run_managed_aligned_backtest_from_bars(
+                bars,
+                strategy_name="persona-adaptive",
+                symbol=symbol,
+                volume=0.1,
+                point_value=default_point_value(resolved),
+                config=BacktestConfig(
+                    initial_balance=100_000.0,
+                    point_size=0.01,
+                    point_value=default_point_value(resolved),
+                    commission_per_volume=commission,
+                    slippage_points=slippage,
+                ),
+                trade_config=_trade_config_from_risk(),
+                persona_config=_persona_config_from_risk(resolved),
+            )
+        except Exception as exc:  # pragma: no cover - broker/data dependent
+            rejected.append({"symbol": symbol, "reason": f"backtest error: {exc}"})
+            continue
+
+        gross_profit = sum(float(trade.realized_pnl) for trade in result.trades if trade.realized_pnl > 0)
+        gross_loss = abs(sum(float(trade.realized_pnl) for trade in result.trades if trade.realized_pnl < 0))
+        profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
+        trades = int(result.metrics.trades)
+        total_return = float(result.metrics.total_return)
+        drawdown = float(result.metrics.max_drawdown)
+        admitted_ok = (
+            trades >= min_trades
+            and total_return > min_return
+            and drawdown < max_drawdown
+            and profit_factor >= min_profit_factor
+        )
+        record: dict[str, object] = {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "total_return": total_return,
+            "max_drawdown": drawdown,
+            "profit_factor": profit_factor,
+            "trades": trades,
+            "admitted": admitted_ok,
+        }
+        if admitted_ok:
+            admitted.append(record)
+        else:
+            record["reason"] = f"trades={trades} return={total_return:+.1%} dd={drawdown:.1%} pf={profit_factor:.2f}"
+            rejected.append(record)
+        info(f"{symbol}: {'ADMITTED' if admitted_ok else 'rejected'} "
+             f"(return {total_return:+.1%}, dd {drawdown:.1%}, pf {profit_factor:.2f}, trades {trades})")
+
+    payload = {"timeframe": timeframe, "admitted": admitted, "rejected": rejected}
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(payload, indent=2, default=str))
+    return TaskResult(True, f"admitted {len(admitted)}/{len(symbol_list)} symbols -> {out_path}", payload)
+
+
+def collect_incremental(
+    symbol: str,
+    *,
+    lookback: str = "7d",
+    timeframes: list[str] | None = None,
+    root: str | Path = "data/raw",
+) -> TaskResult:
+    """Top-up the local store with only the newest bars + ticks (online mode).
+
+    Re-downloading full history every run is wasteful; this pulls just the
+    trailing ``lookback`` window and lets the storage merge + de-duplicate into
+    the existing partitioned files, so the archive stays current forever and
+    every backtest / RL run / paper warmup reads the freshest data. Run it on a
+    schedule (cron every few minutes/hours) or right before the paper loop.
+    """
+    from slytrade.progress import info, stage
+
+    if timeframes is None:
+        timeframes = ["M1", "M5", "M15", "H1", "H4", "D1"]
+
+    stage(f"Incremental collect {symbol} (last {lookback}) — newest bars + ticks only")
+    bars = _collect_bars_from_mt5(symbol, lookback=lookback, timeframes=timeframes, root=root)
+    if not bars.ok:
+        return bars
+    ticks = _collect_ticks_from_mt5(symbol, lookback=lookback, root=root)
+    if not ticks.ok:
+        info(f"recent ticks unavailable ({ticks.message}); bars are fresh")
+    info(f"incremental collect complete for {symbol}")
+    return TaskResult(
+        True,
+        f"incremental collect complete for {symbol} (bars fresh; archive merged)",
+        {"bars": bars.data or {}, "ticks": ticks.data if ticks.ok else {}},
+    )
+
+
+# ---------------------------------------------------------------------------
 # Task: clean (reset derived data without touching directory ownership)
 # ---------------------------------------------------------------------------
 
