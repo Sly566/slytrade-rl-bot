@@ -324,13 +324,16 @@ class DashboardServer:
                 return
 
             def _authorized(self) -> bool:
-                if not server.token:
+                # ``server.token`` may hold one token or a comma-separated list
+                # of tokens (one per user/device). Empty = open (localhost use).
+                tokens = {t.strip() for t in server.token.split(",") if t.strip()}
+                if not tokens:
                     return True
                 header = self.headers.get("Authorization", "")
                 if header.startswith("Bearer "):
-                    return header[7:].strip() == server.token
+                    return header[7:].strip() in tokens
                 query = parse_qs(urlparse(self.path).query)
-                return query.get("token", [""])[0] == server.token
+                return query.get("token", [""])[0] in tokens
 
             def _send(self, code: int, body: bytes, ctype: str, *, cache_control: str | None = None) -> None:
                 self.send_response(code)

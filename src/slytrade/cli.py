@@ -1472,7 +1472,7 @@ def dashboard(
     host: str = typer.Option("0.0.0.0", help="Bind address"),
     port: int = typer.Option(8080, help="Dashboard HTTP port"),
     command: str | None = typer.Option(None, help="Loop to supervise: paper or live (default from SLYTRADE_DASHBOARD_COMMAND)"),
-    token: str | None = typer.Option(None, help="Bearer token protecting the dashboard (default from SLYTRADE_DASHBOARD_TOKEN)"),
+    token: str | None = typer.Option(None, help="Bearer token(s) protecting the dashboard — comma-separated for multiple users (default from SLYTRADE_DASHBOARD_TOKEN)"),
     no_supervise: bool = typer.Option(False, "--no-supervise", help="Serve the dashboard only; do not spawn a trading loop"),
 ) -> None:
     """Run the web dashboard / control platform.
@@ -1511,6 +1511,23 @@ def dashboard(
         console.print("[yellow]Dashboard stopped.[/yellow]")
     finally:
         server.stop()
+
+
+@app.command()
+def gen_token() -> None:
+    """Generate a fresh dashboard access token (for authorizing a user or device)."""
+    import secrets
+
+    token = secrets.token_urlsafe(32)
+    console.print(f"[bold green]New dashboard token:[/bold green] {token}")
+    console.print("")
+    console.print("Authorize a user/device by adding this token to SLYTRADE_DASHBOARD_TOKEN")
+    console.print("(comma-separated for multiple users), then restart the dashboard:")
+    console.print("")
+    console.print("  SLYTRADE_DASHBOARD_TOKEN=tok1,tok2,tok3 slytrade dashboard")
+    console.print("")
+    console.print("The token is a secret — share it privately, one per user, so you can")
+    console.print("revoke a single user by removing their token and restarting.")
 
 
 @app.command()

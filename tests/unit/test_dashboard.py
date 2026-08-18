@@ -103,6 +103,36 @@ def test_dashboard_token_auth(tmp_path) -> None:
         server.stop()
 
 
+def test_dashboard_multi_token_auth(tmp_path) -> None:
+    """Comma-separated tokens = one capability per user; each works, none else."""
+    server = DashboardServer(host="127.0.0.1", port=0, token="alice-tok,bob-tok", state_dir=str(tmp_path), data_dir=str(tmp_path), log_dir=str(tmp_path))
+    server.start()
+    try:
+        base = f"http://127.0.0.1:{server.bound_port}"
+        assert _get(base + "/api/status", token="alice-tok")[0] == 200
+        assert _get(base + "/api/status", token="bob-tok")[0] == 200
+        assert _get(base + "/api/status", token="eve-tok")[0] == 401
+        assert _get(base + "/api/status")[0] == 401
+    finally:
+        server.stop()
+
+
+def test_gen_token_command_prints_a_token(tmp_path) -> None:
+    from typer.testing import CliRunner
+
+    from slytrade.cli import app
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["gen-token"])
+    assert result.exit_code == 0
+    assert "New dashboard token:" in result.output
+    # token_urlsafe(32) is 43 chars of A-Za-z0-9_- — strip the label line and check length
+    token_line = [line for line in result.output.splitlines() if "New dashboard token:" in line][0]
+    token = token_line.split(":", 1)[1].strip()
+    assert len(token) >= 32
+    assert "," not in token  # no commas — safe to comma-separate lists
+
+
 def test_dashboard_trades_reads_journal(tmp_path) -> None:
     journal_dir = tmp_path / "live_journal"
     journal_dir.mkdir(parents=True)
