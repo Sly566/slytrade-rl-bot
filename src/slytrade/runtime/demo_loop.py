@@ -263,6 +263,39 @@ class LiveTradingLoop:
                 return candidate
         return None
 
+    def _broker_warmup(self, resolved_symbol: str) -> None:
+        """Seed the bot from the TERMINAL's own recent bars (authoritative).
+
+        The bot must join the market already current — not rebuild bars from
+        scratch and not analyze a stale price level. This pulls the freshest
+        ``history_bars`` bars from MT5 (ending at "now", including the
+        still-forming bar), seeds the feature window with the completed bars,
+        and seeds the BarBuilder with the in-progress bar so it CONTINUES it.
+        Falls back to the file warmup (and then a clear warning) when the
+        terminal can't supply bars.
+        """
+        try:
+            bars = self.adapter.recent_bars(resolved_symbol, self.settings.timeframe, int(self.settings.history_bars))
+        except Exception as exc:  # pragma: no cover - broker dependent
+            self.logger.warning(f"broker warmup failed: {exc}; falling back to file warmup", extra={"event": "broker_warmup_fail"})
+            self._warmup(resolved_symbol)
+            return
+        if bars is None or (hasattr(bars, "empty") and bars.empty) or len(bars) < 2:
+            self.logger.warning("broker warmup returned no bars; falling back to file warmup", extra={"event": "broker_warmup_empty"})
+            self._warmup(resolved_symbol)
+            return
+        completed = bars.iloc[:-1]
+        in_progress = bars.iloc[-1]
+        self._window_bars.extend(row.to_dict() for _, row in completed.iterrows())
+        self.bar_builder.seed(in_progress.to_dict())
+        last_closed = pd.Timestamp(completed["time"].iloc[-1])
+        self.logger.info(
+            f"broker warmup: {len(completed)} bars loaded + continuing the current bar — "
+            f"bot is in sync, last closed bar {last_closed}, no wait beyond the next bar close",
+            extra={"event": "broker_warmup", "bars": len(completed), "last_closed": str(last_closed),
+                   "in_progress": str(pd.Timestamp(in_progress["time"]))},
+        )
+
     def _warmup(self, resolved_symbol: str) -> None:
         """Seed the feature window from stored bars before the first streamed bar.
 
@@ -432,7 +465,7 @@ class LiveTradingLoop:
 
         self.adapter.connect()
         resolved = self.adapter.resolve_symbol(self.settings.symbol)
-        self._warmup(resolved)
+        self._broker_warmup(resolved)
         try:
             spec = self.adapter.symbol_spec(resolved)
             self._point_value = spec.point_value_per_price_unit

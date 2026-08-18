@@ -131,6 +131,37 @@ class MT5BrokerAdapter:
             )
         return resolved
 
+    def recent_bars(self, symbol: str, timeframe: str, count: int = 2000) -> Any:
+        """Pull the terminal's own most-recent bars (ends at "now").
+
+        ``copy_rates_from_pos`` returns the freshest ``count`` bars including
+        the still-forming current bar. This is the authoritative warmup source:
+        the bot joins with the market's actual recent history at the current
+        price level instead of stale archive data. Returns a canonical bar
+        frame (empty/None on failure).
+        """
+        try:
+            import pandas as pd
+
+            from slytrade.data.mt5_collectors import TIMEFRAME_ATTRS
+            from slytrade.data.schemas import normalize_bar_frame
+
+            tf_attr = TIMEFRAME_ATTRS.get(timeframe.upper(), "TIMEFRAME_M15")
+            tf_const = getattr(self.mt5, tf_attr)
+            expression = (
+                f"[r._asdict() for r in (mt5.copy_rates_from_pos({json.dumps(symbol)}, "
+                f"mt5.{tf_attr}, 0, {int(count)}) or [])]"
+            )
+            raw = self._call_remote("copy_rates_from_pos", expression, symbol, tf_const, 0, int(count))
+            if raw is None:
+                return pd.DataFrame()
+            if not isinstance(raw, list):
+                # numpy structured array fallback
+                raw = [dict(zip(raw.dtype.names, row, strict=False)) for row in raw]
+            return normalize_bar_frame(raw, symbol, timeframe)
+        except Exception:  # pragma: no cover - broker/bridge dependent
+            return None
+
     def quote(self, symbol: str) -> Quote:
         tick = self._call_remote("symbol_info_tick", f"mt5.symbol_info_tick({json.dumps(symbol)})._asdict()", symbol)
         if tick is None:

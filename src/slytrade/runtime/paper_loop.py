@@ -168,6 +168,24 @@ class BarBuilder:
     def _bucket(self, ts: pd.Timestamp) -> pd.Timestamp:
         return ts.floor(pd.Timedelta(timeframe_duration(self.timeframe)))
 
+    def seed(self, bar: dict[str, Any]) -> None:
+        """Seed the in-progress bar so the builder CONTINUES it.
+
+        Used at startup after a broker warmup: the terminal already holds the
+        current (still-forming) bar, so the builder joins it mid-bar instead of
+        restarting from scratch. The next completed bar is the natural close of
+        the seeded bucket — the bot is immediately in sync with the market.
+        """
+        seeded = dict(bar)
+        if "quote_bid" not in seeded or not seeded.get("quote_bid"):
+            seeded["quote_bid"] = float(seeded.get("close", 0.0) or 0.0)
+        if "quote_ask" not in seeded or not seeded.get("quote_ask"):
+            seeded["quote_ask"] = float(seeded.get("close", 0.0) or 0.0)
+        if not seeded.get("tick_volume"):
+            seeded["tick_volume"] = 1
+        seeded.setdefault("quote_time", None)
+        self._current = seeded
+
     def _new_bar(self, bucket: pd.Timestamp, quote: Quote) -> dict[str, Any]:
         return {
             "time": bucket,
