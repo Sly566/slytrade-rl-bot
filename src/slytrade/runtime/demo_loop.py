@@ -98,6 +98,11 @@ class LiveTradingLoop:
     _minlot_warned: bool = field(default=False, init=False)
     _journal_open: dict[str, Any] | None = field(default=None, init=False)
     _pending_limit: dict[str, Any] | None = field(default=None, init=False)  # working limit order
+    _ticks: int = field(default=0, init=False)
+    _quotes_seen: int = field(default=0, init=False)
+    _stale_quotes: int = field(default=0, init=False)
+    _last_heartbeat_at: float = field(default=0.0, init=False)
+    _last_quote: Quote | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         self.logger = setup_logging(self.settings.log_level, self.settings.log_dir, self.settings.json_logs)
@@ -239,29 +244,52 @@ class LiveTradingLoop:
         """Seed the feature window from stored bars before the first streamed bar.
 
         Pre-fills ATR/EMA/H4/D1 context so the champion's gates are warm from
-        the first bar instead of cold for the first ``history_bars``.
+        the first bar instead of cold for the first ``history_bars``. Every
+        path logs explicitly — a silent no-op here cost 4 hours of cold H4
+        context once before.
         """
         path = self.settings.replay_bars_file
         if not path:
+            self.logger.warning(
+                "warmup: no replay bars file configured (cold start)",
+                extra={"event": "warmup_none", "hint": "set SLYTRADE_REPLAY_BARS_FILE=data/processed/aligned/XAUUSD/m15/bars.parquet"},
+            )
             return
         try:
             frame = pd.read_parquet(path)
-        except Exception:
+        except Exception as exc_parquet:
             try:
                 frame = pd.read_csv(path)
-            except Exception as exc:  # pragma: no cover
-                self.logger.warning("warmup skipped", extra={"event": "warmup_skip", "reason": str(exc)})
+            except Exception as exc_csv:  # pragma: no cover
+                self.logger.warning(
+                    "warmup skipped: could not read file",
+                    extra={"event": "warmup_skip", "path": path, "reason": str(exc_csv) or str(exc_parquet)},
+                )
                 return
         if frame is None or frame.empty:
+            self.logger.warning("warmup skipped: file has no rows", extra={"event": "warmup_empty", "path": path})
             return
         if "symbol" in frame.columns:
-            frame = frame[frame["symbol"].astype(str) == resolved_symbol]
+            # Match BOTH the canonical research symbol (XAUUSD) and the broker
+            # symbol (XAUUSDm) — the aligned bars are canonical while the
+            # adapter resolves to the broker suffix.
+            symbols = frame["symbol"].astype(str)
+            base = resolved_symbol.split("m")[0] if resolved_symbol.endswith("m") else resolved_symbol
+            frame = frame[symbols.str.upper().isin({resolved_symbol.upper(), base.upper()})]
         if frame.empty:
+            self.logger.warning(
+                "warmup skipped: no rows for symbol",
+                extra={"event": "warmup_symbol_miss", "path": path, "resolved": resolved_symbol},
+            )
             return
         frame = frame.sort_values("time")
         cap = max(64, int(self.settings.history_bars))
-        self._window_bars.extend(row.to_dict() for _, row in frame.tail(cap).iterrows())
-        self.logger.info("warmup loaded", extra={"event": "warmup", "bars": len(frame.tail(cap))})
+        tail = frame.tail(cap)
+        self._window_bars.extend(row.to_dict() for _, row in tail.iterrows())
+        self.logger.info(
+            "warmup loaded",
+            extra={"event": "warmup", "bars": len(tail), "first": str(tail["time"].iloc[0]), "last": str(tail["time"].iloc[-1])},
+        )
 
     # -- live journal (the bot's memory) --------------------------------------
     def _journal_path(self) -> Path:
@@ -386,6 +414,40 @@ class LiveTradingLoop:
         )
         if not reconciliation.reconciled:
             self.alerter.alert("critical", "live loop blocked", reconciliation.detail)
+        # Full startup summary: the operator can see the whole plan at a glance.
+        profile = self._profile
+        strat_cfg = self.strategy.config
+        hb = max(float(self.settings.heartbeat_interval_seconds or 5.0), 5.0)
+        self.logger.info(
+            "live config: "
+            f"symbol={resolved} timeframe={self.settings.timeframe} min_score={strat_cfg.min_score} "
+            f"cooldown={strat_cfg.cooldown_bars} htf={strat_cfg.htf_trend_timeframe} "
+            f"limit_entry={strat_cfg.limit_entry_atr}ATR stop={profile.stop_loss_atr}ATR target={profile.take_profit_atr}ATR "
+            f"max_hold={profile.max_bars_in_trade} risk={self.breaker.limits.risk_per_trade:.1%}/trade "
+            f"window={self.settings.trading_days} {self.settings.trading_start_utc}-{self.settings.trading_end_utc} "
+            f"news={'on' if self.settings.news_enabled else 'off'} poll={self.settings.poll_seconds}s "
+            f"heartbeat={hb}s history={self.settings.history_bars} warm_bars={len(self._window_bars)}",
+            extra={
+                "event": "config",
+                "symbol": resolved,
+                "timeframe": self.settings.timeframe,
+                "min_score": strat_cfg.min_score,
+                "cooldown_bars": strat_cfg.cooldown_bars,
+                "htf_trend_timeframe": strat_cfg.htf_trend_timeframe,
+                "limit_entry_atr": strat_cfg.limit_entry_atr,
+                "stop_atr": profile.stop_loss_atr,
+                "target_atr": profile.take_profit_atr,
+                "max_bars_in_trade": profile.max_bars_in_trade,
+                "risk_per_trade": self.breaker.limits.risk_per_trade,
+                "window_days": self.settings.trading_days,
+                "window_hours": f"{self.settings.trading_start_utc}-{self.settings.trading_end_utc}",
+                "news_enabled": self.settings.news_enabled,
+                "poll_seconds": self.settings.poll_seconds,
+                "heartbeat_seconds": hb,
+                "history_bars": self.settings.history_bars,
+                "window_bars_warm": len(self._window_bars),
+            },
+        )
 
         try:
             while not self._stop.is_set():
@@ -417,12 +479,17 @@ class LiveTradingLoop:
                     time.sleep(self.settings.poll_seconds)
                     continue
 
+                self._ticks += 1
+                self._quotes_seen += 1
+                self._last_quote = quote
+
                 bar = self.bar_builder.on_quote(quote)
                 if bar is not None:
                     self._bar_index += 1
                     self._on_bar(bar, quote, resolved)
                 self._export_metrics(resolved)
                 self._heartbeat()
+                self._status_heartbeat(quote, resolved)
                 time.sleep(self.settings.poll_seconds)
         finally:
             self.adapter.disconnect()
@@ -448,9 +515,14 @@ class LiveTradingLoop:
             self._alert_kill_switch_once()
             return
         if not self.window.is_open(quote.time):
+            self.logger.info("window closed — no entries", extra={"event": "window_closed", "time": str(quote.time)})
             return
         if self.news_gate.is_red_folder(quote.time):
             self.metrics.news_pauses_total.inc()
+            self.logger.info(
+                "red folder — entries paused",
+                extra={"event": "news_pause", "reason": self.news_gate.reason(quote.time) or "news"},
+            )
             return
         decision = self.breaker.check()
         if not decision.allowed:
@@ -473,7 +545,13 @@ class LiveTradingLoop:
             if hook is not None:
                 hook()
             self._journal_exit(resolved_symbol, bar, quote)
+            self.logger.info("position closed", extra={"event": "position_closed", "symbol": resolved_symbol})
         self._side = side
+        if side != "flat":
+            self.logger.info(
+                f"holding {side} — SL/TP managed server-side on the broker",
+                extra={"event": "holding", "side": side, "symbol": resolved_symbol},
+            )
 
         # Working limit order: the broker fills it into a position, or it sits
         # until its hold window expires and we cancel it. Never stack a second
@@ -497,6 +575,7 @@ class LiveTradingLoop:
         if self._side == "flat":
             series = self._decision_series(bar)
             intent = self.strategy.on_bar(self._bar_index, series)
+            self.logger.info(self._decision_trace(series, quote, intent), extra={"event": "decision"})
             if intent is None:
                 return
             sized = self._sized_intent(intent, series, quote)
@@ -706,6 +785,114 @@ class LiveTradingLoop:
 
     def _heartbeat(self) -> None:
         self.soak.record(healthy=True)
+
+    def _status_heartbeat(self, quote: Quote, resolved_symbol: str) -> None:
+        """Periodic 'alive' line so the operator can SEE the loop working.
+
+        Logs one compact status line every ``heartbeat_interval_seconds``:
+        current price, how many quotes were seen, bars built, position state,
+        pending limit and account equity. Nothing else prints between bars, so
+        this is the proof-of-life signal.
+        """
+        interval = max(float(self.settings.heartbeat_interval_seconds or 5.0), 5.0)
+        now = time.monotonic()
+        if now - self._last_heartbeat_at < interval:
+            return
+        self._last_heartbeat_at = now
+        held = self._current_positions(resolved_symbol).get(resolved_symbol, 0.0)
+        side = "long" if held > 0 else ("short" if held < 0 else "flat")
+        equity = None
+        try:
+            info = self.adapter.account_info()
+            equity = float(getattr(info, "equity", None) or 0.0)
+        except Exception:  # pragma: no cover
+            equity = None
+        pending = (
+            f"{self._pending_limit['side']}@{self._pending_limit['entry']} (bar {self._pending_limit['bars']}/ttl)"
+            if self._pending_limit else "none"
+        )
+        msg = (
+            f"♥ alive tick={self._ticks} price={round(float(quote.mid), 2)} "
+            f"quotes={self._quotes_seen} bars={self._bar_index} side={side} "
+            f"limit={pending} equity={round(equity, 2) if equity is not None else 'n/a'} "
+            f"errors={self._errors}"
+        )
+        self.logger.info(
+            msg,
+            extra={
+                "event": "heartbeat",
+                "tick": self._ticks,
+                "price": round(float(quote.mid), 2),
+                "quotes_seen": self._quotes_seen,
+                "bars_built": self._bar_index,
+                "side": side,
+                "pending_limit": pending,
+                "equity": round(equity, 2) if equity is not None else None,
+                "errors": self._errors,
+            },
+        )
+
+    def _decision_trace(self, series: pd.Series, quote: Quote, intent: OrderIntent | None) -> str:
+        """Compact per-bar readout of WHAT the champion saw and WHY it decided.
+
+        This is the 'every little process' line: the two confluence scores,
+        the threshold, the H4 direction, MTF bias, cooldown remaining, and the
+        decision (HOLD + likely reason, or the emitted intent). Best-effort and
+        non-fatal by design.
+        """
+
+        def g(name: str, default: float = 0.0) -> float:
+            if name not in series.index:
+                return default
+            value = series[name]
+            if pd.isna(value):
+                return default
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+
+        strat = self.strategy
+        long_score = short_score = 0.0
+        scorer = getattr(strat, "_scorer", None)
+        if scorer is not None:
+            try:
+                long_score = float(scorer._long_score(series))
+            except Exception:  # pragma: no cover
+                long_score = 0.0
+            try:
+                short_score = float(scorer._short_score(series))
+            except Exception:  # pragma: no cover
+                short_score = 0.0
+        min_score = int(getattr(strat.config, "min_score", 4) or 4)
+        cooldown = int(getattr(strat.config, "cooldown_bars", 0) or 0)
+        last_entry = int(getattr(strat, "_last_entry_index", -10_000_000) or -10_000_000)
+        bars_since = int(self._bar_index) - last_entry
+        cooldown_left = max(0, cooldown - bars_since)
+        htf = g("htf_h4_bos_dir")
+        bias = g("mtf_bias")
+        atr = g("atr")
+
+        if intent is not None:
+            entry = f"@{intent.limit_price}" if intent.kind == OrderKind.LIMIT and intent.limit_price else "@market"
+            return (
+                f"bar {self._bar_index} close={g('close'):.2f} atr={atr:.2f} "
+                f"long={long_score:.0f} short={short_score:.0f} (need>={min_score}) "
+                f"h4={htf:+.0f} bias={bias:+.0f} → SIGNAL {intent.side.value} {intent.kind.value} {entry}"
+            )
+        if cooldown_left > 0:
+            reason = f"cooldown {cooldown_left} bars left"
+        elif max(long_score, short_score) < min_score:
+            reason = f"below threshold (max score {max(long_score, short_score):.0f} < {min_score})"
+        elif bias != 0 and htf != 0 and bias != htf:
+            reason = "H4 alignment blocked"
+        else:
+            reason = "quality gate (no footprint/momentum)"
+        return (
+            f"bar {self._bar_index} close={g('close'):.2f} atr={atr:.2f} "
+            f"long={long_score:.0f} short={short_score:.0f} (need>={min_score}) "
+            f"h4={htf:+.0f} bias={bias:+.0f} → HOLD ({reason})"
+        )
 
     def _alert_kill_switch_once(self) -> None:
         if self._kill_switch_alerted:
