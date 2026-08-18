@@ -33,46 +33,47 @@ class TimeframeProfile:
     take_profit_atr: float
     max_bars_in_trade: int | None
     htf_trend_timeframe: str | None
+    cost_per_trade_r: float
     note: str
 
 
 TIMEFRAME_PROFILES: dict[str, TimeframeProfile] = {
     "H1": TimeframeProfile(
         min_score=4, cooldown_bars=20, stop_loss_atr=1.0, take_profit_atr=2.0,
-        max_bars_in_trade=None, htf_trend_timeframe="h4",
+        max_bars_in_trade=None, htf_trend_timeframe="h4", cost_per_trade_r=0.021,
         note="+17.7% 1stY / +9.1% 2ndY OOS, PF 1.66/1.32, max DD 4.2% — the champion",
     ),
     "M15": TimeframeProfile(
         min_score=3, cooldown_bars=10, stop_loss_atr=1.0, take_profit_atr=3.0,
-        max_bars_in_trade=60, htf_trend_timeframe="h4",
+        max_bars_in_trade=60, htf_trend_timeframe="h4", cost_per_trade_r=0.043,
         note="+12.7% 1stY / +25.7% 2ndY OOS, PF 1.13/1.24 — the profitable scalping timeframe",
     ),
     "M5": TimeframeProfile(
         min_score=3, cooldown_bars=20, stop_loss_atr=1.0, take_profit_atr=2.0,
-        max_bars_in_trade=None, htf_trend_timeframe="h4",
+        max_bars_in_trade=None, htf_trend_timeframe="h4", cost_per_trade_r=0.076,
         note="negative net of costs (overtrading + ~7.6% cost/R) — not recommended",
     ),
     "M1": TimeframeProfile(
         min_score=4, cooldown_bars=20, stop_loss_atr=1.0, take_profit_atr=2.0,
-        max_bars_in_trade=None, htf_trend_timeframe="h4",
+        max_bars_in_trade=None, htf_trend_timeframe="h4", cost_per_trade_r=0.176,
         note="structurally unprofitable: ~17.6% cost/R vs ~5% gross edge at the scalp horizon",
     ),
     # Reasonable defaults for the remaining bar timeframes (not re-validated).
     "M30": TimeframeProfile(
         min_score=4, cooldown_bars=15, stop_loss_atr=1.0, take_profit_atr=2.0,
-        max_bars_in_trade=None, htf_trend_timeframe="h4", note="defaults (unvalidated)",
+        max_bars_in_trade=None, htf_trend_timeframe="h4", cost_per_trade_r=0.043, note="defaults (unvalidated)",
     ),
     "H4": TimeframeProfile(
         min_score=4, cooldown_bars=5, stop_loss_atr=1.0, take_profit_atr=2.0,
-        max_bars_in_trade=None, htf_trend_timeframe="d1", note="defaults (unvalidated)",
+        max_bars_in_trade=None, htf_trend_timeframe="d1", cost_per_trade_r=0.011, note="defaults (unvalidated)",
     ),
     "D1": TimeframeProfile(
         min_score=4, cooldown_bars=1, stop_loss_atr=1.0, take_profit_atr=2.0,
-        max_bars_in_trade=None, htf_trend_timeframe=None, note="defaults (unvalidated)",
+        max_bars_in_trade=None, htf_trend_timeframe=None, cost_per_trade_r=0.021, note="defaults (unvalidated)",
     ),
     "W1": TimeframeProfile(
         min_score=4, cooldown_bars=1, stop_loss_atr=1.0, take_profit_atr=2.0,
-        max_bars_in_trade=None, htf_trend_timeframe=None, note="defaults (unvalidated)",
+        max_bars_in_trade=None, htf_trend_timeframe=None, cost_per_trade_r=0.021, note="defaults (unvalidated)",
     ),
 }
 

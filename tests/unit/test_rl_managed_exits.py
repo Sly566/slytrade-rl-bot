@@ -122,4 +122,17 @@ def test_observation_includes_mode_vector_dimension() -> None:
     config = RLEnvironmentConfig(reward_type="trade_pnl")
     env = SlyTradeRLEnvironment(features=features, bars=bars, config=config, mode_vector=np.zeros(6, dtype=np.float32))
     obs, _ = env.reset()
-    assert obs.shape == (1 + 6,)
+    # 1 feature + 6 mode + 5 agent-state scalars.
+    assert obs.shape == (1 + 6 + 5,)
+
+
+def test_observation_includes_agent_state() -> None:
+    bars = make_bars(120, drift=0.01)
+    features = pd.DataFrame({"f1": np.zeros(120, dtype=float)})
+    config = RLEnvironmentConfig(reward_type="trade_pnl")
+    env = SlyTradeRLEnvironment(features=features, bars=bars, config=config)
+    obs, _ = env.reset()
+    # The last 5 elements are the agent-state vector; position starts at 0.
+    assert obs.shape == (1 + 5,)
+    assert obs[-5] == 0.0  # position
+    assert obs[-1] == 0.0  # episode progress at reset (step 0)

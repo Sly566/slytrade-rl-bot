@@ -106,6 +106,11 @@ class RLEnvironmentConfig:
     stop_loss_atr: float = 1.0
     take_profit_atr: float = 2.0
     trailing_stop_atr: float | None = None
+    # Time-based exit in bars (0 = off). The validated per-timeframe profiles
+    # use this (e.g. M15 holds 60 bars), and the RL must play the SAME game as
+    # the champion it is measured against — otherwise it is optimising a
+    # different, worse exit structure.
+    max_bars_in_trade: int = 0
     # Production reward (reward_type="r_multiple") — the unit is R, the risk
     # at entry. Entry/regret shaping is driven by the ICT footprint score.
     setup_score_threshold: int = 4
@@ -122,6 +127,20 @@ class RLEnvironmentConfig:
     # cap the agent may only hold or flatten — it can never open new risk. A
     # sane value forces the agent to pick its best few setups, like a pro.
     max_trades_per_episode: int = 0
+    # Candidate-bar masking (the "RL as a filter" methodology). When enabled,
+    # the env only accepts new entries on bars where the persona would consider
+    # a setup (the candidate mask); everywhere else the agent may only hold or
+    # flatten. This is NOT a hardcoded trade cap — the candidates ARE the
+    # dynamic opportunities, so the agent's selectivity is bounded by the
+    # market's own setups, exactly like a pro who only looks for their pattern.
+    mask_to_candidates: bool = False
+    # Round-trip trading cost in R, charged once per opened leg (spread +
+    # commission + slippage, measured per timeframe from real data: M15 ~0.043,
+    # H1 ~0.021, H4 ~0.011, M5 ~0.076, M1 ~0.176). The old price-fraction cost
+    # (0.0002) converted to ~0.16R on gold — ~4x the real cost — which is why
+    # even the champion barely broke even inside the env. This must match the
+    # backtest's net-of-cost economics or the RL is learning a different game.
+    round_trip_cost_r: float = 0.04
 
 
 if gym is not None:
@@ -138,6 +157,7 @@ if gym is not None:
             config: RLEnvironmentConfig | None = None,
             mode_vector: np.ndarray | None = None,
             ledger: TradeLedger | None = None,
+            candidate_mask: np.ndarray | None = None,
             **_: object,
         ):
             if features.empty or len(features) != len(bars):
@@ -152,13 +172,27 @@ if gym is not None:
             self.bars = bars if isinstance(bars.index, pd.RangeIndex) else bars.reset_index(drop=True)
             self.config = config or RLEnvironmentConfig()
             self.mode_vector = mode_vector
+            self.candidate_mask = (
+                np.asarray(candidate_mask, dtype=np.float32) if candidate_mask is not None else None
+            )
             # Precompute the full observation matrix once (float32) so each
             # step's observation is a single numpy row slice instead of a
             # pandas Series -> numpy conversion. When the frame is already
             # float32 this is a zero-copy view of its buffer.
             self._feature_matrix = self.features.to_numpy(dtype=np.float32)
             self._mode_vector32 = np.asarray(mode_vector, dtype=np.float32) if mode_vector is not None else None
-            shape = len(self.features.columns) + (len(mode_vector) if mode_vector is not None else 0)
+            # Agent state appended to the observation (the part of the Markov
+            # state the raw features do not carry): position, bars-in-trade,
+            # entries-used, last-exit-R, episode progress. Without these the
+            # policy cannot learn "I am already in a trade / I just lost" —
+            # which is exactly the statefulness the persona exploits.
+            self._state_vector = np.zeros(5, dtype=np.float32)
+            self._n_state = 5
+            shape = (
+                len(self.features.columns)
+                + (len(mode_vector) if mode_vector is not None else 0)
+                + self._n_state
+            )
             self.observation_space = spaces.Box(-np.inf, np.inf, shape=(shape,), dtype=np.float32)
             self.action_space = spaces.Discrete(4)
             self.ledger = ledger or TradeLedger()
@@ -174,6 +208,8 @@ if gym is not None:
             self._last_exit_price = 0.0
             self._closed_r: list[float] = []
             self._regret_charged = False
+            self._entries_this_episode = 0
+            self._bars_in_trade = 0
 
         def reset(self, *, seed: int | None = None, options: dict | None = None):
             super().reset(seed=seed)
@@ -190,7 +226,9 @@ if gym is not None:
             self._closed_r = []
             self._regret_charged = False
             self._entries_this_episode = 0
+            self._bars_in_trade = 0
             self.ledger.records.clear()
+            self._update_state_vector()
             return self._observation(), {}
 
         def step(self, action: int):
@@ -220,6 +258,18 @@ if gym is not None:
                 and self._entries_this_episode >= self.config.max_trades_per_episode
             ):
                 target = old_position
+            # Candidate-bar masking: outside the persona's candidate setups the
+            # agent may only hold or flatten. The candidates ARE the dynamic
+            # opportunities, so this bounds selectivity by the market's own
+            # setups rather than a hardcoded number.
+            if (
+                self.config.mask_to_candidates
+                and self.candidate_mask is not None
+                and target != 0
+                and (old_position == 0 or target != old_position)
+                and float(self.candidate_mask[self.current_step]) == 0.0
+            ):
+                target = old_position
             turnover = abs(target - old_position)
 
             previous_equity = self._equity
@@ -242,7 +292,7 @@ if gym is not None:
             current_bar = self.bars.iloc[min(self.current_step, len(self.bars) - 1)]
             current_close = float(current_bar["close"])
 
-            # --- 3) Managed exit (SL/TP/trailing) on the held leg ----------
+            # --- 3) Managed exit (SL/TP/trailing/time) on the held leg -----
             managed_realized = 0.0
             exit_price_for_equity: float | None = None
             if (
@@ -251,10 +301,21 @@ if gym is not None:
                 and self._position == target
                 and self.current_step < len(self.bars)
             ):
+                self._bars_in_trade += 1
                 managed_realized, exit_price = self._check_managed_exit(current_bar)
                 if managed_realized != 0.0 or exit_price is not None:
                     extra_closes += 1
                     exit_price_for_equity = exit_price
+                elif (
+                    self.config.max_bars_in_trade > 0
+                    and self._bars_in_trade >= self.config.max_bars_in_trade
+                ):
+                    # Time-based exit at the current close — same structure the
+                    # validated per-timeframe profiles use.
+                    managed_realized = self._realize_return(self._position, current_close)
+                    self._position = 0
+                    extra_closes += 1
+                    exit_price_for_equity = current_close
 
             # --- 4) Episode end: force-flatten an open position ------------
             self._episode_step += 1
@@ -306,6 +367,7 @@ if gym is not None:
             else:
                 reward = equity_change / max(previous_equity, 1e-12)
 
+            self._update_state_vector()
             return self._observation(), float(reward), terminated, truncated, {
                 "equity": float(self._equity),
                 "n_trades": len(self.ledger.records),
@@ -316,6 +378,7 @@ if gym is not None:
         def _open_leg(self, direction: int, price: float, bar: pd.Series) -> None:
             self._position = direction
             self._entry_price = price
+            self._bars_in_trade = 0
             atr = float(bar.get("atr", 0.0) or 0.0)
             if atr <= 0:
                 high = float(bar.get("high", price))
@@ -348,17 +411,15 @@ if gym is not None:
             return realized
 
         def _r_multiple_reward(self, decision_bar: pd.Series, *, opened: bool) -> float:
-            """Production reward: realised R minus the true opening cost.
+            """Production reward: realised R minus the true round-trip cost.
 
             With ``shaping_enabled`` it additionally adds entry-quality shaping
             (+bonus for high-confluence entries, −penalty for low-quality ones,
             −regret for staying flat on a setup). That shaping rewards activity,
             so it is OFF by default: the default reward is purely the realised
-            R of closed legs minus the actual opening cost in R — the only terms
-            that correspond to money in the account.
+            R of closed legs minus the measured round-trip cost in R — the only
+            terms that correspond to money in the account.
             """
-            from slytrade.rl.rewards import opening_cost_r
-
             reward = float(sum(self._closed_r))
 
             if opened:
@@ -368,11 +429,10 @@ if gym is not None:
                         reward += self.config.entry_quality_bonus
                     else:
                         reward -= self.config.low_quality_entry_penalty
-                reward -= opening_cost_r(
-                    self.config.transaction_cost,
-                    self._entry_price if self._entry_price > 0 else float(decision_bar["close"]),
-                    self._entry_stop_distance if self._entry_stop_distance > 0 else float(decision_bar["close"]) * 0.0002,
-                )
+                # Real cost: spread + commission + slippage as a round trip in R
+                # (per timeframe), instead of a price-fraction that blew up to
+                # ~4x the true cost on gold.
+                reward -= float(self.config.round_trip_cost_r)
                 self._regret_charged = True  # entered: don't charge regret this bar
                 return reward
 
@@ -477,9 +537,23 @@ if gym is not None:
         def _observation(self) -> np.ndarray:
             index = min(self.current_step, self._feature_matrix.shape[0] - 1)
             row = self._feature_matrix[index]
+            parts = [row]
             if self._mode_vector32 is not None:
-                return np.concatenate((row, self._mode_vector32))
-            return row
+                parts.append(self._mode_vector32)
+            parts.append(self._state_vector)
+            return np.concatenate(parts)
+
+        def _update_state_vector(self) -> None:
+            """Refresh the agent-state part of the observation."""
+            n = len(self.bars)
+            max_bars = self.config.max_bars_in_trade or 200
+            max_entries = self.config.max_trades_per_episode or 200
+            last_r = self._closed_r[-1] if self._closed_r else 0.0
+            self._state_vector[0] = float(np.clip(self._position, -1.0, 1.0))
+            self._state_vector[1] = min(float(self._bars_in_trade) / max_bars, 1.0)
+            self._state_vector[2] = min(float(self._entries_this_episode) / max_entries, 1.0)
+            self._state_vector[3] = float(np.clip(last_r, -5.0, 5.0)) / 5.0
+            self._state_vector[4] = float(self.current_step) / max(n, 1)
 
 else:
 

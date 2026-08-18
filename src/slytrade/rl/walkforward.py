@@ -157,16 +157,68 @@ def resolve_fold_windows(
 
 
 def persona_actions_for_bars(bars: pd.DataFrame) -> list[int]:
-    """Map the persona-adaptive strategy's decisions to env actions per bar.
+    """Map the persona-adaptive champion's ACTUAL entries to env actions.
 
-    0 = hold, 1 = enter/confirm long, 2 = enter/confirm short. The persona never
-    emits a flatten (managed exits handle that), so the cloned action set is
-    {0, 1, 2}. Uses the SAME validated per-timeframe profile + gates as the
-    backtest champion, so the policy inherits the champion's actual behaviour.
+    Runs the managed backtest (the champion's own engine, with its cooldown +
+    side state + gates) and maps each entry fill to its bar. 0 = hold, 1 = enter
+    long, 2 = enter short. This is the faithful champion reproduction — a naive
+    direct ``on_bar`` loop would never reset the persona's side after a managed
+    exit and would under-generate entries by ~10x.
     """
-    from slytrade.rl.dataset import persona_action_column
+    from slytrade.backtest.engine import BacktestConfig
+    from slytrade.backtest.reporting import run_managed_aligned_backtest_from_bars
+    from slytrade.tasks import _persona_config_from_risk, _trade_config_from_risk
 
-    return [int(value) for value in persona_action_column(bars).to_numpy()]
+    symbol = str(bars["symbol"].iloc[0]) if "symbol" in bars.columns else "XAUUSD"
+    timeframe = str(bars["timeframe"].iloc[0]) if "timeframe" in bars.columns else "H1"
+    # Synthetic / non-aligned bars (no decision_time) can't run the backtest:
+    # fall back to the direct strategy loop (fine for tests; the faithful
+    # backtest path is used on the pipeline's aligned bars).
+    if "decision_time" not in bars.columns:
+        from slytrade.strategies.personality_adaptive import PersonalityAdaptiveStrategy
+
+        strategy = PersonalityAdaptiveStrategy(symbol=symbol, volume=0.1, config=_persona_config_from_risk(symbol, timeframe))
+        actions: list[int] = []
+        for i in range(len(bars)):
+            intent = strategy.on_bar(i, bars.iloc[i])
+            actions.append(0 if intent is None else (1 if intent.side.value == "buy" else 2))
+        return actions
+    result = run_managed_aligned_backtest_from_bars(
+        bars,
+        strategy_name="persona-adaptive",
+        symbol=symbol,
+        volume=0.1,
+        point_value=100.0,
+        config=BacktestConfig(
+            initial_balance=100_000.0,
+            point_size=0.01,
+            point_value=100.0,
+            commission_per_volume=3.5,
+            slippage_points=5,
+        ),
+        trade_config=_trade_config_from_risk(timeframe),
+        persona_config=_persona_config_from_risk(symbol, timeframe),
+    )
+    # Map each entry fill's event time to the bar that emitted it (bar-open
+    # grid, side="right"-1). Robust UTC conversion: the ledger event times are
+    # tz-aware UTC; a naive one is assumed UTC.
+    from datetime import UTC
+
+    bar_opens = pd.to_datetime(bars["time"], utc=True).to_numpy(dtype="datetime64[ns]")
+    actions = [0] * len(bars)
+    for record in result.trades:
+        if not record.reason.startswith("persona_"):
+            continue
+        dt = record.event_time
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        else:
+            dt = dt.astimezone(UTC)
+        event_ns = np.datetime64(dt.replace(tzinfo=None), "ns")
+        index = int(np.searchsorted(bar_opens, event_ns, side="right") - 1)
+        if 0 <= index < len(actions):
+            actions[index] = 1 if record.side.value == "buy" else 2
+    return actions
 
 
 def collect_demonstrations(env, actions: list[int]) -> tuple[np.ndarray, np.ndarray]:
@@ -190,19 +242,43 @@ def collect_demonstrations(env, actions: list[int]) -> tuple[np.ndarray, np.ndar
 
 
 def behavioral_clone(model, obs: np.ndarray, act: np.ndarray, *, epochs: int = 5, lr: float = 1e-3, batch: int = 256) -> None:
-    """Supervised pretrain of the policy network to imitate the persona."""
+    """Supervised pretrain of the policy network to imitate the persona.
+
+    Class-balanced: ~99% of bars are "hold", so plain cross-entropy collapses
+    to an always-hold policy (the earlier BC under-fitting). The loss is
+    weighted by inverse class frequency and the minority (entry) classes are
+    upsampled into each minibatch, so the policy actually learns the rare
+    entries that carry the persona's edge.
+    """
     import torch
 
     policy = model.policy
     optimizer = torch.optim.Adam(policy.parameters(), lr=lr)
-    loss_fn = torch.nn.CrossEntropyLoss()
     x = torch.as_tensor(obs, dtype=torch.float32)
     y = torch.as_tensor(act, dtype=torch.long)
-    n = len(x)
+
+    # 4 actions (hold/long/short/flatten); the persona only emits {0,1,2} but
+    # the policy's action_net outputs 4 logits, so the weight tensor must match.
+    counts = torch.bincount(y, minlength=4).float()
+    weights = (counts.sum() / (counts + 1e-6)).clamp(max=50.0)
+    loss_fn = torch.nn.CrossEntropyLoss(weight=weights)
+
+    # Upsample each class so every minibatch is roughly class-balanced.
+    idx_by_class = [torch.nonzero(y == c, as_tuple=False).flatten() for c in range(4)]
+    largest = max(len(idx) for idx in idx_by_class)
+    balanced: list[torch.Tensor] = []
+    for idx in idx_by_class:
+        if len(idx) == 0:
+            continue
+        repeats = max(1, int(round(largest / len(idx))))
+        balanced.append(idx.repeat(repeats))
+    flat = torch.cat(balanced)
+    perm = torch.randperm(len(flat))
+    flat = flat[perm]
+
     for _ in range(epochs):
-        perm = torch.randperm(n)
-        for start in range(0, n, batch):
-            idx = perm[start : start + batch]
+        for start in range(0, len(flat), batch):
+            idx = flat[start : start + batch]
             features = policy.extract_features(x[idx])
             latent, _ = policy.mlp_extractor(features)
             logits = policy.action_net(latent)
@@ -540,11 +616,23 @@ def walk_forward_validation(
     from slytrade.rl.environment import RLEnvironmentConfig
 
     rows: list[dict] = []
+    # The RL must play the SAME exit game as the champion it is measured
+    # against: adopt the validated per-timeframe profile's stop/target/hold,
+    # otherwise it optimises a different (worse) structure than the persona
+    # backtest shown in rl_minus_persona.
+    from slytrade.config.timeframe_profiles import profile_for
+    from slytrade.rl.dataset import infer_timeframe
+
+    profile = profile_for(infer_timeframe(dataset.bars))
     env_config = RLEnvironmentConfig(
         seed=seed,
         reward_type=reward_type,
         shaping_enabled=shaping_enabled,
         max_trades_per_episode=max_trades_per_episode,
+        stop_loss_atr=profile.stop_loss_atr,
+        take_profit_atr=profile.take_profit_atr,
+        max_bars_in_trade=profile.max_bars_in_trade or 0,
+        round_trip_cost_r=profile.cost_per_trade_r,
     )
 
     for index, fold in enumerate(folds):

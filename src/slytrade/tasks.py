@@ -1121,12 +1121,27 @@ def train(
     except ImportError as exc:
         return TaskResult(False, f"RL dependencies not installed: {exc}")
     env.config = _with_reward(env.config, reward)
-    # Reward shaping off by default (it taught overtrading); activity brake.
+    # Reward shaping off by default (it taught overtrading); activity brake;
+    # and the RL plays the SAME exit game as the champion (per-timeframe
+    # profile's stop/target/hold), so rl_minus_persona is a fair comparison.
     from dataclasses import replace as _replace
 
-    env.config = _replace(env.config, shaping_enabled=shaping, max_trades_per_episode=max_trades_per_episode)
+    from slytrade.config.timeframe_profiles import profile_for
+    from slytrade.rl.dataset import infer_timeframe
+
+    _profile = profile_for(infer_timeframe(dataset.bars))
+    env.config = _replace(
+        env.config,
+        shaping_enabled=shaping,
+        max_trades_per_episode=max_trades_per_episode,
+        stop_loss_atr=_profile.stop_loss_atr,
+        take_profit_atr=_profile.take_profit_atr,
+        max_bars_in_trade=_profile.max_bars_in_trade or 0,
+        round_trip_cost_r=_profile.cost_per_trade_r,
+    )
     info(f"reward: {reward} | managed exits: {env.config.use_managed_exits} "
-         f"(SL {env.config.stop_loss_atr}×ATR, TP {env.config.take_profit_atr}×ATR) | "
+         f"(SL {env.config.stop_loss_atr}×ATR, TP {env.config.take_profit_atr}×ATR, "
+         f"hold {env.config.max_bars_in_trade or '∞'}) | "
          f"episode length: {env.config.episode_length_bars} bars")
 
     # Model ids are unique per training run: the registry is append-only and
