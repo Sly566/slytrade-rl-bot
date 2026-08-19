@@ -36,6 +36,7 @@ import pandas as pd
 from slytrade.backtest.execution import Quote
 from slytrade.core.config import load_config
 from slytrade.currency import CurrencyConverter, load_converter
+from slytrade.data.timeframes import timeframe_duration
 from slytrade.execution.models import OrderIntent, OrderKind, OrderStatus, Side
 from slytrade.execution.oms import OrderManagementSystem
 from slytrade.monitoring.gates import DeploymentStage
@@ -288,13 +289,83 @@ class LiveTradingLoop:
         in_progress = bars.iloc[-1]
         self._window_bars.extend(row.to_dict() for _, row in completed.iterrows())
         self.bar_builder.seed(in_progress.to_dict())
+        # The bot already knows every completed bar; the bar counter reflects
+        # that instead of showing 0, and the in-progress bar's close time makes
+        # the remaining wait explicit.
+        self._bar_index = len(self._window_bars)
         last_closed = pd.Timestamp(completed["time"].iloc[-1])
+        in_progress_open = pd.Timestamp(in_progress["time"])
+        in_progress_close = in_progress_open + pd.Timedelta(minutes=int(timeframe_duration(self.settings.timeframe).total_seconds() / 60))
         self.logger.info(
-            f"broker warmup: {len(completed)} bars loaded + continuing the current bar — "
-            f"bot is in sync, last closed bar {last_closed}, no wait beyond the next bar close",
+            f"broker warmup: {len(completed)} bars loaded (bar #{self._bar_index}); continuing the current bar "
+            f"[{in_progress_open} → closes {in_progress_close}]; last closed bar {last_closed}",
             extra={"event": "broker_warmup", "bars": len(completed), "last_closed": str(last_closed),
-                   "in_progress": str(pd.Timestamp(in_progress["time"]))},
+                   "in_progress": str(in_progress_open), "in_progress_close": str(in_progress_close)},
         )
+
+    def _warm_strategy_context(self) -> None:
+        """Warm the champion's regime/alignment context from recent featured bars.
+
+        The strategy gates on rolling trend/volatility/session context; without
+        this, the first immediate decision would see an empty context and could
+        differ from a mid-session decision. Computes the ICT+MTF features over
+        the warmup window and feeds the last ``history_window`` rows in.
+        """
+        warm = getattr(self.strategy, "warm_context", None)
+        if warm is None or len(self._window_bars) < 2:
+            return
+        try:
+            from slytrade.data.resample import resample_bars_to_timeframe
+            from slytrade.features.ict import compute_ict_features
+            from slytrade.features.mtf import compute_mtf_ict_features
+
+            frame = pd.DataFrame(self._window_bars)
+            feats = compute_ict_features(frame).reset_index(drop=True)
+            higher = {}
+            for tf in ("H4", "D1"):
+                resampled = resample_bars_to_timeframe(frame, tf)
+                if not resampled.empty:
+                    higher[tf] = resampled
+            merged = compute_mtf_ict_features(frame, higher) if higher else feats
+            warm(merged.iloc[-120:])
+        except Exception:  # pragma: no cover - feature degradation must never block startup
+            return
+
+    def _evaluate_immediate(self, resolved_symbol: str) -> None:
+        """Arm the bot at second 0: evaluate the last CLOSED bar right away.
+
+        Warmup puts the bot in sync, but the first live decision would otherwise
+        wait for the current in-progress bar to close (up to 15 min). There is no
+        reason to wait: the last closed bar's decision is fully computable from
+        history and is 'due' the moment the loop starts — so we evaluate it now
+        and place any limit order immediately (it rests in the zone anyway).
+        Uses only history up to that bar's close, so no lookahead.
+        """
+        if len(self._window_bars) < 2:
+            return
+        try:
+            self._warm_strategy_context()
+            bar = dict(self._window_bars[-1])
+            close = float(bar.get("close", 0.0) or 0.0)
+            spread = float(bar.get("spread", 0.0) or 0.0)
+            ts = pd.Timestamp(bar.get("time"))
+            quote = Quote(
+                symbol=resolved_symbol,
+                bid=close - spread / 2.0,
+                ask=close + spread / 2.0,
+                time=(ts + pd.Timedelta(minutes=int(timeframe_duration(self.settings.timeframe).total_seconds() / 60))).to_pydatetime(),
+            )
+            if not self.window.is_open(quote.time) or self.news_gate.is_red_folder(quote.time):
+                self.logger.info("immediate evaluation: market closed / red folder — nothing to do", extra={"event": "immediate_skip"})
+                return
+            decision = self.breaker.check()
+            if not decision.allowed:
+                return
+            series = self._decision_series(bar)
+            self.logger.info(f"immediate evaluation of last closed bar (close {close}) — arming now", extra={"event": "immediate_eval"})
+            self._decide_and_maybe_enter(series, quote, resolved_symbol)
+        except Exception as exc:  # pragma: no cover - must never stop startup
+            self.logger.warning(f"immediate evaluation failed: {exc}", extra={"event": "immediate_error"})
 
     def _warmup(self, resolved_symbol: str) -> None:
         """Seed the feature window from stored bars before the first streamed bar.
@@ -515,6 +586,10 @@ class LiveTradingLoop:
             },
         )
 
+        # Arm immediately: the last closed bar's decision is already due, so
+        # evaluate it now instead of waiting for the in-progress bar to close.
+        self._evaluate_immediate(resolved)
+
         try:
             while not self._stop.is_set():
                 elapsed = time.monotonic() - start
@@ -640,38 +715,46 @@ class LiveTradingLoop:
 
         if self._side == "flat":
             series = self._decision_series(bar)
-            intent = self.strategy.on_bar(self._bar_index, series)
-            self._last_decision = self._decision_trace(series, quote, intent)
-            self.logger.info(self._last_decision, extra={"event": "decision"})
-            self._publish_status()
-            if intent is None:
-                return
-            sized = self._sized_intent(intent, series, quote)
-            report = self.adapter.submit(sized, quote)
-            self._orders += 1
-            self.metrics.orders_total.labels(status=str(report.status.value)).inc()
-            if report.status == OrderStatus.FILLED:
-                self._fills += 1
-                self._side = "long" if sized.side == Side.BUY else "short"
-                self._journal_entry(series, sized, quote)
-                self.logger.info("live order filled", extra={"event": "live_fill", "order_id": sized.client_order_id})
-            elif sized.kind == OrderKind.LIMIT and report.status == OrderStatus.ACCEPTED:
-                self._pending_limit = {
-                    "symbol": sized.symbol,
-                    "side": sized.side.value,
-                    "entry": float(sized.limit_price or quote.mid),
-                    "volume": sized.volume,
-                    "bars": 0,
-                    "ticket": report.broker_order_id,
-                    "features": {c: self._journal_feature(series, c) for c in
-                                 ("persona_score", "persona_bias", "bos_dir", "choch_dir", "liquidity_sweep",
-                                  "premium_discount", "trend_strength", "htf_h4_bos_dir", "mtf_bias")},
-                }
-                self.logger.info("limit order resting", extra={"event": "limit_resting",
-                                                               "price": sized.limit_price, "ticket": report.broker_order_id})
-            elif report.status == OrderStatus.REJECTED:
-                self.logger.warning("live order rejected", extra={"event": "live_reject", "reason": report.message})
-                self.alerter.alert("warning", "live order rejected", report.message)
+            self._decide_and_maybe_enter(series, quote, resolved_symbol)
+
+    def _decide_and_maybe_enter(self, series: pd.Series, quote: Quote, resolved_symbol: str) -> None:
+        """Evaluate the champion on one bar and place the order if it signals.
+
+        Shared by the per-bar path and the startup immediate evaluation so the
+        decision + submission logic is identical in both.
+        """
+        intent = self.strategy.on_bar(self._bar_index, series)
+        self._last_decision = self._decision_trace(series, quote, intent)
+        self.logger.info(self._last_decision, extra={"event": "decision"})
+        self._publish_status()
+        if intent is None:
+            return
+        sized = self._sized_intent(intent, series, quote)
+        report = self.adapter.submit(sized, quote)
+        self._orders += 1
+        self.metrics.orders_total.labels(status=str(report.status.value)).inc()
+        if report.status == OrderStatus.FILLED:
+            self._fills += 1
+            self._side = "long" if sized.side == Side.BUY else "short"
+            self._journal_entry(series, sized, quote)
+            self.logger.info("live order filled", extra={"event": "live_fill", "order_id": sized.client_order_id})
+        elif sized.kind == OrderKind.LIMIT and report.status == OrderStatus.ACCEPTED:
+            self._pending_limit = {
+                "symbol": sized.symbol,
+                "side": sized.side.value,
+                "entry": float(sized.limit_price or quote.mid),
+                "volume": sized.volume,
+                "bars": 0,
+                "ticket": report.broker_order_id,
+                "features": {c: self._journal_feature(series, c) for c in
+                             ("persona_score", "persona_bias", "bos_dir", "choch_dir", "liquidity_sweep",
+                              "premium_discount", "trend_strength", "htf_h4_bos_dir", "mtf_bias")},
+            }
+            self.logger.info("limit order resting", extra={"event": "limit_resting",
+                                                           "price": sized.limit_price, "ticket": report.broker_order_id})
+        elif report.status == OrderStatus.REJECTED:
+            self.logger.warning("live order rejected", extra={"event": "live_reject", "reason": report.message})
+            self.alerter.alert("warning", "live order rejected", report.message)
 
     def _cancel_pending(self, resolved_symbol: str) -> None:
         """Cancel the resting limit order once its hold window has elapsed."""

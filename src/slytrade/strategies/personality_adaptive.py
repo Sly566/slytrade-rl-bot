@@ -272,6 +272,17 @@ class PersonalityAdaptiveStrategy:
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+    def warm_context(self, bars: pd.DataFrame) -> None:
+        """Populate the regime/alignment context from recent featured bars.
+
+        Used by the live loop at startup so its FIRST decision (on the last
+        closed bar) is as faithful as a mid-session bar-close decision. Feeds
+        ``_push_history`` for each row WITHOUT emitting orders or touching
+        ``_side`` / ``_last_entry_index`` — it only warms the rolling context.
+        """
+        for _, row in bars.iterrows():
+            self._push_history(row)
+
     def _push_history(self, bar: pd.Series) -> None:
         """Buffer the scalars the context engine reads, in causal order.
 

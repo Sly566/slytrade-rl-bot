@@ -113,6 +113,46 @@ def test_broker_warmup_seeds_window_and_continues_bar(tmp_path, caplog) -> None:
     assert loop.bar_builder._current is not None
     assert any("broker warmup" in r.message for r in caplog.records)
     assert any("continuing the current bar" in r.message for r in caplog.records)
+    # The bar counter reflects the warmup bars, not 0 — the bot knows its history.
+    assert loop._bar_index == 49
+
+
+def test_evaluate_immediate_runs_at_startup(tmp_path, caplog) -> None:
+    """The last closed bar's decision is due at second 0 — no wait for the
+    in-progress bar to close. The immediate evaluation must run, log a decision
+    (HOLD or SIGNAL), and never crash on synthetic warmup bars."""
+    caplog.set_level(logging.INFO)
+    loop = LiveTradingLoop(_settings(tmp_path), FakeMT5())
+    loop.logger.propagate = True
+    loop._broker_warmup("XAUUSDm")
+    loop._evaluate_immediate("XAUUSDm")
+    assert any("immediate evaluation" in r.message for r in caplog.records)
+    # a decision line (HOLD or SIGNAL) was produced from the last closed bar
+    assert any("HOLD" in r.message or "SIGNAL" in r.message for r in caplog.records)
+
+
+def test_warm_strategy_context_populates_without_orders(tmp_path) -> None:
+    """warm_context feeds the strategy's rolling context without emitting orders
+    or flipping its side state."""
+    from slytrade.strategies.personality_adaptive import PersonalityAdaptiveStrategy
+
+    strat = PersonalityAdaptiveStrategy(symbol="XAUUSD", volume=0.1)
+    frame = pd.DataFrame(_bar_rows(150))
+    # synthesize the scalar columns warm_context reads (as the featured bars would)
+    frame["atr_norm"] = 0.001
+    frame["trend_strength"] = 0.3
+    frame["premium_discount"] = 0.0
+    frame["mtf_bias"] = 1.0
+    frame["mtf_confluence_score"] = 2.0
+    frame["liquidity_sweep"] = 0.0
+    frame["bos_dir"] = 0.0
+    frame["choch_dir"] = 0.0
+    strat.warm_context(frame)
+    # deques are bounded by the strategy's history_window (120)
+    assert len(strat._trend) == 120
+    assert strat._side == "flat"
+    assert strat._last_entry_index == -1_000_000
+    assert strat.trade_count == 0
 
 
 def test_broker_warmup_falls_back_to_file(tmp_path, caplog) -> None:
