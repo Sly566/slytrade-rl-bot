@@ -53,6 +53,11 @@ from slytrade.runtime.settings import RuntimeSettings, TradingStage
 from slytrade.runtime.trading_window import TradingWindow, window_from_settings
 from slytrade.strategies.personality_adaptive import PersonalityAdaptiveStrategy
 
+# Shared journal lock: multiple live loops (one per symbol in portfolio mode)
+# append to the SAME trades.parquet from different threads; serializing those
+# read-modify-write cycles prevents interleaved/corrupt writes.
+_JOURNAL_LOCK = threading.Lock()
+
 
 @dataclass(frozen=True)
 class LiveLoopSummary:
@@ -76,6 +81,8 @@ class LiveTradingLoop:
     settings: RuntimeSettings
     mt5: Any
     strategy: Any = None
+    portfolio_breaker: Any = None  # optional shared multi-symbol breaker
+    status_key: str | None = None  # per-symbol status file suffix (portfolio mode)
     logger: Any = field(default=None, init=False)
 
     adapter: Any = field(init=False)
@@ -372,6 +379,8 @@ class LiveTradingLoop:
             decision = self.breaker.check()
             if not decision.allowed:
                 return
+            if self.portfolio_breaker is not None and not self.portfolio_breaker.allowed():
+                return
             series = self._decision_series(bar)
             self.logger.info(f"immediate evaluation of last closed bar (close {close}) — arming now", extra={"event": "immediate_eval"})
             self._decide_and_maybe_enter(series, quote, resolved_symbol)
@@ -521,23 +530,30 @@ class LiveTradingLoop:
             row["exit_reason"] = reason
             row["outcome_r"] = round(r, 4)
             self._journal_append(row, replace=open_row["time"])
+            # Feed the portfolio breaker with realized USD PnL (account-wide
+            # drawdown guard across symbols).
+            if self.portfolio_breaker is not None:
+                volume = float(open_row.get("volume", 0.0) or 0.0)
+                realized_usd = direction * (exit_price - entry) * self._point_value * volume
+                self.portfolio_breaker.record(resolved_symbol, realized_usd)
         except Exception as exc:  # pragma: no cover
             self.logger.warning("journal exit failed", extra={"event": "journal_error", "reason": str(exc)})
 
     def _journal_append(self, row: dict[str, Any], replace: str | None = None) -> None:
         path = self._journal_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        if path.exists():
-            try:
-                frame = pd.read_parquet(path)
-            except Exception:  # pragma: no cover
+        with _JOURNAL_LOCK:  # serialized across portfolio threads
+            if path.exists():
+                try:
+                    frame = pd.read_parquet(path)
+                except Exception:  # pragma: no cover
+                    frame = pd.DataFrame()
+            else:
                 frame = pd.DataFrame()
-        else:
-            frame = pd.DataFrame()
-        if replace is not None and not frame.empty and "time" in frame.columns:
-            frame = frame[frame["time"] != replace]
-        frame = pd.concat([frame, pd.DataFrame([row])], ignore_index=True)
-        frame.to_parquet(path, index=False)
+            if replace is not None and not frame.empty and "time" in frame.columns:
+                frame = frame[frame["time"] != replace]
+            frame = pd.concat([frame, pd.DataFrame([row])], ignore_index=True)
+            frame.to_parquet(path, index=False)
 
     # -- main ------------------------------------------------------------------
     def run(self, *, max_bars: int | None = None, max_seconds: float = 0.0) -> LiveLoopSummary:
@@ -679,6 +695,12 @@ class LiveTradingLoop:
         decision = self.breaker.check()
         if not decision.allowed:
             self.logger.info("entry paused", extra={"event": "paused", "reason": decision.reason})
+            return
+        if self.portfolio_breaker is not None and not self.portfolio_breaker.allowed():
+            self.logger.info(
+                "portfolio breaker tripped — entries paused across all symbols",
+                extra={"event": "portfolio_pause", "reason": self.portfolio_breaker.reason},
+            )
             return
 
         self._window_bars.append(bar)
@@ -957,7 +979,8 @@ class LiveTradingLoop:
         decision — so a phone dashboard never needs to scrape logs.
         """
         try:
-            path = Path(self.settings.state_dir) / "live_status.json"
+            filename = f"live_status_{self.status_key}.json" if self.status_key else "live_status.json"
+            path = Path(self.settings.state_dir) / filename
             path.parent.mkdir(parents=True, exist_ok=True)
             equity = balance = None
             try:

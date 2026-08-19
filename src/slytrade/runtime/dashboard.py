@@ -193,11 +193,25 @@ def build_loop_env(settings: dict[str, Any], base_env: dict[str, str]) -> dict[s
     env = dict(base_env)
     symbols = settings.get("symbols") or ["XAUUSD"]
     env["SLYTRADE_SYMBOL"] = str(symbols[0]).upper()
+    env["SLYTRADE_SYMBOLS"] = ",".join(str(s).upper() for s in symbols)
     env["SLYTRADE_TIMEFRAME"] = str(settings.get("timeframe") or "M15").upper()
     env["SLYTRADE_RISK_PER_TRADE"] = str(settings.get("risk_per_trade", 0.005))
     env["SLYTRADE_MAX_POSITION_VOLUME"] = str(settings.get("max_position_volume", 1.0))
     env["SLYTRADE_LIMIT_ENTRY_ATR"] = str(settings.get("limit_entry_atr", 0.25))
     return env
+
+
+def resolve_loop_command(settings: dict[str, Any]) -> str:
+    """Map the operator's loop command + watchlist to a CLI command.
+
+    Single symbol stays single-loop; a multi-symbol watchlist upgrades the
+    loop to its portfolio variant (live-multi / paper-multi) automatically.
+    """
+    command = str(settings.get("loop_command") or "paper").lower()
+    symbols = settings.get("symbols") or ["XAUUSD"]
+    if len(symbols) <= 1:
+        return command if command in ("paper", "live") else "paper"
+    return "live-multi" if command.startswith("live") else "paper-multi"
 
 
 @dataclass
@@ -667,14 +681,15 @@ class DashboardServer:
                     # propagate to the child processes so the next start/run
                     # uses the new symbol/timeframe/risk immediately
                     loop_env = build_loop_env(server.settings, server.base_env)
+                    loop_command = resolve_loop_command(server.settings)
                     if server.supervisor is not None:
                         server.supervisor.reconfigure(
-                            [sys.executable, "-m", "slytrade.cli", server.settings.get("loop_command", "paper")],
+                            [sys.executable, "-m", "slytrade.cli", loop_command],
                             loop_env,
                         )
                     if server.pipeline is not None:
                         server.pipeline.env = loop_env
-                    self._json(200, {"settings": server.settings, "detail": "settings saved"})
+                    self._json(200, {"settings": server.settings, "detail": f"settings saved (loop: {loop_command})"})
                     return
 
                 # --- pipeline task control (one-shot research/ops stages) ------
@@ -765,9 +780,10 @@ def run_dashboard(
     env = dict(os.environ)
     settings_path = Path(state_dir) / "dashboard_settings.json"
     settings = load_dashboard_settings(settings_path, env)
-    # The supervised loop runs what the operator configured (loop_command),
-    # with symbol/timeframe/risk from the settings — never hardcoded defaults.
-    loop_command = settings.loop_command
+    # The supervised loop runs what the operator configured (loop_command +
+    # watchlist), with symbol/timeframe/risk from the settings — a multi-symbol
+    # watchlist upgrades the loop to its portfolio variant automatically.
+    loop_command = resolve_loop_command(settings.to_dict())
     loop_env = build_loop_env(settings.to_dict(), env)
     supervisor = None
     if supervise:

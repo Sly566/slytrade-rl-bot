@@ -1468,6 +1468,49 @@ def live() -> None:
 
 
 @app.command()
+def live_multi(
+    symbols: str = typer.Option("", help="Comma-separated symbols (default from SLYTRADE_SYMBOLS / SLYTRADE_SYMBOL)"),
+) -> None:
+    """Run the LIVE portfolio — real orders on every symbol in the watchlist.
+
+    One guarded live loop per symbol, in parallel, against the connected MT5
+    account, sharing a portfolio-level drawdown breaker. Requires
+    SLYTRADE_ALLOW_LIVE=1 and SLYTRADE_STAGE=demo.
+    """
+    import time as _time
+
+    from slytrade.runtime.live_portfolio import LivePortfolio
+    from slytrade.runtime.settings import RuntimeSettings
+
+    settings = RuntimeSettings()
+    if not settings.allow_live or settings.stage.value != "demo":
+        console.print("[bold red]Live trading is disabled.[/bold red]")
+        console.print("Set SLYTRADE_ALLOW_LIVE=1 and SLYTRADE_STAGE=demo in your environment first.")
+        raise typer.Exit(code=1)
+
+    symbol_list = _resolve_portfolio_symbols(symbols, settings)
+    console.print(f"[bold red]LIVE TRADING portfolio — real orders on {len(symbol_list)} symbols: {', '.join(symbol_list)}[/bold red]")
+    portfolio = LivePortfolio(symbol_list, settings)
+    try:
+        portfolio.start(load_mt5())
+        while True:
+            _time.sleep(3600)
+    except KeyboardInterrupt:
+        console.print("[yellow]Live portfolio stopped.[/yellow]")
+    finally:
+        portfolio.stop()
+
+
+def _resolve_portfolio_symbols(cli_symbols: str, settings) -> list[str]:
+    """Resolve the portfolio watchlist: CLI arg > SLYTRADE_SYMBOLS > SLYTRADE_SYMBOL."""
+    source = cli_symbols.strip() or (os.environ.get("SLYTRADE_SYMBOLS") or "").strip() or settings.symbol
+    symbols = [s.strip().upper() for s in source.split(",") if s.strip()]
+    if not symbols:
+        symbols = [settings.symbol.upper()]
+    return symbols
+
+
+@app.command()
 def dashboard(
     host: str = typer.Option("0.0.0.0", help="Bind address"),
     port: int = typer.Option(8080, help="Dashboard HTTP port"),

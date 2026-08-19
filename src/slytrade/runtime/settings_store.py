@@ -24,7 +24,7 @@ from typing import Any
 
 DASHBOARD_SETTINGS_PATH = "state/dashboard_settings.json"
 VALID_TIMEFRAMES = ("M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1")
-VALID_LOOP_COMMANDS = ("paper", "live")
+VALID_LOOP_COMMANDS = ("paper", "live", "paper-multi", "live-multi")
 
 
 @dataclass
@@ -78,7 +78,8 @@ class DashboardSettings:
 def default_dashboard_settings(env: dict[str, str] | None = None) -> DashboardSettings:
     """Defaults from the environment (and configs/risk.yaml when present)."""
     env = env or dict(os.environ)
-    symbols = [str(env.get("SLYTRADE_SYMBOL") or "XAUUSD").strip().upper()]
+    syms_env = str(env.get("SLYTRADE_SYMBOLS") or env.get("SLYTRADE_SYMBOL") or "XAUUSD")
+    symbols = [s.strip().upper() for s in syms_env.split(",") if s.strip()] or ["XAUUSD"]
     timeframe = str(env.get("SLYTRADE_TIMEFRAME") or "M15").upper()
     risk = 0.005
     max_vol = 1.0
