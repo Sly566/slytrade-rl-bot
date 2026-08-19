@@ -77,6 +77,16 @@ class PersonalityAdaptiveConfig:
     # (quote_spread), so it could never trigger correctly. Use ``max_spread``
     # (PRICE units) instead — the scorer and the gate now share that one field.
     max_spread_points: float | None = None
+
+    # Dynamic gate model (score-weighted executability). When ON, the auxiliary
+    # quality gates no longer hard-stop an entry: each FAILED gate subtracts
+    # ``gate_penalty`` points from the raw confluence score, and the bot
+    # executes when (raw_score - penalties) >= threshold. A very strong setup
+    # (score 6-7) therefore survives a minor gate miss; a marginal setup (score
+    # at threshold) still needs every gate green. The spread gate is a COST
+    # control and stays a hard block even in dynamic mode.
+    dynamic_gates: bool = False
+    gate_penalty: float = 1.0
     # Directional asymmetry: trade ONLY with the higher-timeframe macro trend.
     # When set (e.g. "d1"), longs require htf_<tf>_trend_strength > 0 and shorts
     # require < 0 — so in a confirmed bull market the strategy stops fading the
@@ -171,6 +181,10 @@ class PersonalityAdaptiveStrategy:
         self._side: str = "flat"
         self._last_entry_index: int = -1_000_000
         self._trades: list[OrderIntent] = []
+        # Dynamic-gate observability (read by the live-loop decision trace).
+        self._last_gate_penalty: float = 0.0
+        self._last_effective_score: float = 0.0
+        self._last_threshold: float = 0.0
 
     # ------------------------------------------------------------------
     # Public API (used by backtest engines)
@@ -197,41 +211,54 @@ class PersonalityAdaptiveStrategy:
         )
         alignment = self._alignment_engine.evaluate(None, context)
 
-        # Regime gates -------------------------------------------------
-        if self.config.use_regime_filter:
-            if context["volatility"] not in self.personality.volatility_preferences:
-                return None
-            if context["trend"] not in self.personality.trend_preferences:
-                return None
-            if context["session"] not in self.personality.session_preferences:
-                return None
-
-        # Only enforce the MTF alignment gate when higher-timeframe data was
-        # actually supplied. On a single-timeframe dataset there is nothing to
-        # align against, so requiring a threshold there silently blocks almost
-        # every entry (the original "10 trades in a year" behaviour).
-        if self.config.require_mtf_alignment and context.get("has_htf", False) and alignment < self.config.alignment_threshold:
-            return None
-
         # Personality-adaptive threshold -------------------------------
         threshold = self._adaptive_threshold(context)
-        long_score = self._scorer._long_score(bar)  # type: ignore[attr-defined]
-        short_score = self._scorer._short_score(bar)  # type: ignore[attr-defined]
 
         # Poor regime: demand a stronger setup (adaptive discipline)
         if float(context.get("regime_score", 0.5)) < 0.5:
             threshold = int(round(threshold + self.config.regime_filter_penalty))
 
-        intent: OrderIntent | None = None
-        if long_score >= threshold and long_score > short_score and self._side != "long":
-            intent = self._build_intent(Side.BUY, long_score, bar)
-        elif short_score >= threshold and short_score > long_score and self._side != "short":
-            intent = self._build_intent(Side.SELL, short_score, bar)
+        long_score = self._scorer._long_score(bar)  # type: ignore[attr-defined]
+        short_score = self._scorer._short_score(bar)  # type: ignore[attr-defined]
 
-        # Setup-quality gate: drop the entry unless it is a real footprint
-        # (sweep + reversal, with momentum, in the HTF direction, tight spread).
-        if intent is not None and not self._setup_quality_ok(intent.side, bar):
-            intent = None
+        intent: OrderIntent | None = None
+        if self.config.dynamic_gates:
+            # DYNAMIC (score-weighted) executability: the bot decides whether a
+            # setup is tradeable from its confluence score minus the penalties
+            # of any failed auxiliary gate — a strong setup overrides minor
+            # misses instead of being hard-stopped.
+            if long_score >= short_score:
+                side, raw_score = Side.BUY, long_score
+            else:
+                side, raw_score = Side.SELL, short_score
+            if raw_score < 1 or (side == Side.BUY and self._side == "long") or (side == Side.SELL and self._side == "short"):
+                return None
+            penalty = self._gate_penalties(side, bar, context, alignment)
+            self._last_gate_penalty = penalty
+            self._last_effective_score = raw_score - penalty
+            self._last_threshold = threshold
+            if penalty >= float("inf"):
+                return None  # spread cost-control remains a hard block
+            if (raw_score - penalty) < threshold:
+                return None
+            intent = self._build_intent(side, raw_score, bar)
+        else:
+            # Legacy HARD gates (unchanged path, kept for A/B comparison).
+            if self.config.use_regime_filter:
+                if context["volatility"] not in self.personality.volatility_preferences:
+                    return None
+                if context["trend"] not in self.personality.trend_preferences:
+                    return None
+                if context["session"] not in self.personality.session_preferences:
+                    return None
+            if self.config.require_mtf_alignment and context.get("has_htf", False) and alignment < self.config.alignment_threshold:
+                return None
+            if long_score >= threshold and long_score > short_score and self._side != "long":
+                intent = self._build_intent(Side.BUY, long_score, bar)
+            elif short_score >= threshold and short_score > long_score and self._side != "short":
+                intent = self._build_intent(Side.SELL, short_score, bar)
+            if intent is not None and not self._setup_quality_ok(intent.side, bar):
+                intent = None
 
         if intent is not None:
             self._side = "long" if intent.side == Side.BUY else "short"
@@ -372,6 +399,79 @@ class PersonalityAdaptiveStrategy:
                 return False
 
         return True
+
+    def _gate_penalties(self, side: Side, bar: pd.Series, context: dict, alignment: float) -> float:
+        """Dynamic gate model: score-weighted executability.
+
+        Instead of hard-stopping an entry when one auxiliary check fails, each
+        failed gate subtracts ``gate_penalty`` from the raw confluence score.
+        Returns a non-negative penalty; ``float("inf")`` means a hard block
+        (only used for the spread cost-control, which must never be overridden).
+        """
+        cfg = self.config
+        long = side == Side.BUY
+        penalty = 0.0
+
+        # Regime preference filter — soft: an unfavourable regime raises the
+        # bar instead of banning the entry outright.
+        if cfg.use_regime_filter:
+            if context["volatility"] not in self.personality.volatility_preferences:
+                penalty += cfg.gate_penalty
+            if context["trend"] not in self.personality.trend_preferences:
+                penalty += cfg.gate_penalty
+            if context["session"] not in self.personality.session_preferences:
+                penalty += cfg.gate_penalty
+
+        # MTF alignment — soft: misalignment against higher timeframes costs
+        # points instead of discarding a strong local setup.
+        if cfg.require_mtf_alignment and context.get("has_htf", False) and alignment < cfg.alignment_threshold:
+            penalty += cfg.gate_penalty
+
+        # Momentum — soft: a strong confluence score may override a candle
+        # fading the signal.
+        if cfg.require_entry_momentum:
+            open_ = _to_float(bar.get("open", 0.0))
+            close_ = _to_float(bar.get("close", 0.0))
+            if open_ and close_ and ((long and close_ <= open_) or (not long and close_ >= open_)):
+                penalty += cfg.gate_penalty
+
+        # Spread — HARD: a wide spread is a cost reality, not a quality call.
+        if cfg.max_spread is not None:
+            if _to_float(bar.get("quote_spread", 0.0)) > cfg.max_spread:
+                return float("inf")
+
+        # Strict MTF direction — soft.
+        if cfg.strict_mtf_direction and self._has_mtf_bias and self._mtf_bias:
+            bias = self._mtf_bias[-1]
+            if (long and bias < 0) or (not long and bias > 0):
+                penalty += cfg.gate_penalty
+
+        # HTF macro-trend asymmetry — soft.
+        if cfg.htf_trend_timeframe:
+            trend_col = f"htf_{cfg.htf_trend_timeframe}_trend_strength"
+            if trend_col in bar.index:
+                ts = _to_float(bar.get(trend_col, 0.0))
+                if (long and ts <= 0) or (not long and ts >= 0):
+                    penalty += cfg.gate_penalty
+
+        # Sweep + reversal — soft.
+        if cfg.require_sweep_reversal:
+            sweeps = list(self._sweeps)
+            bos = list(self._bos)
+            choch = list(self._choch)
+            if not sweeps:
+                penalty += cfg.gate_penalty
+            else:
+                if long:
+                    swept = any(s < 0 for s in sweeps)
+                    structure = any(b > 0 or c > 0 for b, c in zip(bos, choch, strict=False))
+                else:
+                    swept = any(s > 0 for s in sweeps)
+                    structure = any(b < 0 or c < 0 for b, c in zip(bos, choch, strict=False))
+                if not (swept and structure):
+                    penalty += cfg.gate_penalty
+
+        return penalty
 
     def _adaptive_threshold(self, context: dict) -> int:
         """Compute the entry-score threshold from personality + regime.

@@ -70,3 +70,13 @@ ict:
     # 25mo real XAUUSD M15: 0.25 fills ~97% of setups and lifts net edge ~+72%
     # (gold retraces 0.25ATR after a setup almost always). 0 = market orders.
     limit_entry_atr: 0.25
+    # Dynamic gate model: instead of hard-stopping an entry when one auxiliary
+    # quality check fails, each failed gate subtracts ``gate_penalty`` points
+    # from the confluence score and the bot executes when
+    # (score - penalties) >= threshold. A strong setup overrides minor misses;
+    # a marginal setup still needs every gate green. Spread stays a hard block.
+    # Validated on 25mo real XAUUSD M15 (gate sweep): penalty 2.0 → +39.8% mean
+    # net vs +35.0% for hard gates, PF 1.26, max DD 13.6%, 856 trades (vs 712).
+    # The 2.0–3.0 plateau is robust; 4.0 collapses back to hard-gate behaviour.
+    dynamic_gates: true
+    gate_penalty: 2.0

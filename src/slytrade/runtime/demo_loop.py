@@ -218,6 +218,8 @@ class LiveTradingLoop:
                 if self.settings.limit_entry_atr is not None
                 else float(entry.get("limit_entry_atr", 0.0) or 0.0)
             ),
+            dynamic_gates=bool(entry.get("dynamic_gates", False)),
+            gate_penalty=float(entry.get("gate_penalty", 1.0) or 1.0),
             point_value=point_value,
         )
         return PersonalityAdaptiveStrategy(symbol=self.settings.symbol, volume=0.1, config=config)
@@ -1121,6 +1123,12 @@ class LiveTradingLoop:
             )
         if cooldown_left > 0:
             reason = f"cooldown {cooldown_left} bars left"
+        elif getattr(strat.config, "dynamic_gates", False):
+            # Dynamic gate model: show the score - penalties math the bot used.
+            penalty = float(getattr(strat, "_last_gate_penalty", 0.0) or 0.0)
+            threshold = float(getattr(strat, "_last_threshold", 0.0) or 0.0)
+            effective = max(long_score, short_score) - penalty
+            reason = f"gates: {max(long_score, short_score):.0f} - {penalty:.0f} = {effective:.0f} < threshold {threshold:.0f}"
         elif max(long_score, short_score) < min_score:
             reason = f"below threshold (max score {max(long_score, short_score):.0f} < {min_score})"
         elif bias != 0 and htf != 0 and bias != htf:

@@ -961,6 +961,8 @@ def _persona_config_from_risk(symbol: str = "XAUUSD", timeframe: str | None = No
         smc_vi=int(entry.get("smc_vi", 0)),
         smc_dol_tap=int(entry.get("smc_dol_tap", 0)),
         limit_entry_atr=float(entry.get("limit_entry_atr", 0.0) or 0.0),
+        dynamic_gates=bool(entry.get("dynamic_gates", False)),
+        gate_penalty=float(entry.get("gate_penalty", 1.0) or 1.0),
         point_value=default_point_value(symbol),
     )
 
