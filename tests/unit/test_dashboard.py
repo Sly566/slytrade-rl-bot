@@ -226,3 +226,104 @@ def test_live_loop_publishes_status_file(tmp_path) -> None:
     assert payload["bars_built"] == 3
     assert payload["last_decision"] == "bar 3 → HOLD (below threshold)"
     assert payload["journal_path"].endswith("trades.parquet")
+
+
+def _pipeline_server(tmp_path, token: str = ""):
+    from slytrade.runtime.dashboard import PipelineRunner
+
+    pipeline = PipelineRunner(cwd=str(tmp_path), env={})
+    server = DashboardServer(
+        host="127.0.0.1", port=0, token=token,
+        state_dir=str(tmp_path), data_dir=str(tmp_path), log_dir=str(tmp_path),
+        pipeline=pipeline,
+    )
+    return server, pipeline
+
+
+def test_pipeline_overview_and_run(tmp_path) -> None:
+    server, pipeline = _pipeline_server(tmp_path)
+    server.start()
+    try:
+        base = f"http://127.0.0.1:{server.bound_port}"
+        # overview lists the six stages, none running
+        code, body = _get(base + "/api/pipeline")
+        assert code == 200
+        tasks = json.loads(body)["tasks"]
+        ids = [t["id"] for t in tasks]
+        assert ids == ["full-pipeline", "collect", "admit", "backtest", "walk-forward", "learn"]
+        assert all(not t["running"] for t in tasks)
+
+        # run a fake task via direct runner (the real CLI needs data/MT5)
+        ok, detail = pipeline.run("backtest", ["doctor"])
+        assert ok
+        deadline = time.time() + 10
+        while not pipeline.running() and time.time() < deadline:
+            time.sleep(0.05)
+        assert pipeline.running() == ["backtest"]
+
+        code, body = _get(base + "/api/pipeline")
+        tasks = json.loads(body)["tasks"]
+        backtest = [t for t in tasks if t["id"] == "backtest"][0]
+        assert backtest["running"] is True
+
+        # a second run is refused while busy
+        ok2, detail2 = pipeline.run("learn", ["doctor"])
+        assert not ok2 and "busy" in detail2
+
+        # stop it
+        code, body = _post(base + "/api/pipeline/stop", {"task": "backtest"})
+        assert code == 200
+        deadline = time.time() + 10
+        while pipeline.running() and time.time() < deadline:
+            time.sleep(0.05)
+        assert not pipeline.running()
+    finally:
+        server.stop()
+
+
+def test_pipeline_run_endpoint_validates_task(tmp_path) -> None:
+    server, pipeline = _pipeline_server(tmp_path)
+    server.start()
+    try:
+        base = f"http://127.0.0.1:{server.bound_port}"
+        code, body = _post(base + "/api/pipeline/run", {"task": "does-not-exist"})
+        assert code == 400
+        assert "unknown task" in body["error"]
+        # a valid task id returns 200 ("started"); the child fails fast without
+        # MT5 in the sandbox, which the supervisor reports, not the endpoint
+        code, body = _post(base + "/api/pipeline/run", {"task": "collect"})
+        assert code == 200
+    finally:
+        for tid in list(pipeline.running()):
+            pipeline.stop(tid)
+        server.stop()
+
+
+def test_pipeline_logs_endpoint(tmp_path) -> None:
+    server, pipeline = _pipeline_server(tmp_path)
+    server.start()
+    try:
+        base = f"http://127.0.0.1:{server.bound_port}"
+        ok, _ = pipeline.run("learn", ["doctor"])
+        assert ok
+        deadline = time.time() + 10
+        while not pipeline.running() and time.time() < deadline:
+            time.sleep(0.05)
+        code, body = _get(base + "/api/pipeline/logs?task=learn&lines=50")
+        assert code == 200
+        assert isinstance(json.loads(body), list)
+        code, body = _get(base + "/api/pipeline/logs?task=nope&lines=50")
+        assert code == 200 and json.loads(body) == []
+    finally:
+        server.stop()
+
+
+def test_pipeline_task_defs_respect_env() -> None:
+    from slytrade.runtime.dashboard import pipeline_task_defs
+
+    defs = pipeline_task_defs({"SLYTRADE_SYMBOL": "EURUSD", "SLYTRADE_TIMEFRAME": "H1"})
+    by_id = {d["id"]: d for d in defs}
+    assert by_id["full-pipeline"]["argv"] == ["full-pipeline", "--symbol", "EURUSD", "--timeframe", "H1"]
+    assert by_id["backtest"]["argv"] == ["persona-backtest", "--bars-file", "data/processed/aligned/EURUSD/h1/bars.parquet"]
+    assert by_id["learn"]["argv"] == ["learn", "--bars-file", "data/processed/aligned/EURUSD/h1/bars.parquet"]
+    assert by_id["collect"]["argv"] == ["collect-incremental", "--symbol", "EURUSD", "--lookback", "7d"]

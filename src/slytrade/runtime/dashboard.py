@@ -113,6 +113,118 @@ class LoopSupervisor:
 
 
 # --------------------------------------------------------------------------- #
+# Pipeline runner (one-shot research/ops tasks, serialized)
+# --------------------------------------------------------------------------- #
+def pipeline_task_defs(env: dict[str, str]) -> list[dict]:
+    """The dashboard's pipeline buttons → CLI invocations.
+
+    Built from the environment (symbol / timeframe / aligned-bars path) so the
+    whole pipeline is controllable from the browser without hardcoding paths.
+    RL stages (full-pipeline, walk-forward, learn) require the RL extras; they
+    fail gracefully with a clear message when torch is missing (e.g. the thin
+    runtime container — use the `research` image there).
+    """
+    symbol = str(env.get("SLYTRADE_SYMBOL") or "XAUUSD")
+    timeframe = str(env.get("SLYTRADE_TIMEFRAME") or "M15").upper()
+    bars_file = f"data/processed/aligned/{symbol}/{timeframe.lower()}/bars.parquet"
+    return [
+        {
+            "id": "full-pipeline",
+            "label": "Full pipeline",
+            "desc": "collect → align → backtest → train → walk-forward → promote",
+            "argv": ["full-pipeline", "--symbol", symbol, "--timeframe", timeframe],
+        },
+        {
+            "id": "collect",
+            "label": "Collect (top-up)",
+            "desc": "fetch the newest bars + ticks only",
+            "argv": ["collect-incremental", "--symbol", symbol, "--lookback", "7d"],
+        },
+        {
+            "id": "admit",
+            "label": "Admit symbols",
+            "desc": "validate the champion per symbol before trading",
+            "argv": ["admit", "--symbols", symbol, "--timeframe", timeframe],
+        },
+        {
+            "id": "backtest",
+            "label": "Backtest",
+            "desc": "champion backtest on the aligned bars",
+            "argv": ["persona-backtest", "--bars-file", bars_file],
+        },
+        {
+            "id": "walk-forward",
+            "label": "Walk-forward",
+            "desc": "honest out-of-sample RL vs champion",
+            "argv": ["walk-forward", "--bars-file", bars_file, "--total-timesteps", "20000"],
+        },
+        {
+            "id": "learn",
+            "label": "Learn (re-distill)",
+            "desc": "re-distill the champion from the latest data",
+            "argv": ["learn", "--bars-file", bars_file],
+        },
+    ]
+
+
+@dataclass
+class PipelineRunner:
+    """Run and supervise one-shot pipeline tasks (serialized: one at a time)."""
+
+    cwd: str
+    env: dict[str, str]
+    tasks: dict[str, LoopSupervisor] = field(default_factory=dict)
+    _lock: threading.RLock = field(default_factory=threading.RLock, init=False)  # RLock: run() calls running()
+
+    def running(self) -> list[str]:
+        with self._lock:
+            return [tid for tid, sup in self.tasks.items() if sup.running]
+
+    def run(self, task_id: str, argv: list[str]) -> tuple[bool, str]:
+        with self._lock:
+            busy = self.running()
+            if busy:
+                return False, f"busy: '{busy[0]}' is still running — stop it first"
+            sup = LoopSupervisor(
+                command=[sys.executable, "-m", "slytrade.cli", *argv],
+                cwd=self.cwd,
+                env=self.env,
+            )
+            self.tasks[task_id] = sup
+            sup.start()
+            return True, f"{task_id} started"
+
+    def stop(self, task_id: str) -> tuple[bool, str]:
+        sup = self.tasks.get(task_id)
+        if sup is None or not sup.running:
+            return False, f"{task_id} is not running"
+        sup.stop()
+        return True, f"{task_id} stopped"
+
+    def tail(self, task_id: str, n: int) -> list[str]:
+        sup = self.tasks.get(task_id)
+        return sup.tail(n) if sup is not None else []
+
+    def overview(self, defs: list[dict]) -> list[dict]:
+        with self._lock:
+            out = []
+            for d in defs:
+                sup = self.tasks.get(d["id"])
+                st = sup.status() if sup is not None else None
+                out.append({
+                    "id": d["id"],
+                    "label": d["label"],
+                    "desc": d["desc"],
+                    "running": bool(st["running"]) if st else False,
+                    "pid": st["pid"] if st else None,
+                    "started_at": st["started_at"] if st else None,
+                    "exit_code": st["exit_code"] if st else None,
+                    "command": st["command"] if st else None,
+                })
+            return out
+
+
+# --------------------------------------------------------------------------- #
 # Dashboard server
 # --------------------------------------------------------------------------- #
 DASHBOARD_HTML = r"""<!doctype html>
@@ -180,6 +292,10 @@ input[type=password]{background:var(--panel2);border:1px solid var(--line);color
     <button class="btn" onclick="ctl('restart')">↻ Restart</button>
     <span class="sub" id="ctlstate"></span>
   </div>
+  <div class="section">Pipeline</div>
+  <div class="row" id="pipelineButtons"><span class="sub">loading…</span></div>
+  <div class="sub" id="pipestate" style="margin-bottom:6px">—</div>
+  <div class="logs" id="pipelines" style="height:220px">run a pipeline task to see its output here…</div>
   <div class="section">Recent trades</div>
   <table><thead><tr><th>time</th><th>side</th><th>entry</th><th>exit</th><th>R</th><th>reason</th></tr></thead>
   <tbody id="trades"><tr><td colspan="6">no trades yet</td></tr></tbody></table>
@@ -203,6 +319,37 @@ function ctl(action){
   api("/api/control", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({action:action})})
     .then(d=>{ document.getElementById("ctlstate").textContent = d.detail||""; refresh(); })
     .catch(()=>{});
+}
+function pipe(action, id){
+  api("/api/pipeline/"+action, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({task:id})})
+    .then(d=>{ document.getElementById("pipestate").textContent = d.detail||d.error||""; refreshPipeline(); })
+    .catch(()=>{});
+}
+async function refreshPipeline(){
+  var p; try{ p = await api("/api/pipeline"); }catch(e){ return; }
+  var btns=document.getElementById("pipelineButtons");
+  btns.innerHTML = p.tasks.map(function(t){
+    var cls = t.running ? "btn stop" : "btn";
+    return "<button class='"+cls+"' data-task='"+t.id+"' title='"+t.desc+"'>"+(t.running?"■ ":"▶ ")+t.label+"</button>";
+  }).join("");
+  btns.querySelectorAll("button").forEach(function(b){
+    b.onclick = function(){ pipe(b.classList.contains("stop")?"stop":"run", b.dataset.task); };
+  });
+  var running = p.tasks.find(function(t){ return t.running; });
+  if(running){ showPipeLogs(running.id); }
+  var finished = p.tasks.filter(function(t){ return !t.running && t.exit_code!==null; });
+  var st=document.getElementById("pipestate");
+  if(finished.length){
+    var last=finished[finished.length-1];
+    st.textContent = "last: "+last.id+" exit="+last.exit_code+(last.exit_code===0?" ✓":"");
+  }
+}
+async function showPipeLogs(id){
+  try{
+    var l = await api("/api/pipeline/logs?task="+id+"&lines=120");
+    var el=document.getElementById("pipelines");
+    if(l && l.length){ el.textContent = l.join("\n"); el.scrollTop = el.scrollHeight; }
+  }catch(e){}
 }
 async function refresh(){
   var s; try{ s = await api("/api/status"); }catch(e){ return; }
@@ -231,7 +378,7 @@ async function refresh(){
     if(l && l.length){ el.textContent = l.join("\n"); el.scrollTop = el.scrollHeight; }
   }catch(e){}
 }
-refresh(); setInterval(refresh, 3000);
+refresh(); refreshPipeline(); setInterval(refresh, 3000); setInterval(refreshPipeline, 3000);
 </script>
 </body>
 </html>"""
@@ -246,6 +393,7 @@ class DashboardServer:
     data_dir: str = "data"
     log_dir: str = "logs"
     supervisor: LoopSupervisor | None = None
+    pipeline: PipelineRunner | None = None
     _server: ThreadingHTTPServer | None = field(default=None, init=False)
     _thread: threading.Thread | None = field(default=None, init=False)
 
@@ -383,13 +531,25 @@ class DashboardServer:
                     lines = int(query.get("lines", ["100"])[0] or 100)
                     self._json(200, server.read_logs(min(max(lines, 1), 2000)))
                     return
+                if path == "/api/pipeline":
+                    if server.pipeline is None:
+                        self._json(200, {"tasks": []})
+                        return
+                    self._json(200, {"tasks": server.pipeline.overview(pipeline_task_defs(server.pipeline.env))})
+                    return
+                if path == "/api/pipeline/logs":
+                    query = parse_qs(urlparse(self.path).query)
+                    task = query.get("task", [""])[0] or ""
+                    lines = int(query.get("lines", ["100"])[0] or 100)
+                    if server.pipeline is None or not task:
+                        self._json(200, [])
+                        return
+                    self._json(200, server.pipeline.tail(task, min(max(lines, 1), 2000)))
+                    return
                 self._json(404, {"error": "not found"})
 
             def do_POST(self) -> None:  # noqa: N802
                 path = urlparse(self.path).path
-                if path != "/api/control":
-                    self._json(404, {"error": "not found"})
-                    return
                 if not self._authorized():
                     self._json(401, {"error": "unauthorized"})
                     return
@@ -398,6 +558,28 @@ class DashboardServer:
                     body = json.loads(self.rfile.read(length) or b"{}")
                 except Exception:
                     body = {}
+
+                # --- pipeline task control (one-shot research/ops stages) ------
+                if path in ("/api/pipeline/run", "/api/pipeline/stop"):
+                    if server.pipeline is None:
+                        self._json(400, {"error": "no pipeline runner configured"})
+                        return
+                    task_id = str(body.get("task", "")).strip()
+                    defs = {d["id"]: d for d in pipeline_task_defs(server.pipeline.env)}
+                    if task_id not in defs:
+                        self._json(400, {"error": f"unknown task {task_id!r}; choose from {sorted(defs)}"})
+                        return
+                    if path == "/api/pipeline/run":
+                        ok, detail = server.pipeline.run(task_id, defs[task_id]["argv"])
+                        self._json(200 if ok else 409, {"task": task_id, "detail": detail})
+                    else:
+                        ok, detail = server.pipeline.stop(task_id)
+                        self._json(200 if ok else 409, {"task": task_id, "detail": detail})
+                    return
+
+                if path != "/api/control":
+                    self._json(404, {"error": "not found"})
+                    return
                 action = str(body.get("action", "")).lower()
                 if server.supervisor is None:
                     self._json(400, {"error": "no supervised loop configured"})
@@ -471,6 +653,7 @@ def run_dashboard(
             env=env,
         )
         supervisor.start()
+    pipeline = PipelineRunner(cwd=os.getcwd(), env=env)
     server = DashboardServer(
         host=host,
         port=port,
@@ -479,6 +662,7 @@ def run_dashboard(
         data_dir=data_dir,
         log_dir=log_dir,
         supervisor=supervisor,
+        pipeline=pipeline,
     )
     server.start()
     return server
