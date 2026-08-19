@@ -32,6 +32,14 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from slytrade.runtime.settings_store import (
+    DASHBOARD_SETTINGS_PATH,
+    VALID_LOOP_COMMANDS,
+    VALID_TIMEFRAMES,
+    load_dashboard_settings,
+    save_dashboard_settings,
+)
+
 
 # --------------------------------------------------------------------------- #
 # Loop supervisor (start/stop/restart the trading loop as a child process)
@@ -56,6 +64,12 @@ class LoopSupervisor:
     def exit_code(self) -> int | None:
         with self._lock:
             return self._exit_code
+
+    def reconfigure(self, command: list[str], env: dict[str, str]) -> None:
+        """Update the command/env before the next start (settings edits)."""
+        with self._lock:
+            self.command = list(command)
+            self.env = dict(env)
 
     def start(self) -> None:
         with self._lock:
@@ -115,24 +129,26 @@ class LoopSupervisor:
 # --------------------------------------------------------------------------- #
 # Pipeline runner (one-shot research/ops tasks, serialized)
 # --------------------------------------------------------------------------- #
-def pipeline_task_defs(env: dict[str, str]) -> list[dict]:
+def pipeline_task_defs(settings: dict[str, Any]) -> list[dict]:
     """The dashboard's pipeline buttons → CLI invocations.
 
-    Built from the environment (symbol / timeframe / aligned-bars path) so the
-    whole pipeline is controllable from the browser without hardcoding paths.
-    RL stages (full-pipeline, walk-forward, learn) require the RL extras; they
-    fail gracefully with a clear message when torch is missing (e.g. the thin
-    runtime container — use the `research` image there).
+    Built from the operator's dashboard settings (symbols / timeframe /
+    lookback) so every stage runs on what the operator configured, never on
+    hardcoded defaults. RL stages (full-pipeline, walk-forward, learn) require
+    the RL extras; they fail gracefully with a clear message when torch is
+    missing (e.g. the thin runtime container — use the `research` image there).
     """
-    symbol = str(env.get("SLYTRADE_SYMBOL") or "XAUUSD")
-    timeframe = str(env.get("SLYTRADE_TIMEFRAME") or "M15").upper()
+    symbols = settings.get("symbols") or ["XAUUSD"]
+    symbol = str(symbols[0]).upper()
+    timeframe = str(settings.get("timeframe") or "M15").upper()
+    lookback = str(settings.get("lookback") or "1y")
     bars_file = f"data/processed/aligned/{symbol}/{timeframe.lower()}/bars.parquet"
     return [
         {
             "id": "full-pipeline",
             "label": "Full pipeline",
             "desc": "collect → align → backtest → train → walk-forward → promote",
-            "argv": ["full-pipeline", "--symbol", symbol, "--timeframe", timeframe],
+            "argv": ["full-pipeline", "--symbol", symbol, "--timeframe", timeframe, "--lookback", lookback],
         },
         {
             "id": "collect",
@@ -144,7 +160,7 @@ def pipeline_task_defs(env: dict[str, str]) -> list[dict]:
             "id": "admit",
             "label": "Admit symbols",
             "desc": "validate the champion per symbol before trading",
-            "argv": ["admit", "--symbols", symbol, "--timeframe", timeframe],
+            "argv": ["admit", "--symbols", ",".join(symbols), "--timeframe", timeframe, "--lookback", lookback],
         },
         {
             "id": "backtest",
@@ -165,6 +181,23 @@ def pipeline_task_defs(env: dict[str, str]) -> list[dict]:
             "argv": ["learn", "--bars-file", bars_file],
         },
     ]
+
+
+def build_loop_env(settings: dict[str, Any], base_env: dict[str, str]) -> dict[str, str]:
+    """Environment for a supervised child (loop/pipeline) from the settings.
+
+    Maps the operator's dashboard settings onto the SLYTRADE_* variables the
+    loop reads, so symbol / timeframe / risk / limit-entry all reflect what the
+    operator saved instead of hardcoded defaults.
+    """
+    env = dict(base_env)
+    symbols = settings.get("symbols") or ["XAUUSD"]
+    env["SLYTRADE_SYMBOL"] = str(symbols[0]).upper()
+    env["SLYTRADE_TIMEFRAME"] = str(settings.get("timeframe") or "M15").upper()
+    env["SLYTRADE_RISK_PER_TRADE"] = str(settings.get("risk_per_trade", 0.005))
+    env["SLYTRADE_MAX_POSITION_VOLUME"] = str(settings.get("max_position_volume", 1.0))
+    env["SLYTRADE_LIMIT_ENTRY_ATR"] = str(settings.get("limit_entry_atr", 0.25))
+    return env
 
 
 @dataclass
@@ -261,6 +294,10 @@ td.win{color:var(--green)}td.loss{color:var(--red)}
 .logs{background:#0d1117;border:1px solid var(--line);border-radius:8px;padding:10px;font-family:var(--mono);font-size:11.5px;height:280px;overflow-y:auto;white-space:pre-wrap;color:#b7c4d1}
 .section{margin:16px 0 6px;color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.08em}
 input[type=password]{background:var(--panel2);border:1px solid var(--line);color:var(--txt);border-radius:8px;padding:10px;font-size:14px;width:100%;margin-bottom:10px}
+.frm{display:grid;grid-template-columns:1fr 1fr;gap:8px 12px}
+.frm label{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.05em;align-self:end}
+.frm input,.frm select{background:var(--panel2);border:1px solid var(--line);color:var(--txt);border-radius:8px;padding:9px;font-size:14px;width:100%;box-sizing:border-box}
+@media (max-width:520px){.frm{grid-template-columns:1fr}}
 #login{max-width:340px;margin:40px auto}
 </style>
 </head>
@@ -284,6 +321,29 @@ input[type=password]{background:var(--panel2);border:1px solid var(--line);color
     <div class="card"><div class="k">Pending limit</div><div class="v small" id="pending">—</div></div>
     <div class="card"><div class="k">Bars built</div><div class="v" id="bars">—</div></div>
     <div class="card"><div class="k">Ticks / errors</div><div class="v small" id="ticks">—</div></div>
+  </div>
+  <div class="section">Settings</div>
+  <div class="card" style="margin-bottom:14px">
+    <div class="frm">
+      <label>Symbols (comma-separated watchlist)</label>
+      <input type="text" id="setSymbols" placeholder="XAUUSD,EURUSD,GBPUSD"/>
+      <label>Timeframe</label>
+      <select id="setTimeframe"></select>
+      <label>Loop command (what Start runs)</label>
+      <select id="setLoopCommand"></select>
+      <label>Risk per trade (0.005 = 0.5%)</label>
+      <input type="number" id="setRisk" step="0.001" min="0.001" max="0.1"/>
+      <label>Max position volume (lots)</label>
+      <input type="number" id="setMaxVol" step="0.01" min="0.01" max="500"/>
+      <label>Limit entry (ATR pullback; 0 = market orders)</label>
+      <input type="number" id="setLimitAtr" step="0.05" min="0" max="5"/>
+      <label>Lookback (pipeline history)</label>
+      <input type="text" id="setLookback" placeholder="1y"/>
+      <div class="row" style="margin-top:10px">
+        <button class="btn start" onclick="saveSettings()">💾 Save settings</button>
+        <span class="sub" id="setstate"></span>
+      </div>
+    </div>
   </div>
   <div class="section">Control</div>
   <div class="row">
@@ -378,6 +438,33 @@ async function refresh(){
     if(l && l.length){ el.textContent = l.join("\n"); el.scrollTop = el.scrollHeight; }
   }catch(e){}
 }
+function fillOptions(sel, list, current){ sel.innerHTML = list.map(function(x){ return "<option"+(x===current?" selected":"")+">"+x+"</option>"; }).join(""); }
+async function loadSettings(){
+  var s; try{ s = await api("/api/settings"); }catch(e){ return; }
+  fillOptions(document.getElementById("setTimeframe"), s.timeframes, s.settings.timeframe);
+  fillOptions(document.getElementById("setLoopCommand"), s.loop_commands, s.settings.loop_command);
+  document.getElementById("setSymbols").value = (s.settings.symbols||[]).join(",");
+  document.getElementById("setRisk").value = s.settings.risk_per_trade;
+  document.getElementById("setMaxVol").value = s.settings.max_position_volume;
+  document.getElementById("setLimitAtr").value = s.settings.limit_entry_atr;
+  document.getElementById("setLookback").value = s.settings.lookback;
+}
+async function saveSettings(){
+  var body = {
+    symbols: document.getElementById("setSymbols").value.split(",").map(function(x){return x.trim().toUpperCase();}).filter(function(x){return x;}),
+    timeframe: document.getElementById("setTimeframe").value,
+    loop_command: document.getElementById("setLoopCommand").value,
+    risk_per_trade: parseFloat(document.getElementById("setRisk").value),
+    max_position_volume: parseFloat(document.getElementById("setMaxVol").value),
+    limit_entry_atr: parseFloat(document.getElementById("setLimitAtr").value),
+    lookback: document.getElementById("setLookback").value
+  };
+  var r = await api("/api/settings", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
+  if(r && r.problems && r.problems.length){ document.getElementById("setstate").textContent = "rejected: "+r.problems[0]; return; }
+  document.getElementById("setstate").textContent = (r&&r.detail)||"saved ✓";
+  await loadSettings(); refreshPipeline();
+}
+loadSettings();
 refresh(); refreshPipeline(); setInterval(refresh, 3000); setInterval(refreshPipeline, 3000);
 </script>
 </body>
@@ -394,6 +481,9 @@ class DashboardServer:
     log_dir: str = "logs"
     supervisor: LoopSupervisor | None = None
     pipeline: PipelineRunner | None = None
+    settings_path: str = DASHBOARD_SETTINGS_PATH
+    settings: dict[str, Any] = field(default_factory=dict)
+    base_env: dict[str, str] = field(default_factory=dict)
     _server: ThreadingHTTPServer | None = field(default=None, init=False)
     _thread: threading.Thread | None = field(default=None, init=False)
 
@@ -535,7 +625,7 @@ class DashboardServer:
                     if server.pipeline is None:
                         self._json(200, {"tasks": []})
                         return
-                    self._json(200, {"tasks": server.pipeline.overview(pipeline_task_defs(server.pipeline.env))})
+                    self._json(200, {"tasks": server.pipeline.overview(pipeline_task_defs(server.settings))})
                     return
                 if path == "/api/pipeline/logs":
                     query = parse_qs(urlparse(self.path).query)
@@ -545,6 +635,14 @@ class DashboardServer:
                         self._json(200, [])
                         return
                     self._json(200, server.pipeline.tail(task, min(max(lines, 1), 2000)))
+                    return
+                if path == "/api/settings":
+                    self._json(200, {
+                        "settings": server.settings,
+                        "timeframes": list(VALID_TIMEFRAMES),
+                        "loop_commands": list(VALID_LOOP_COMMANDS),
+                        "path": server.settings_path,
+                    })
                     return
                 self._json(404, {"error": "not found"})
 
@@ -559,13 +657,33 @@ class DashboardServer:
                 except Exception:
                     body = {}
 
+                # --- operator settings (the dashboard's configuration) ---------
+                if path == "/api/settings":
+                    saved, problems = save_dashboard_settings(server.settings_path, body, server.base_env)
+                    if problems:
+                        self._json(400, {"problems": problems})
+                        return
+                    server.settings = saved.to_dict()
+                    # propagate to the child processes so the next start/run
+                    # uses the new symbol/timeframe/risk immediately
+                    loop_env = build_loop_env(server.settings, server.base_env)
+                    if server.supervisor is not None:
+                        server.supervisor.reconfigure(
+                            [sys.executable, "-m", "slytrade.cli", server.settings.get("loop_command", "paper")],
+                            loop_env,
+                        )
+                    if server.pipeline is not None:
+                        server.pipeline.env = loop_env
+                    self._json(200, {"settings": server.settings, "detail": "settings saved"})
+                    return
+
                 # --- pipeline task control (one-shot research/ops stages) ------
                 if path in ("/api/pipeline/run", "/api/pipeline/stop"):
                     if server.pipeline is None:
                         self._json(400, {"error": "no pipeline runner configured"})
                         return
                     task_id = str(body.get("task", "")).strip()
-                    defs = {d["id"]: d for d in pipeline_task_defs(server.pipeline.env)}
+                    defs = {d["id"]: d for d in pipeline_task_defs(server.settings)}
                     if task_id not in defs:
                         self._json(400, {"error": f"unknown task {task_id!r}; choose from {sorted(defs)}"})
                         return
@@ -645,15 +763,21 @@ def run_dashboard(
     the /api/control endpoints manage it.
     """
     env = dict(os.environ)
+    settings_path = Path(state_dir) / "dashboard_settings.json"
+    settings = load_dashboard_settings(settings_path, env)
+    # The supervised loop runs what the operator configured (loop_command),
+    # with symbol/timeframe/risk from the settings — never hardcoded defaults.
+    loop_command = settings.loop_command
+    loop_env = build_loop_env(settings.to_dict(), env)
     supervisor = None
     if supervise:
         supervisor = LoopSupervisor(
-            command=[sys.executable, "-m", "slytrade.cli", command],
+            command=[sys.executable, "-m", "slytrade.cli", loop_command],
             cwd=os.getcwd(),
-            env=env,
+            env=loop_env,
         )
         supervisor.start()
-    pipeline = PipelineRunner(cwd=os.getcwd(), env=env)
+    pipeline = PipelineRunner(cwd=os.getcwd(), env=loop_env)
     server = DashboardServer(
         host=host,
         port=port,
@@ -663,6 +787,9 @@ def run_dashboard(
         log_dir=log_dir,
         supervisor=supervisor,
         pipeline=pipeline,
+        settings_path=str(settings_path),
+        settings=settings.to_dict(),
+        base_env=env,
     )
     server.start()
     return server

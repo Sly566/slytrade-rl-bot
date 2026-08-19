@@ -91,6 +91,14 @@ class RuntimeSettings(BaseSettings):
     replay_bars_file: str | None = None
     history_bars: int = 2000  # rolling bar context for ATR/EMA/H4/D1 features
 
+    # --- Dashboard overrides (None = use configs/risk.yaml) ---------------------
+    # The web dashboard persists operator settings and passes them to the loop
+    # via these env-driven fields, so the bot runs on what the operator set,
+    # not on hardcoded defaults.
+    risk_per_trade: float | None = None
+    max_position_volume: float | None = None
+    limit_entry_atr: float | None = None
+
     # --- Trading window (UTC) -------------------------------------------------
     trading_days: str = "mon,tue,wed,thu,fri"
     trading_start_utc: str = "00:00"

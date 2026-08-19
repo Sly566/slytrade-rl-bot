@@ -318,12 +318,15 @@ def test_pipeline_logs_endpoint(tmp_path) -> None:
         server.stop()
 
 
-def test_pipeline_task_defs_respect_env() -> None:
+def test_pipeline_task_defs_respect_settings() -> None:
     from slytrade.runtime.dashboard import pipeline_task_defs
 
-    defs = pipeline_task_defs({"SLYTRADE_SYMBOL": "EURUSD", "SLYTRADE_TIMEFRAME": "H1"})
+    settings = {"symbols": ["EURUSD", "GBPUSD"], "timeframe": "H1", "lookback": "2y"}
+    defs = pipeline_task_defs(settings)
     by_id = {d["id"]: d for d in defs}
-    assert by_id["full-pipeline"]["argv"] == ["full-pipeline", "--symbol", "EURUSD", "--timeframe", "H1"]
+    assert by_id["full-pipeline"]["argv"] == ["full-pipeline", "--symbol", "EURUSD", "--timeframe", "H1", "--lookback", "2y"]
     assert by_id["backtest"]["argv"] == ["persona-backtest", "--bars-file", "data/processed/aligned/EURUSD/h1/bars.parquet"]
     assert by_id["learn"]["argv"] == ["learn", "--bars-file", "data/processed/aligned/EURUSD/h1/bars.parquet"]
     assert by_id["collect"]["argv"] == ["collect-incremental", "--symbol", "EURUSD", "--lookback", "7d"]
+    # the full watchlist reaches the admit stage
+    assert by_id["admit"]["argv"] == ["admit", "--symbols", "EURUSD,GBPUSD", "--timeframe", "H1", "--lookback", "2y"]

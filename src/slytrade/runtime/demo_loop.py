@@ -26,7 +26,7 @@ import os
 import signal
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -123,6 +123,9 @@ class LiveTradingLoop:
         risk_cfg = config.risk
         self._converter = load_converter(risk_cfg)
         limits = limits_from_config(risk_cfg)
+        # Dashboard/operator overrides: when set, they win over risk.yaml.
+        if self.settings.risk_per_trade is not None:
+            limits = replace(limits, risk_per_trade=float(self.settings.risk_per_trade))
         self.breaker = LossCircuitBreaker(limits)
         self.window = window_from_settings(self.settings.trading_days, self.settings.trading_start_utc, self.settings.trading_end_utc)
         self.alerter = AlertManager.from_settings(self.settings, self.logger)
@@ -135,7 +138,11 @@ class LiveTradingLoop:
                 allow_live_trading=True,
                 max_daily_drawdown=limits.max_daily_drawdown,
                 max_total_drawdown=limits.max_total_drawdown,
-                max_position_volume=float(risk_cfg.get("max_position_volume", 1.0)),
+                max_position_volume=(
+                    float(self.settings.max_position_volume)
+                    if self.settings.max_position_volume is not None
+                    else float(risk_cfg.get("max_position_volume", 1.0))
+                ),
                 max_spread_points=float(config.broker.get("execution", {}).get("max_spread_points", 50.0)),
             ),
             initial_equity=float(self.settings.initial_balance),
@@ -199,7 +206,11 @@ class LiveTradingLoop:
             smc_breaker=int(entry.get("smc_breaker", 0)),
             smc_vi=int(entry.get("smc_vi", 0)),
             smc_dol_tap=int(entry.get("smc_dol_tap", 0)),
-            limit_entry_atr=float(entry.get("limit_entry_atr", 0.0) or 0.0),
+            limit_entry_atr=(
+                float(self.settings.limit_entry_atr)
+                if self.settings.limit_entry_atr is not None
+                else float(entry.get("limit_entry_atr", 0.0) or 0.0)
+            ),
             point_value=point_value,
         )
         return PersonalityAdaptiveStrategy(symbol=self.settings.symbol, volume=0.1, config=config)
