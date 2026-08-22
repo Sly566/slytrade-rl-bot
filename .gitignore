@@ -8,8 +8,8 @@ __pycache__/
 venv/
 *.egg-info/
 
-# Data — never commit raw/processed data to git
-data/
+# Data — never commit raw/processed data to git (anchored at repo root)
+/data/
 logs/
 state/
 reports/

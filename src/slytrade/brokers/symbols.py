@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from . import BROKER_SUFFIXES  # re-export from config for convenience
+from ..config import BROKER_SUFFIXES
 
 
 def symbol_variants(base: str) -> List[str]:
