@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slytrade"
+version = "0.3.0"
+description = "SlyTrade — MT5 raw data collection foundation (Layer 0+1)"
+requires-python = ">=3.12"
+dependencies = [
+  "numpy>=2.0",
+  "pandas>=3.0",
+  "pyarrow>=17.0",
+  "typer>=0.12",
+  "rich>=13.0",
+  "pydantic>=2.5",
+  "requests>=2.31",
+  "python-dateutil>=2.9",
+  "pytz>=2024.1",
+  "mt5linux==1.0.11",
+  "rpyc==6.0.2",
+  "plumbum==1.7.0",
+  "pyparsing>=3.1,<4",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-cov>=5.0",
+]
+
+[project.scripts]
+slytrade = "slytrade.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"

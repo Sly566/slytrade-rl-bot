@@ -1,0 +1,33 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "setup",
+      "type": "shell",
+      "command": "bash scripts/setup.sh",
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "doctor",
+      "type": "shell",
+      "command": "source .venv/bin/activate && slytrade doctor",
+      "group": "test",
+      "problemMatcher": []
+    },
+    {
+      "label": "mt5-info",
+      "type": "shell",
+      "command": "source .venv/bin/activate && slytrade mt5-info",
+      "group": "test",
+      "problemMatcher": []
+    },
+    {
+      "label": "full-collect",
+      "type": "shell",
+      "command": "source .venv/bin/activate && slytrade collect --symbol XAUUSD --lookback 2y --source hybrid",
+      "group": "build",
+      "problemMatcher": []
+    }
+  ]
+}

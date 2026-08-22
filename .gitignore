@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+*.egg-info/
+
+# Data — never commit raw/processed data to git
+data/
+logs/
+state/
+reports/
+*.parquet
+*.zip
+*.csv.gz
+*.db
+*.sqlite
+
+# IDE
+.vscode/settings.local.json
+.DS_Store
+
+# Secrets
+.env
+*.key
+*.pem
