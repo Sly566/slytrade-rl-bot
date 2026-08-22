@@ -51,4 +51,35 @@ Second and subsequent runs skip existing files; `--clean` wipes and re-fetches.
 
 - Exness archive speeds from South Africa are ~0.03–0.2 MB/s; a full 2y first-time run takes 3–4 hours. After that, `skip_existing` makes runs complete in minutes.
 - MT5 demo tick history only goes back ~6–8 weeks. The Exness backfill covers everything before that.
-- Data is not committed to git. If you need a copy, tar the `data/` directory.
+- Data is not committed to git. Snapshots move between machines via GitHub Releases (below).
+
+## Transferring data between machines
+
+`data/` never enters the `main` branch. Snapshots travel as **orphan
+snapshot tags**: a single throwaway commit pushed only as `refs/tags/<tag>`,
+so code history stays pristine and the branch list stays `main`-only.
+(Git is used instead of Release assets because the receiving environment can
+only reach `github.com` — the release-asset CDN is blocked there.)
+
+```bash
+# Sender (any clone with push access):
+bash scripts/upload_data.sh processed-v1 data/processed
+# or several trees at once:
+bash scripts/upload_data.sh data-v1 data/raw data/processed
+
+# Receiver (any clone of this repo):
+bash scripts/fetch_data.sh processed-v1          # restores under repo root
+bash scripts/fetch_data.sh processed-v1 /tmp/x   # ...or into another dir
+```
+
+Details:
+- Files >90MB are byte-sharded automatically (GitHub rejects single files
+  >100MB) and reassembled transparently on fetch.
+- Every restored file is verified against `MANIFEST.sha256` in the snapshot;
+  re-running a fetch skips files that already checksum-match.
+- Delete an old snapshot with: `git push origin :refs/tags/<tag>`
+
+If you already uploaded an archive as a **Release asset** via the GitHub web
+UI (e.g. a `.tar.zst` of processed data), convert it into a snapshot tag
+with the `import-data-release` workflow (Actions tab → Run workflow → enter
+the numeric release id + a tag name), then fetch it as above.
