@@ -1,4 +1,4 @@
-"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.2 scalper persona.
+"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.3 scalper persona.
 
 Connects to MT5 via the mt5linux RPyC bridge (run `bash start_mt5_bridge.sh`
 in another terminal first), pulls multi-timeframe bars, computes Layer 2
@@ -18,7 +18,7 @@ Run:
     python -m slytrade.live.trader --symbol XAUUSDm --all --verbose  # see ALL signals
     python -m slytrade.live.trader --symbol XAUUSDm --live     # real trading (champion)
 
-Default persona: v0.9.2 champion (longs-only, 0.85R one-shot, >=2 ATR stops,
+Default persona: v0.9.3 champion (longs-only, 0.85R one-shot, >=2 ATR stops,
 grades A+/A/B, M5+M15 OBs, London/NY). Use --all to switch to the unrestricted
 scalper persona (long+short, all grades, H1+M15+M5 OBs+FVGs, LIQ_SWEEP + BOS_CONT
 quick scalps, Asian+off-hours unlocked, persona_gating=False) so you see
@@ -150,23 +150,36 @@ def fetch_bars(mt5: Any, symbol: str, timeframe: str, count: int) -> pd.DataFram
     """Fetch `count` COMPLETED bars ending 'now' from MT5, normalized.
 
     MT5 copy_rates_from_pos(symbol, tf, 0, N) returns N bars where the most
-    recent (last after time-sort) is the CURRENTLY-FORMING bar — its OHLC is
-    still mutating. We over-fetch and drop that in-progress bar so our feature
-    pipeline only sees closed bars (causality-safe).
+    recent (last after time-sort) is the CURRENTLY-FORMING bar -- its OHLC is
+    still mutating. We over-fetch and then DEFENSIVELY drop the tail so that
+    we NEVER feed a forming bar into the feature pipeline or signal engine.
+
+    The wall-clock close-time check (`time + tf <= now`) is necessary but not
+    sufficient: under Wine/RPyC jitter, MT5 broker time can drift 1-2 seconds
+    from the host clock, so a bar that "should" be closed according to host
+    time may still have a tick or two left on the broker. We therefore drop
+    the last BAR_COUNT_BUFFER bars UNCONDITIONALLY after the time filter to
+    guarantee causality. Costs us 1-2 minutes of signal latency but that's
+    irrelevant for 240-bar time-stop scalps and eliminates the "diag sees disp
+    but engine state doesn't update" class of bugs.
     """
     tf_const = getattr(mt5, TIMEFRAME_ATTRS[timeframe])
-    want = int(count) + 2  # +1 for in-progress bar, +1 safety margin
+    tail_drop = 2 if timeframe == "M1" else 1
+    want = int(count) + 5 + tail_drop
     raw = mt5.copy_rates_from_pos(symbol, tf_const, 0, want)
     if raw is None or len(raw) == 0:
         return pd.DataFrame()
     df = normalize_bar_frame(raw, symbol, timeframe)
     if df.empty:
         return df
-    # Drop the in-progress bar: any bar whose close time (time + tf_duration)
-    # hasn't passed yet is incomplete.
+    # 1) Wall-clock close-time filter: drop bars whose close hasn't passed yet.
     dur = timeframe_timedelta(timeframe)
     now = datetime.now(UTC)
     df = df[df["time"] + dur <= now].copy()
+    # 2) HARD tail drop: shave off the last `tail_drop` bars unconditionally
+    #    to absorb broker/host clock jitter.
+    if len(df) > tail_drop:
+        df = df.iloc[:-tail_drop].copy()
     # Keep only the last `count` completed bars
     if len(df) > count:
         df = df.iloc[-count:].copy()
@@ -668,15 +681,37 @@ class LiveTrader:
         new_rows = aligned.index[new_mask].tolist()
 
         n_sigs_this_cycle = 0
+        verbose_rejects: list[str] = []
         for i in new_rows:
             row = aligned.iloc[i]
+            trace: list[str] = [] if self.verbose else []
             try:
-                sig = _evaluate_row(int(i), row, self.cfg, self._state)
-            except Exception:
+                sig = _evaluate_row(int(i), row, self.cfg, self._state, fail_trace=trace)
+            except Exception as e:
                 sig = None
+                if self.verbose:
+                    trace.append(f"[row {i}] EXCEPTION: {e}")
             if sig is not None:
                 self._handle_signal(sig)
                 n_sigs_this_cycle += 1
+            elif self.verbose and trace:
+                # In verbose mode log reject reasons for 'interesting' bars
+                # (disp/BOS/sweep just fired) so we can see which gate is
+                # killing the row; also log once per 5 cycles unconditionally.
+                flags_hot = (bool(row.get('bear_disp', False)) or
+                             bool(row.get('bull_disp', False)) or
+                             bool(row.get('minor_bos_up', False)) or
+                             bool(row.get('minor_bos_dn', False)) or
+                             bool(row.get('bull_liq_sweep', False)) or
+                             bool(row.get('bear_liq_sweep', False)))
+                if flags_hot or self._cycle % 5 == 0:
+                    verbose_rejects.append(trace[-1])
+
+        if self.verbose and verbose_rejects:
+            for line in verbose_rejects[:8]:
+                print(f"    [GATE] {line}")
+            if len(verbose_rejects) > 8:
+                print(f"    [GATE] ... and {len(verbose_rejects)-8} more rejects this cycle")
 
         if new_rows:
             self._last_processed_m1_time = aligned.iloc[new_rows[-1]]["time"]
@@ -725,8 +760,8 @@ class LiveTrader:
 
     # ------------------------------------------------------------------ #
     def run(self) -> None:
-        persona_label = "v0.9.2 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.2 champion (long-only A+/A/B RETEST_OB)"
-        print(f"SlyTrade LIVE v0.9.2  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  max_open={self.max_open}")
+        persona_label = "v0.9.3 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.3 champion (long-only A+/A/B RETEST_OB)"
+        print(f"SlyTrade LIVE v0.9.3  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  max_open={self.max_open}")
         print(f"persona: {persona_label}")
         print("setups : RETEST_OB RETEST_FVG LIQ_SWEEP BOS_CONT  (champion gates apply unless --all)")
         print(f"Magic={MAGIC}")
@@ -770,7 +805,7 @@ class LiveTrader:
 # --------------------------------------------------------------------------- #
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="SlyTrade v0.9.2 SCALPER LIVE trader (OB/FVG retests + liq sweeps + BOS continuation)")
+    ap = argparse.ArgumentParser(description="SlyTrade v0.9.3 SCALPER LIVE trader (OB/FVG retests + liq sweeps + BOS continuation)")
     ap.add_argument("--symbol", default="XAUUSDm")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=18812)

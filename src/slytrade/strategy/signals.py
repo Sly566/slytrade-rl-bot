@@ -295,26 +295,43 @@ def _evaluate_row(i: int,
                   # State carried across rows: dict[str, dict] tracking per-TF
                   # active (unmitigated) OB/FVG zones after a displacement.
                   state: dict,
+                  *,
+                  fail_trace: list[str] | None = None,
                   ) -> Signal | None:
     """Evaluate one M1 bar and return a Signal if all gates pass, else None.
 
     `state` is mutated across rows; it tracks the most recent unmitigated
     OBs/FVGs on each HTF, keyed by f"{tf}_{side}_{kind}" → dict(top, bot, bar).
+
+    Pass `fail_trace=[]` to collect human-readable reject reasons (one string
+    per gate that fired, last-wins since order matters). Used by the live
+    verbose loop to debug why bars that print disp/sweep flags in diagnostics
+    don't produce signals; batch scan ignores it.
     """
+    def _reject(msg: str):
+        if fail_trace is not None:
+            t = row.get('time')
+            try:
+                ts = pd.Timestamp(t).strftime('%H:%M')
+            except Exception:
+                ts = str(t)
+            fail_trace.append(f"t={ts} {msg}")
+
     c = float(row['close'])
     atr = float(row['atr_14']) if pd.notna(row['atr_14']) else 0.0
     if atr <= 0:
-        return None
+        _reject(f"atr<=0 atr={atr}"); return None
 
     # Gate 0: ATR sanity (skip dead/news-spike bars)
     atr_pct = atr / c if c > 0 else 0.0
     if atr_pct < cfg.confluence.min_atr_pct or atr_pct > cfg.confluence.max_atr_pct:
+        _reject(f"atr_pct={atr_pct:.5f} outside band [{cfg.confluence.min_atr_pct},{cfg.confluence.max_atr_pct}] atr={atr:.2f} c={c:.2f}")
         return None
 
     # Gate 1: session / killzone
     allowed, kz_tag = _killzone_tag(row, cfg.sessions)
     if not allowed:
-        return None
+        _reject(f"session blocked kz={kz_tag}"); return None
 
     # Update tracked zones from this row's HTF values. A zone becomes "active"
     # when it appears (top becomes notnull, mitigated=False) after a
