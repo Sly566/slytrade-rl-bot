@@ -373,32 +373,52 @@ def _evaluate_row(i: int,
             _update_zone(tf, 'bear', 'fvg')
 
     # --- 1b. Displacement/BOS trigger freshness ---
+    # Trigger freshness: any bullish structural impulse (disp/BOS/CHoCH on
+    # M1 or trigger TF) resets the trigger window. v0.9.5 missed the minor
+    # CHoCH variants at M1 level and the minor/major CHoCH variants at the
+    # trigger-TF level (M5), causing the engine to ignore legitimate CHoCH-
+    # driven reversals like the 22:27+ impulse Sly watched.
     bull_trig_fresh = (bool(row.get(f'{trigger_tf}_bull_disp', False)) or
                        bool(row.get(f'{trigger_tf}_minor_bos_up', False)) or
                        bool(row.get(f'{trigger_tf}_major_bos_up', False)) or
+                       bool(row.get(f'{trigger_tf}_minor_choch_up', False)) or
                        bool(row.get(f'{trigger_tf}_major_choch_up', False)) or
                        bool(row.get('bull_disp', False)) or
                        bool(row.get('minor_bos_up', False)) or
-                       bool(row.get('major_bos_up', False)))
+                       bool(row.get('major_bos_up', False)) or
+                       bool(row.get('minor_choch_up', False)) or
+                       bool(row.get('major_choch_up', False)))
     bear_trig_fresh = (bool(row.get(f'{trigger_tf}_bear_disp', False)) or
                        bool(row.get(f'{trigger_tf}_minor_bos_dn', False)) or
                        bool(row.get(f'{trigger_tf}_major_bos_dn', False)) or
+                       bool(row.get(f'{trigger_tf}_minor_choch_dn', False)) or
                        bool(row.get(f'{trigger_tf}_major_choch_dn', False)) or
                        bool(row.get('bear_disp', False)) or
                        bool(row.get('minor_bos_dn', False)) or
-                       bool(row.get('major_bos_dn', False)))
+                       bool(row.get('major_bos_dn', False)) or
+                       bool(row.get('minor_choch_dn', False)) or
+                       bool(row.get('major_choch_dn', False)))
     if bull_trig_fresh:
         state['_last_bull_trigger'] = t_now
+        # m5_bull = any bullish structural impulse on the trigger TF (M5).
+        # v0.9.5 omitted minor_choch_up / major_choch_up here, which meant
+        # a bullish M5 CHoCH (which IS a valid fresh M5 trigger for retest
+        # zones) refreshed the M1-level window but NOT the _m5 window —
+        # causing RETEST longs to miss the M5 retest window by ~60 bars.
         m5_bull = bool(row.get(f'{trigger_tf}_bull_disp', False)) or \
                  bool(row.get(f'{trigger_tf}_minor_bos_up', False)) or \
-                 bool(row.get(f'{trigger_tf}_major_bos_up', False))
+                 bool(row.get(f'{trigger_tf}_major_bos_up', False)) or \
+                 bool(row.get(f'{trigger_tf}_minor_choch_up', False)) or \
+                 bool(row.get(f'{trigger_tf}_major_choch_up', False))
         if m5_bull:
             state['_last_bull_trigger_m5'] = t_now
     if bear_trig_fresh:
         state['_last_bear_trigger'] = t_now
         m5_bear = bool(row.get(f'{trigger_tf}_bear_disp', False)) or \
                  bool(row.get(f'{trigger_tf}_minor_bos_dn', False)) or \
-                 bool(row.get(f'{trigger_tf}_major_bos_dn', False))
+                 bool(row.get(f'{trigger_tf}_major_bos_dn', False)) or \
+                 bool(row.get(f'{trigger_tf}_minor_choch_dn', False)) or \
+                 bool(row.get(f'{trigger_tf}_major_choch_dn', False))
         if m5_bear:
             state['_last_bear_trigger_m5'] = t_now
 
@@ -478,9 +498,13 @@ def _evaluate_row(i: int,
         side = 'bull' if direction == 1 else 'bear'
         last_sweep_ts = state.get(f'_last_{side}_sweep_ts')
         if last_sweep_ts is None:
+            if fail_trace is not None:
+                _reject(f"LIQ_SWEEP {side}: no sweep in state")
             continue
         age_min = (t_now - last_sweep_ts).total_seconds() / 60.0
         if age_min > sweep_window:
+            if fail_trace is not None:
+                _reject(f"LIQ_SWEEP {side}: sweep age {age_min:.0f}m > window {sweep_window}m")
             continue
         sweep_extreme = state.get(f'_last_{side}_sweep_px')
         if sweep_extreme is None:
@@ -488,26 +512,33 @@ def _evaluate_row(i: int,
         # Invalidate if price has already pushed back through the sweep
         # extreme (sweep failed -> continuation, not reversal)
         if direction == 1 and c < float(sweep_extreme):
+            if fail_trace is not None:
+                _reject(f"LIQ_SWEEP {side}: c={c:.2f} < sweep_px={float(sweep_extreme):.2f} (failed reversal)")
             continue
         if direction == -1 and c > float(sweep_extreme):
+            if fail_trace is not None:
+                _reject(f"LIQ_SWEEP {side}: c={c:.2f} > sweep_px={float(sweep_extreme):.2f} (failed reversal)")
             continue
-        # Require displacement/BOS in reversal direction (M1 or trigger_tf).
-        # In persona mode (champion) keep the vol-spike confirmation on BOS
-        # legs to filter fakeouts; in --all unrestricted mode we want to SEE
-        # every displacement+BOS combo so the RL agent learns which ones
-        # work, so we drop the vol-spike gate (low-volume grind-downs are
-        # real setups, as Sly saw in the 20:14 selloff where vol was sub-2x
-        # SMA for 45 min while price dropped $10).
+        # Require displacement/BOS/CHoCH in reversal direction (M1 or trigger_tf).
+        # v0.9.5 only checked disp and major/minor BOS; CHoCH breaks (which
+        # are the primary signal after a liquidity grab) were silently
+        # skipped -- added them here so a fresh sweep+CHoCH reversal fires.
         m1_disp = bool(row.get('bull_disp' if direction==1 else 'bear_disp', False))
         tf_disp = bool(row.get(f'{trigger_tf}_{"bull" if direction==1 else "bear"}_disp', False))
         m1_bos = bool(row.get('minor_bos_up' if direction==1 else 'minor_bos_dn', False)) or \
-                 bool(row.get('major_bos_up' if direction==1 else 'major_bos_dn', False))
+                 bool(row.get('major_bos_up' if direction==1 else 'major_bos_dn', False)) or \
+                 bool(row.get('minor_choch_up' if direction==1 else 'minor_choch_dn', False)) or \
+                 bool(row.get('major_choch_up' if direction==1 else 'major_choch_dn', False))
         vol_surge = bool(row.get('vol_spike', False)) or bool(row.get(f'{trigger_tf}_vol_spike', False))
         if cfg.confluence.persona_gating:
             if not (m1_disp or tf_disp or (m1_bos and vol_surge)):
+                if fail_trace is not None:
+                    _reject(f"LIQ_SWEEP {side}: no disp/BOS confirmation (champion requires vol_surge)")
                 continue
         else:
             if not (m1_disp or tf_disp or m1_bos):
+                if fail_trace is not None:
+                    _reject(f"LIQ_SWEEP {side}: no disp/BOS/CHoCH confirmation yet")
                 continue
         # One entry per sweep event (dedupe by timestamp)
         sweep_key = f"_swept_{direction}_{last_sweep_ts.isoformat()}"
@@ -571,45 +602,55 @@ def _evaluate_row(i: int,
 
     # ================================================================== #
     # SETUP B: BOS / CHoCH CONTINUATION SCALP
-    # Minor/major BOS fires with displacement + vol spike — ride the
-    # impulse, don't wait for retest. SL below last swing low (bull) or
-    # above last swing high (bear), TP at 0.85R momentum scalp.
+    # Minor/major BOS or CHoCH fires with displacement — ride the impulse,
+    # don't wait for retest. SL below last opposing swing, TP at 0.85R.
+    # v0.9.6 adds M1 CHoCH and trigger-TF minor CHoCH detection (v0.9.5
+    # silently ignored minor_choch on either TF — the bar Sly watched at
+    # 22:27 with `minor_choch_up` printed but sigs=0 was this bug).
     # ================================================================== #
     for direction in (1, -1):
         if direction not in candidates:
             continue
-        # Fresh BOS/CHoCH on trigger_tf in this direction
+        side = 'bull' if direction == 1 else 'bear'
+        # Fresh BOS/CHoCH on trigger_tf OR M1 in this direction.
+        # BOS = continuation of existing structure; CHoCH = reversal.
+        # Both are valid continuation-scalp entries right after the break.
         if direction == 1:
-            bos_now = bool(row.get(f'{trigger_tf}_minor_bos_up', False)) or \
-                      bool(row.get(f'{trigger_tf}_major_bos_up', False)) or \
-                      bool(row.get(f'{trigger_tf}_major_choch_up', False))
-            m1_bos = bool(row.get('minor_bos_up', False)) or bool(row.get('major_bos_up', False))
+            tf_structure = (bool(row.get(f'{trigger_tf}_minor_bos_up', False)) or
+                            bool(row.get(f'{trigger_tf}_major_bos_up', False)) or
+                            bool(row.get(f'{trigger_tf}_minor_choch_up', False)) or
+                            bool(row.get(f'{trigger_tf}_major_choch_up', False)))
+            m1_structure = (bool(row.get('minor_bos_up', False)) or
+                            bool(row.get('major_bos_up', False)) or
+                            bool(row.get('minor_choch_up', False)) or
+                            bool(row.get('major_choch_up', False)))
         else:
-            bos_now = bool(row.get(f'{trigger_tf}_minor_bos_dn', False)) or \
-                      bool(row.get(f'{trigger_tf}_major_bos_dn', False)) or \
-                      bool(row.get(f'{trigger_tf}_major_choch_dn', False))
-            m1_bos = bool(row.get('minor_bos_dn', False)) or bool(row.get('major_bos_dn', False))
-        if not (bos_now or m1_bos):
+            tf_structure = (bool(row.get(f'{trigger_tf}_minor_bos_dn', False)) or
+                            bool(row.get(f'{trigger_tf}_major_bos_dn', False)) or
+                            bool(row.get(f'{trigger_tf}_minor_choch_dn', False)) or
+                            bool(row.get(f'{trigger_tf}_major_choch_dn', False)))
+            m1_structure = (bool(row.get('minor_bos_dn', False)) or
+                            bool(row.get('major_bos_dn', False)) or
+                            bool(row.get('minor_choch_dn', False)) or
+                            bool(row.get('major_choch_dn', False)))
+        if not (tf_structure or m1_structure):
+            if fail_trace is not None:
+                _reject(f"BOS_CONT {side}: no BOS/CHoCH structure on this bar")
             continue
         # Momentum confirmation. Champion (persona_gating=True) requires
         # displacement AND volume spike (PF 2.00 preservation); unrestricted
-        # --all mode relaxes this to displacement OR BOS (vol spike is a
-        # bonus tag, not a gate) so we don't miss low-volume grind
-        # continuations like the 20:14-20:20 selloff Sly watched go
-        # signal-less for 45 minutes.
+        # --all mode relaxes this to just the structural break above
+        # (disp/vol are bonus tags, not gates) so we don't miss low-volume
+        # grind continuations.
         disp_flag = f'{trigger_tf}_bull_disp' if direction == 1 else f'{trigger_tf}_bear_disp'
         m1_disp_flag = 'bull_disp' if direction == 1 else 'bear_disp'
         has_disp = bool(row.get(disp_flag, False)) or bool(row.get(m1_disp_flag, False))
         has_vol = bool(row.get(f'{trigger_tf}_vol_spike', False)) or bool(row.get('vol_spike', False))
         if cfg.confluence.persona_gating:
             if not (has_disp and has_vol):
+                if fail_trace is not None:
+                    _reject(f"BOS_CONT {side}: persona requires disp+vol_surge")
                 continue
-        else:
-            if not has_disp:
-                # In unrestricted mode a pure BOS (no displacement flag yet)
-                # is acceptable -- displacement often prints the bar after a
-                # sharp BOS break, and waiting a bar costs us the scalp.
-                pass
         # Dedupe per BOS bar
         bos_key = f"_bos_{direction}_{t_now.isoformat()}"
         if state.get(bos_key):
@@ -624,6 +665,8 @@ def _evaluate_row(i: int,
             sl_anchor = row.get(f'{trigger_tf}_minor_swing_high', np.nan)
             if pd.isna(sl_anchor): sl_anchor = row.get('minor_swing_high', np.nan)
         if pd.isna(sl_anchor):
+            if fail_trace is not None:
+                _reject(f"BOS_CONT {side}: no minor swing anchor for SL")
             continue
         entry = c
         buffer_amt = cfg.exits.ob_invalidation_buffer * atr
@@ -633,12 +676,10 @@ def _evaluate_row(i: int,
             stop = float(sl_anchor) + buffer_amt
         risk = abs(entry - stop)
         if risk <= 0 or risk < 0.5 * atr or risk > 7.0 * atr or risk > 40.0:
+            if fail_trace is not None:
+                _reject(f"BOS_CONT {side}: risk={risk:.2f} atr={atr:.2f} outside bounds (0.5-7ATR, <=$40)")
             continue
         risk_atr = risk / atr if atr > 0 else 0
-        if cfg.confluence.persona_gating and risk_atr < cfg.confluence.min_risk_atr:
-            # Contiuation scalps naturally have tighter stops than retests;
-            # relax min_risk in persona mode for BOS_CONT
-            pass
 
         grade, conf_tags = _grade(direction, row, cfg.confluence,
                                   bonus_killzone=('+' in kz_tag or 'open30' in kz_tag))

@@ -1,4 +1,4 @@
-"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.5 scalper persona.
+"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.6 scalper persona.
 
 Connects to MT5 via the mt5linux RPyC bridge (run `bash start_mt5_bridge.sh`
 in another terminal first), pulls multi-timeframe bars, computes Layer 2
@@ -18,7 +18,7 @@ Run:
     python -m slytrade.live.trader --symbol XAUUSDm --all --verbose  # see ALL signals
     python -m slytrade.live.trader --symbol XAUUSDm --live     # real trading (champion)
 
-Default persona: v0.9.5 champion (longs-only, 0.85R one-shot, >=2 ATR stops,
+Default persona: v0.9.6 champion (longs-only, 0.85R one-shot, >=2 ATR stops,
 grades A+/A/B, M5+M15 OBs, London/NY). Use --all to switch to the unrestricted
 scalper persona (long+short, all grades, H1+M15+M5 OBs+FVGs, LIQ_SWEEP + BOS_CONT
 quick scalps, Asian+off-hours unlocked, persona_gating=False) so you see
@@ -150,26 +150,25 @@ def fetch_bars(mt5: Any, symbol: str, timeframe: str, count: int) -> pd.DataFram
     """Fetch `count` COMPLETED bars ending 'now' from MT5, normalized.
 
     CRITICAL CAUSALITY RULE: MT5's copy_rates_from_pos(symbol, tf, 0, N) ALWAYS
-    returns the CURRENTLY-FORMING bar as the LAST row -- its OHLC is mutating
-    in real time and must NEVER be fed into the feature pipeline or signal
-    engine. We cannot reliably filter this with wall-clock arithmetic
-    (`time+dur <= now`) because broker/host clock drift under Wine/RPyC can
-    be 1-2 seconds, which is enough for a forming bar to leak in and poison
-    state (the bug that froze trigger timestamps for two hours in v0.9.2).
+    returns the CURRENTLY-FORMING bar as the LAST row -- its OHLC mutates in
+    real time and must NEVER be fed into the feature pipeline or signal
+    engine. v0.9.6 guard:
 
-    Instead we:
-      1. Over-fetch by a small buffer.
-      2. Apply the wall-clock filter as a belt-and-braces safety net.
-      3. UNCONDITIONALLY drop the LAST 1 bar per TF. MT5's forming bar is
-         ALWAYS the last row, period -- this is the only clock-drift-proof
-         way to exclude it.
-    Latency cost: ~1 full TF period (1 minute for M1, 5 min for M5, etc.).
-    For M1 scalps that is ~60 seconds after bar close at :05 past -- fast
-    enough to catch LIQ_SWEEP reversals and BOS continuations without
-    chasing.
+      1. Wall-clock filter with 2s grace: keep bars whose close time
+         (time+dur) is at least 2 seconds in the past on host clock. This
+         tolerates Wine/RPyC/NTP jitter up to ~2s without admitting the
+         forming bar (whose close is `dur` in the future).
+      2. For M1 ONLY: unconditionally drop the last bar as belt-and-
+         suspenders. M1 forming-bar OHLC poisons feature state
+         (displacements, swings) within seconds, and a ~60s lag is
+         acceptable for scalps. For M5+ the forming bar closes 5-1440
+         minutes in the future, so the wall filter ALONE excludes it
+         safely; an extra tail drop there (v0.9.5 bug) cut off the most
+         recently CLOSED HTF bar, leaving structural flags (bull_disp,
+         minor_choch_up, etc.) always one HTF period stale.
     """
     tf_const = getattr(mt5, TIMEFRAME_ATTRS[timeframe])
-    tail_drop = 1
+    dur = timeframe_timedelta(timeframe)
     want = int(count) + 5
     raw = mt5.copy_rates_from_pos(symbol, tf_const, 0, want)
     if raw is None or len(raw) == 0:
@@ -177,16 +176,24 @@ def fetch_bars(mt5: Any, symbol: str, timeframe: str, count: int) -> pd.DataFram
     df = normalize_bar_frame(raw, symbol, timeframe)
     if df.empty:
         return df
-    # Belt-and-braces wall-clock filter (drops bars whose close time has
-    # not yet passed on host clock -- useful after long pauses or weekends
-    # where MT5 may return stale history).
-    dur = timeframe_timedelta(timeframe)
+    # Wall-clock filter with a 2-second safety buffer: keep only bars
+    # whose close time is at least 2 seconds in the past on host clock.
+    # This tolerates Wine/RPyC/NTP jitter up to ~2s without admitting the
+    # forming bar (which always closes `dur` in the future).
     now = datetime.now(UTC)
-    df = df[df["time"] + dur <= now].copy()
-    # HARD unconditional tail drop of 1 bar. This is the real guard against
-    # the forming bar -- MT5 ALWAYS puts the live-forming candle last.
-    if len(df) > tail_drop:
-        df = df.iloc[:-tail_drop].copy()
+    safe_grace = timedelta(seconds=2)
+    df = df[df["time"] + dur <= now - safe_grace].copy()
+    # For M1 ONLY: unconditionally drop the last bar as belt-and-suspenders.
+    # M1 forming-bar OHLC poisons feature state (displacements, swings)
+    # within seconds, and a 1-bar (~60s) lag on M1 is acceptable for
+    # scalps. For higher TFs (M5+), the forming bar closes 5-1440 minutes
+    # in the future so the wall filter above ALWAYS excludes it; an
+    # unconditional drop there (v0.9.5 bug) cuts off the most recently
+    # CLOSED HTF bar, making M5/M15/M30/H1 structural flags (bull_disp,
+    # minor_choch_up, etc.) always one bar (~5-60 min) stale. v0.9.6 fixes
+    # that so HTF structure updates the moment the HTF bar closes.
+    if timeframe == "M1" and len(df) > 1:
+        df = df.iloc[:-1].copy()
     # Keep only the last `count` completed bars
     if len(df) > count:
         df = df.iloc[-count:].copy()
@@ -705,12 +712,22 @@ class LiveTrader:
                 # In verbose mode log reject reasons for 'interesting' bars
                 # (disp/BOS/sweep just fired) so we can see which gate is
                 # killing the row; also log once per 5 cycles unconditionally.
-                flags_hot = (bool(row.get('bear_disp', False)) or
-                             bool(row.get('bull_disp', False)) or
-                             bool(row.get('minor_bos_up', False)) or
-                             bool(row.get('minor_bos_dn', False)) or
-                             bool(row.get('bull_liq_sweep', False)) or
-                             bool(row.get('bear_liq_sweep', False)))
+                # Print [GATE] reason for any bar carrying a structural
+                # impulse flag on M1 or the trigger TF, so verbose output
+                # tells us exactly which gate killed a "hot" bar.
+                flags_hot = False
+                for fl in ('bear_disp', 'bull_disp',
+                           'minor_bos_up', 'minor_bos_dn',
+                           'minor_choch_up', 'minor_choch_dn',
+                           'major_bos_up', 'major_bos_dn',
+                           'major_choch_up', 'major_choch_dn',
+                           'bull_liq_sweep', 'bear_liq_sweep',
+                           'M5_bull_disp', 'M5_bear_disp',
+                           'M5_minor_bos_up', 'M5_minor_bos_dn',
+                           'M5_minor_choch_up', 'M5_minor_choch_dn'):
+                    if bool(row.get(fl, False)):
+                        flags_hot = True
+                        break
                 if flags_hot or self._cycle % 5 == 0:
                     verbose_rejects.append(trace[-1])
 
@@ -767,8 +784,8 @@ class LiveTrader:
 
     # ------------------------------------------------------------------ #
     def run(self) -> None:
-        persona_label = "v0.9.5 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.5 champion (long-only A+/A/B RETEST_OB)"
-        print(f"SlyTrade LIVE v0.9.5  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  max_open={self.max_open}")
+        persona_label = "v0.9.6 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.6 champion (long-only A+/A/B RETEST_OB)"
+        print(f"SlyTrade LIVE v0.9.6  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  max_open={self.max_open}")
         print(f"persona: {persona_label}")
         print("setups : RETEST_OB RETEST_FVG LIQ_SWEEP BOS_CONT  (champion gates apply unless --all)")
         print(f"Magic={MAGIC}")
@@ -812,7 +829,7 @@ class LiveTrader:
 # --------------------------------------------------------------------------- #
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="SlyTrade v0.9.5 SCALPER LIVE trader (OB/FVG retests + liq sweeps + BOS continuation)")
+    ap = argparse.ArgumentParser(description="SlyTrade v0.9.6 SCALPER LIVE trader (OB/FVG retests + liq sweeps + BOS continuation)")
     ap.add_argument("--symbol", default="XAUUSDm")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=18812)
