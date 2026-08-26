@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 # --------------------------------------------------------------------------- #
@@ -263,8 +264,17 @@ class LiveTrader:
         return float(self.account().get("equity", 0.0))
 
     def quote(self) -> tuple[float, float]:
+        """Return (bid, ask). If MT5 returns stale/zero ticks (can happen
+        briefly right after a large historical pull or on session close),
+        return the last good quote so the status line and order sizing
+        don't see 0.0 which wrecks margin/risk math."""
         t = _to_dict(self.mt5.symbol_info_tick(self.symbol))
-        return float(t.get("bid", 0.0)), float(t.get("ask", 0.0))
+        bid = float(t.get("bid", 0.0))
+        ask = float(t.get("ask", 0.0))
+        if bid > 0 and ask > 0 and ask >= bid:
+            self._last_quote = (bid, ask)
+            return bid, ask
+        return getattr(self, "_last_quote", (bid, ask))
 
     # ------------------------------------------------------------------ #
     # Order entry
@@ -525,15 +535,25 @@ class LiveTrader:
         """Print active zones and trigger state for debugging."""
         active_zones: list[str] = []
         trigger_ts: list[str] = []
+        sweep_px_lines: list[str] = []
         now_ts = pd.Timestamp.now(tz=UTC)
         for k, v in self._state.items():
-            if k.startswith("_last_"):
+            if k.startswith("_last_") and k.endswith("_ts"):
+                # timestamp entries (triggers, sweep events)
                 if v is not None:
                     try:
                         age_s = (now_ts - pd.Timestamp(v, tz=UTC)).total_seconds()
-                        trigger_ts.append(f"{k}={pd.Timestamp(v).strftime('%H:%M:%S')} (age={age_s:.0f}s)")
+                        age_min = age_s / 60.0
+                        trigger_ts.append(f"{k}={pd.Timestamp(v).strftime('%H:%M:%S')} (age={age_min:.0f}m)")
                     except Exception:
                         trigger_ts.append(f"{k}={v}")
+                continue
+            if k.startswith("_last_") and k.endswith("_px"):
+                # sweep price levels (floats, not timestamps)
+                try:
+                    sweep_px_lines.append(f"  {k}={float(v):.2f}")
+                except Exception:
+                    sweep_px_lines.append(f"  {k}={v}")
                 continue
             if isinstance(v, dict) and not k.endswith("_entered") and not v.get("mitigated", False):
                 try:
@@ -543,8 +563,12 @@ class LiveTrader:
                     active_zones.append(f"{k} {dict(v)}")
         if trigger_ts:
             print(f"  [{tag}] triggers:")
-            for t in trigger_ts[:10]:
+            for t in trigger_ts[:20]:
                 print(f"    {t}")
+        if sweep_px_lines:
+            print(f"  [{tag}] sweep extremes:")
+            for line in sweep_px_lines:
+                print(line)
         print(f"  [{tag}] active zones ({len(active_zones)}):")
         for z in active_zones[:20]:
             print(f"    {z}")
@@ -553,37 +577,66 @@ class LiveTrader:
 
     def _structure_diagnostics(self, aligned: pd.DataFrame) -> None:
         """Print counts of recent displacements/BOS/CHoCH/liq-sweeps on trigger
-        TFs so we can see whether features are firing during big moves."""
+        TFs so we can see whether features are firing during big moves.
+
+        HTF boolean columns are forward-filled across M1 bars by the causal
+        asof merge (one M5 bar maps to 5 M1 rows, etc.), so a raw ``sum()``
+        overcounts. We count *distinct HTF-bar firings* by masking to rows
+        where the HTF ``{tf}_bar_time`` just changed (the first M1 bar of
+        a new HTF candle) — equivalent to counting HTF events, not M1 echoes.
+        """
+        # Pre-compute first-bar masks for each HTF (True on the first M1 row
+        # of a new HTF candle, where bar_time differs from previous M1 row).
+        first_bar: dict[str, np.ndarray] = {}
+        for tf in ("M5", "M15", "M30", "H1", "H4"):
+            bt_col = f"{tf}_bar_time"
+            if bt_col in aligned.columns:
+                bt = pd.to_datetime(aligned[bt_col], utc=True, errors="coerce")
+                changed = np.concatenate(([True], bt.diff().dt.total_seconds().iloc[1:].fillna(0).abs().to_numpy() > 0))
+                first_bar[tf] = changed
+            else:
+                first_bar[tf] = np.ones(len(aligned), dtype=bool)
+
+        def _events(tail_idx: np.ndarray, tf: str, col: str) -> tuple[int, pd.Timestamp | None]:
+            full_col = col if tf == "M1" else f"{tf}_{col}"
+            if full_col not in aligned.columns:
+                return 0, None
+            vals = aligned[full_col].iloc[tail_idx].fillna(False).astype(bool).to_numpy()
+            if tf == "M1":
+                mask = np.ones(len(vals), dtype=bool)
+            else:
+                mask = first_bar[tf][tail_idx]
+            hits = vals & mask
+            n = int(hits.sum())
+            last_t: pd.Timestamp | None = None
+            if n > 0:
+                # last index where hits is True (walk tail backwards)
+                for k in range(len(hits) - 1, -1, -1):
+                    if hits[k]:
+                        last_t = aligned["time"].iloc[tail_idx[k]]
+                        break
+            return n, last_t
+
         for tf, lookback in [("M1", 30), ("M5", 60), ("M15", 240), ("M30", 480), ("H1", 600)]:
-            tail = aligned.tail(lookback)
+            tail_start = max(0, len(aligned) - lookback)
+            tail_idx = np.arange(tail_start, len(aligned))
             counts: dict[str, int] = {}
+            last_ts: dict[str, pd.Timestamp | None] = {}
             for ev in ("bull_disp", "bear_disp",
                        "minor_bos_up", "minor_bos_dn", "minor_choch_up", "minor_choch_dn",
                        "major_bos_up", "major_bos_dn", "major_choch_up", "major_choch_dn",
                        "bull_liq_sweep", "bear_liq_sweep"):
-                col = f"{tf}_{ev}" if tf != "M1" else ev
-                if col in tail.columns:
-                    n = int(tail[col].fillna(False).sum())
-                    if n > 0:
-                        counts[ev] = n
-            last_bd = last_bu = None
-            last_bullsw = last_bearsw = None
-            for col, attr in [(f"{tf}_bear_disp" if tf != "M1" else "bear_disp", "bd"),
-                              (f"{tf}_bull_disp" if tf != "M1" else "bull_disp", "bu"),
-                              (f"{tf}_bear_liq_sweep" if tf != "M1" else "bear_liq_sweep", "bs"),
-                              (f"{tf}_bull_liq_sweep" if tf != "M1" else "bull_liq_sweep", "bl")]:
-                if col in tail.columns:
-                    hits = tail[tail[col].fillna(False)]["time"]
-                    if len(hits) > 0:
-                        ts = pd.Timestamp(hits.iloc[-1]).strftime("%H:%M")
-                        if attr == "bd": last_bd = ts
-                        elif attr == "bu": last_bu = ts
-                        elif attr == "bs": last_bearsw = ts
-                        elif attr == "bl": last_bullsw = ts
-            if counts or last_bd or last_bu or last_bullsw or last_bearsw:
+                n, t = _events(tail_idx, tf, ev)
+                if n > 0:
+                    counts[ev] = n
+                    last_ts[ev] = t
+            def _fmt(ev: str, _lt: dict = last_ts) -> str:
+                t = _lt.get(ev)
+                return pd.Timestamp(t).strftime("%H:%M") if t is not None else "None"
+            if counts:
                 print(f"  [diag] {tf} last {lookback}M1: {counts} "
-                      f"bull_disp={last_bu} bear_disp={last_bd} "
-                      f"bull_sweep={last_bullsw} bear_sweep={last_bearsw}")
+                      f"bull_disp={_fmt('bull_disp')} bear_disp={_fmt('bear_disp')} "
+                      f"bull_sweep={_fmt('bull_liq_sweep')} bear_sweep={_fmt('bear_liq_sweep')}")
 
     def _cycle_fn(self) -> None:
         self._cycle += 1
