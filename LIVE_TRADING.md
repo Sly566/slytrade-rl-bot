@@ -26,9 +26,11 @@ slytrade live --symbol XAUUSDm --risk-cap 0.01
 
 Flags:
 - `--risk-cap 0.01` = max 1% of equity per trade (safe default for your ZAR 2039 demo)
-- `--max-open 3` = max 3 concurrent positions (default)
+- `--max-open 3` = max 3 concurrent positions (default; auto-bumped to 10 when using `--all`)
 - `--usd-zar 18.5` = USD/ZAR for P&L conversion (default 18.5 — update if rate moves)
-- Default is dry-run; omit `--live` to just print what it WOULD do.
+- `--live` = actually send orders (omit for dry-run)
+- `--verbose` = dump zone/trigger state every 5 cycles and show WHY signals were rejected (dupe / direction blocked / max-open / min-lot / margin)
+- `--all` = **unrestricted / RL-training persona** — disables persona gating so you see EVERY signal: longs AND shorts, grades A+/A/B/C, H1+M15+M5 OBs + FVGs, Asian + off-hours unlocked. Use this to see what the engine sees before Layer 6 RL learns which to take/skip.
 
 You'll see lines like:
 ```
@@ -92,14 +94,40 @@ Then `tail -f live.log` from another terminal.
 - Ctrl+C the live terminal (positions already open stay open on MT5 — bot stops managing but broker-side SL/TP are already set, so they'll close on their own).
 - To flatten everything: close MT5 manually or use the MT5 terminal one-click close.
 
-## 7. Known limitations (before Layer 6 RL)
+## 7. Unrestricted mode (pre-RL diagnostics)
+
+To watch the engine fire ALL signals (long+short, all grades, all sessions, FVGs included) without the champion persona gating — so you can gauge what needs fixing before Layer 6 RL learns:
+
+```bash
+# Dry-run unrestricted with verbose logging first
+slytrade live --symbol XAUUSDm --risk-cap 0.02 --all --verbose
+
+# When ready, go live (still respects --risk-cap and broker SL/TP)
+slytrade live --symbol XAUUSDm --risk-cap 0.02 --all --verbose --live
+```
+
+`--all` switches to `rl_training_persona()`:
+- `accept_longs=True, accept_shorts=True`
+- `accept_grades=("A+","A","B","C")`
+- `accept_ob_tfs=("H1","M15","M5")`
+- `accept_zone_kinds=("OB","FVG")`
+- `min_risk_atr=0.3, max_risk_atr=7.0`
+- Asian + off-hours unlocked
+- `persona_gating=False` (engine emits everything; RL decides later)
+
+`--verbose` adds:
+- `[warmup] processed N bars` + zone/trigger dump after priming
+- `[SIG]` lines for every signal: dupe skips, blocked directions, rejection reasons (max-open / min-lot / margin), and accepted entries with full SL/TP/size
+- Active-zone + trigger-timestamp dump every 5 cycles
+
+## 8. Known limitations (before Layer 6 RL)
 
 - No web dashboard yet (planned); stdout + log file for now
 - No partial/ladder exits — one-shot (tp1=0.85R) per champion (this is what tested best PF 2.00)
 - No BE lock or trailing stop in the live loop (broker-side SL/TP are static; champion PF validated without BE/trail)
 - Single-symbol for now (we only trained on XAUUSDm)
 - Weekend / closed-market: MT5 will return stale quotes; bot prints them and won't open trades if spread is unreasonable
-- Signals use `champion_persona()` — `rl_training_persona()` is exported for Layer 6 training, not live
+- State priming walks 600 M1 bars on first cycle; subsequent cycles only process newly-closed bars (causality-safe — the forming bar is dropped)
 
 ## Files
 - `src/slytrade/live/trader.py` — main loop (LiveTrader class + CLI entry)

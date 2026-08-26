@@ -1,4 +1,4 @@
-"""SlyTrade v0.8.1 CLI — ICT/SMC scalping bot (Layers 0-5)."""
+"""SlyTrade v0.9.0 CLI — ICT/SMC scalping bot (Layers 0-5 + live)."""
 from __future__ import annotations
 
 import importlib.util
@@ -24,7 +24,7 @@ def _hint_bridge():
 @app.command()
 def doctor():
     """Check dependencies and data dirs."""
-    table = Table(title="SlyTrade Doctor v0.8.1"); table.add_column("Check"); table.add_column("Status")
+    table = Table(title="SlyTrade Doctor v0.9.0"); table.add_column("Check"); table.add_column("Status")
     for mod in ["numpy", "pandas", "pyarrow", "pydantic", "typer", "rich"]:
         table.add_row(f"required:{mod}", "OK" if importlib.util.find_spec(mod) else "MISSING")
     for opt in ["mt5linux"]:
@@ -71,7 +71,6 @@ def inspect_cmd(raw_symbol: str = typer.Option("XAUUSDm", "--symbol"),
     from slytrade.config import DataConfig
     from slytrade.data.storage import discover_partitions
     cfg = DataConfig.from_paths(Path(raw_root), Path(processed_root))
-    # Processed bars
     console.print("[bold]Processed bars:[/bold]")
     for tf in ["M1","M5","M15","M30","H1","H4","D1","W1"]:
         base = cfg.processed_bars_path / f"symbol={raw_symbol}" / f"timeframe={tf}"
@@ -84,12 +83,15 @@ def inspect_cmd(raw_symbol: str = typer.Option("XAUUSDm", "--symbol"),
             except Exception: pass
         if files:
             console.print(f"  {tf:4s}: {len(files):3d} partitions, {rows:>10,} rows")
-    # Aligned
     base = cfg.aligned_path / f"symbol={raw_symbol}" / "timeframe=M1"
     afiles = discover_partitions(base, "**/*.parquet")
-    arows = sum((lambda fp: (lambda pf: pf.metadata.num_rows if False else __import__("pyarrow.parquet").ParquetFile(str(fp)).metadata.num_rows)(fp))(fp) for fp in afiles)
+    arows = 0
+    for fp in afiles:
+        try:
+            import pyarrow.parquet as pq
+            arows += pq.ParquetFile(str(fp)).metadata.num_rows
+        except Exception: pass
     console.print(f"[bold]Aligned M1:[/bold] files={len(afiles)} rows≈{arows:,}")
-    # Signals
     sp = cfg.signals_path / f"symbol={raw_symbol}" / "signals.parquet"
     console.print("[bold]Signals:[/bold]")
     if sp.exists():
@@ -102,7 +104,7 @@ def inspect_cmd(raw_symbol: str = typer.Option("XAUUSDm", "--symbol"),
 
 
 # --------------------------------------------------------------------------- #
-# process (per-TF feature engineering — Layer 2)
+# process (Layer 2)
 # --------------------------------------------------------------------------- #
 @app.command("process")
 def process_cmd(raw_symbol: str = typer.Option("XAUUSDm", "--symbol"),
@@ -122,7 +124,7 @@ def process_cmd(raw_symbol: str = typer.Option("XAUUSDm", "--symbol"),
 
 
 # --------------------------------------------------------------------------- #
-# align (MTF causal alignment — Layer 3)
+# align (Layer 3)
 # --------------------------------------------------------------------------- #
 @app.command("align")
 def align_cmd(raw_symbol: str = typer.Option("XAUUSDm", "--symbol"),
@@ -139,7 +141,7 @@ def align_cmd(raw_symbol: str = typer.Option("XAUUSDm", "--symbol"),
 
 
 # --------------------------------------------------------------------------- #
-# scan (signal generation — Layer 4)
+# scan (Layer 4)
 # --------------------------------------------------------------------------- #
 @app.command("scan")
 def scan_cmd(raw_symbol: str = typer.Option("XAUUSDm", "--symbol"),
@@ -211,7 +213,6 @@ def backtest_cmd(raw_symbol: str = typer.Option("XAUUSDm", "--symbol"),
     console.print(f"  Final equity   : {m.get('final_equity', equity):,.2f} {bt_cfg.account_ccy}")
     console.print(f"  Return         : {m.get('return_pct',0):+.2f}%")
     console.print(f"  Max drawdown   : {m.get('max_drawdown_acct',0):,.2f} {bt_cfg.account_ccy} ({m.get('max_drawdown_pct',0):.2f}%)")
-    # Breakdowns
     for section, label in [("by_grade","By grade"),("by_session","By session"),
                            ("by_zone","By zone kind"),("by_direction","By direction"),
                            ("by_killzone","By killzone"),("by_ob_tf","By OB TF"),("by_exit","By exit reason")]:
@@ -222,7 +223,6 @@ def backtest_cmd(raw_symbol: str = typer.Option("XAUUSDm", "--symbol"),
                 pnl = v.get("total_pnl", 0); mr = v.get("mean_R", 0)
                 color = "green" if pf >= 1.5 else ("yellow" if pf >= 1.0 else "red")
                 console.print(f"    {str(k):14s}: n={n:4d}  wr={wr:5.1f}%  meanR={mr:+.3f}  PF=[{color}]{pf:.2f}[/]  P&L={pnl:+,.0f}")
-    # Save outputs
     if output_dir:
         out = Path(output_dir)/f"symbol={raw_symbol}"; out.mkdir(parents=True, exist_ok=True)
         result.trades.to_parquet(out/"trades.parquet", index=False)
@@ -230,10 +230,6 @@ def backtest_cmd(raw_symbol: str = typer.Option("XAUUSDm", "--symbol"),
         result.equity_curve.to_parquet(out/"equity.parquet", index=False)
         (out/"metrics.json").write_text(json.dumps(m, indent=2, default=str))
         console.print(f"\nSaved trades/tranches/equity/metrics to {out}")
-
-
-if __name__ == "__main__":
-    app()
 
 
 # --------------------------------------------------------------------------- #
@@ -249,16 +245,29 @@ def live_cmd(
     max_open: int = typer.Option(3, "--max-open"),
     usd_zar: float = typer.Option(18.5, "--usd-zar"),
     leverage: int = typer.Option(2000, "--leverage"),
+    verbose: bool = typer.Option(False, "--verbose",
+                                 help="Dump zone/trigger state every 5 cycles and show signal rejections."),
+    unrestricted: bool = typer.Option(False, "--all",
+                                      help="Disable persona gating: emit ALL signals (long+short, all grades, "
+                                           "H1+M15+M5 OBs+FVGs, C-grades, Asian+off-hours) for pre-RL diagnostics."),
 ):
-    """Run the live trading loop (Layer 5 champion persona)."""
+    """Run the live trading loop. Default: v0.9.0 champion persona (long-only A+/A/B).
+
+    Use --all to see every signal the engine generates (both sides, all grades,
+    all sessions) — what we run before Layer 6 RL starts learning which of those
+    to trade vs skip.
+    """
     from slytrade.live.trader import (
         AccountSpec,
         LiveTrader,
         champion_persona,
         connect_mt5,
         resolve_symbol_spec,
+        rl_training_persona,
     )
-    console.print(f"[bold]SlyTrade LIVE v0.9.0[/bold] symbol={raw_symbol} live={live} risk_cap={risk_cap*100:.1f}%")
+    persona_label = "RL-UNRESTRICTED (all signals)" if unrestricted else "v0.9.0 champion (long-only A+/A/B)"
+    console.print(f"[bold]SlyTrade LIVE v0.9.0[/bold] symbol={raw_symbol} live={live} "
+                  f"risk_cap={risk_cap*100:.1f}% persona={persona_label} verbose={verbose}")
     mt5 = connect_mt5(host, port)
 
     def _to_dict(o):
@@ -283,12 +292,17 @@ def live_cmd(
         leverage=int(acc.get("leverage", leverage)),
         fx_to_account={"USD": usd_zar} if str(acc.get("currency","ZAR")) != "USD" else {"USD": 1.0},
     )
-    cfg = champion_persona()
+    cfg = rl_training_persona() if unrestricted else champion_persona()
+    max_open_eff = max_open if not unrestricted else max(max_open, 10)
     trader = LiveTrader(
         mt5=mt5, symbol=resolved, spec=spec, cfg=cfg, acct=acct_spec,
-        live=live, risk_cap=risk_cap, max_open=max_open,
+        live=live, risk_cap=risk_cap, max_open=max_open_eff, verbose=verbose,
     )
     try:
         trader.run()
     finally:
         mt5.shutdown()
+
+
+if __name__ == "__main__":
+    app()

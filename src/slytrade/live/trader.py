@@ -10,16 +10,18 @@ Open positions are monitored every 5 seconds for:
   - SL hit (broker-side, redundant check via equity diff)
   - TP hit (broker-side)
   - M15 CHoCH emergency exit (closes at market if detected)
-  - Time-stop (4 hours / 240 M1 bars flat if <0R)
+  - Time-stop (4 hours / 240 M1 bars flat regardless of P&L)
 
 Run:
     bash start_mt5_bridge.sh        # in another terminal
-    python -m slytrade.live.trader --symbol XAUUSDm --dry-run   # first, test
-    python -m slytrade.live.trader --symbol XAUUSDm --live      # real trading
+    python -m slytrade.live.trader --symbol XAUUSDm            # dry-run champion
+    python -m slytrade.live.trader --symbol XAUUSDm --all --verbose  # see ALL signals
+    python -m slytrade.live.trader --symbol XAUUSDm --live     # real trading (champion)
 
-Use --dry-run to print orders without sending. Default risk: champion
-persona tiered sizing (A+=1%, A=0.75%, B=0.5%). Override with --risk-cap 0.01
-for 1% max risk on the demo.
+Default persona: v0.9.0 champion (longs-only, 0.85R one-shot, >=2 ATR stops,
+grades A+/A/B, M5+M15 OBs, London/NY). Use --all to switch to the unrestricted
+RL-training persona (long+short, all grades, H1+M15+M5 OBs+FVGs, Asian+off-hours
+unlocked, persona_gating=False) so you see everything the engine sees.
 """
 from __future__ import annotations
 
@@ -41,7 +43,7 @@ from ..data.features import DEFAULT_CONFIG, process_bars
 from ..data.mtf_align import _asof_merge, _prep_htf_frame
 from ..data.schemas import normalize_bar_frame
 from ..data.time import timeframe_timedelta
-from ..strategy.config import StrategyConfig, champion_persona
+from ..strategy.config import StrategyConfig, champion_persona, rl_training_persona
 from ..strategy.signals import _evaluate_row
 
 # --------------------------------------------------------------------------- #
@@ -121,12 +123,30 @@ def resolve_symbol_spec(mt5: Any, symbol: str, account_ccy: str, usd_zar: float)
 
 
 def fetch_bars(mt5: Any, symbol: str, timeframe: str, count: int) -> pd.DataFrame:
-    """Fetch `count` bars ending 'now' from MT5, normalized to our schema."""
+    """Fetch `count` COMPLETED bars ending 'now' from MT5, normalized.
+
+    MT5 copy_rates_from_pos(symbol, tf, 0, N) returns N bars where the most
+    recent (last after time-sort) is the CURRENTLY-FORMING bar — its OHLC is
+    still mutating. We over-fetch and drop that in-progress bar so our feature
+    pipeline only sees closed bars (causality-safe).
+    """
     tf_const = getattr(mt5, TIMEFRAME_ATTRS[timeframe])
-    raw = mt5.copy_rates_from_pos(symbol, tf_const, 0, int(count))
+    want = int(count) + 2  # +1 for in-progress bar, +1 safety margin
+    raw = mt5.copy_rates_from_pos(symbol, tf_const, 0, want)
     if raw is None or len(raw) == 0:
         return pd.DataFrame()
-    return normalize_bar_frame(raw, symbol, timeframe)
+    df = normalize_bar_frame(raw, symbol, timeframe)
+    if df.empty:
+        return df
+    # Drop the in-progress bar: any bar whose close time (time + tf_duration)
+    # hasn't passed yet is incomplete.
+    dur = timeframe_timedelta(timeframe)
+    now = datetime.now(UTC)
+    df = df[df["time"] + dur <= now].copy()
+    # Keep only the last `count` completed bars
+    if len(df) > count:
+        df = df.iloc[-count:].copy()
+    return df.reset_index(drop=True)
 
 
 def fetch_and_process_tf(mt5: Any, symbol: str, tf: str, count: int) -> pd.DataFrame:
@@ -190,6 +210,7 @@ class LiveTrader:
         risk_cap: float = 0.02,
         max_open: int = 3,
         poll_interval: float = 5.0,
+        verbose: bool = False,
     ):
         self.mt5 = mt5
         self.symbol = symbol
@@ -200,12 +221,14 @@ class LiveTrader:
         self.risk_cap = risk_cap
         self.max_open = max_open
         self.poll_interval = poll_interval
+        self.verbose = verbose
 
         self._state: dict = {}
         self._trades: dict[int, LiveTrade] = {}
         self._last_processed_m1_time: datetime | None = None
         self._signals_fired: set[str] = set()   # dedupe keys
         self._cycle = 0
+        self._warmed_up = False
 
     # ------------------------------------------------------------------ #
     # Account info
@@ -311,17 +334,24 @@ class LiveTrader:
     # ------------------------------------------------------------------ #
     # Core signal handling
     # ------------------------------------------------------------------ #
+    def _vlog(self, msg: str) -> None:
+        if self.verbose:
+            print(f"    [SIG] {msg}")
+
     def _handle_signal(self, sig) -> None:
         key = f"{sig.time.isoformat()}|{sig.direction}|{sig.grade}|{sig.ob_tf or ''}"
+        side = "LONG" if sig.direction == 1 else "SHORT"
         if key in self._signals_fired:
+            self._vlog(f"dupe {side} {sig.grade} {sig.ob_tf} @ {sig.time} — skip")
             return
-        # Skip shorts in champion persona
+        # Directional safety net (engine already filters when persona_gating=True)
         if sig.direction == -1 and not self.cfg.confluence.accept_shorts:
-            self._signals_fired.add(key); return
+            self._vlog(f"{side} blocked by accept_shorts=False"); self._signals_fired.add(key); return
         if sig.direction == 1 and not self.cfg.confluence.accept_longs:
-            self._signals_fired.add(key); return
+            self._vlog(f"{side} blocked by accept_longs=False"); self._signals_fired.add(key); return
         open_n = len(self._our_open_positions()) + sum(1 for t in self._trades.values() if not t.closed)
         if open_n >= self.max_open:
+            self._vlog(f"{side} {sig.grade} rejected: max_open={self.max_open} reached (open={open_n})")
             return
         equity = self.equity()
         bid, ask = self.quote()
@@ -331,87 +361,170 @@ class LiveTrader:
         fill = entry_approx + (half_spread + slip_pts) if sig.direction == 1 else entry_approx - (half_spread + slip_pts)
         risk_per_unit = abs(fill - float(sig.stop))
         if risk_per_unit <= 0:
+            self._vlog(f"{side} {sig.grade} rejected: invalid risk_per_unit={risk_per_unit}")
             return
         risk_pct = min(float(sig.risk_pct), self.risk_cap)
         risk_acct = risk_pct * equity
         risk_quote = risk_acct / self.acct.fx_to_account.get(self.spec.currency_profit, 1.0)
         lots = self.spec.lots_for_risk(risk_per_unit, risk_quote)
         if lots < self.spec.volume_min - 1e-9:
+            self._vlog(f"{side} {sig.grade} rejected: lots={lots:.4f} < vol_min={self.spec.volume_min} (eq={equity:.0f} risk_pct={risk_pct:.4f})")
             return
         tp = fill + sig.direction * self.cfg.exits.tp1_r * risk_per_unit
         sl = float(sig.stop)
         margin_quote = (lots * self.spec.contract_size * fill) / max(self.acct.leverage, 1)
         margin_acct = self.acct.to_account_ccy(margin_quote, self.spec.currency_profit)
         if margin_acct > equity * 0.95:
+            self._vlog(f"{side} {sig.grade} rejected: margin {margin_acct:.0f} > 95% equity {equity:.0f}")
             return
+        self._vlog(f"{side} {sig.grade} ob={sig.ob_tf} kz={sig.killzone} fill={fill:.{self.spec.digits}f} "
+                   f"sl={sl:.{self.spec.digits}f} tp={tp:.{self.spec.digits}f} lots={lots:.2f} risk={risk_pct*100:.2f}%")
         comment = f"L5 {sig.grade} {sig.ob_tf or ''} {sig.killzone}"
         ticket = self._place_market(sig.direction, lots, sl, tp, comment)
         if ticket is None:
+            self._vlog(f"{side} {sig.grade} ORDER REJECTED by broker")
             return
         self._signals_fired.add(key)
         self._trades[ticket] = LiveTrade(
             ticket=ticket, direction=sig.direction, entry=fill, sl=sl, tp=tp,
             lots=lots, open_time=datetime.now(UTC), grade=sig.grade, risk_pct=risk_pct,
         )
-        print(f"    [ENTRY] ticket={ticket} {'LONG' if sig.direction==1 else 'SHORT'} {lots} lots @ {fill:.{self.spec.digits}f} "
+        print(f"    [ENTRY] ticket={ticket} {side} {lots} lots @ {fill:.{self.spec.digits}f} "
               f"grade={sig.grade} ob={sig.ob_tf} kz={sig.killzone} SL={sl:.{self.spec.digits}f} TP={tp:.{self.spec.digits}f}")
 
     # ------------------------------------------------------------------ #
     # Position monitoring
     # ------------------------------------------------------------------ #
-    def _monitor_positions(self, latest_m1_row: pd.Series | None) -> None:
-        if self.live:
-            broker_pos = self._our_open_positions()
-        else:
-            broker_pos = {}
+    def _monitor_positions(self, latest_m1_row: pd.Series | None, *, new_bar: bool = False) -> None:
+        """Check SL/TP/emergency/time-stop for open positions.
+
+        new_bar=True means this call corresponds to a fresh closed M1 bar —
+        that's where bars_held increments and CHoCH/time-stop checks run.
+        Intra-bar poll calls (new_bar=False) only check broker-side SL/TP.
+        """
+        bid, ask = self.quote()
+
+        # ---------- SL / TP ---------- #
         if not self.live:
-            bid, ask = self.quote()
             to_close: list[tuple[int, str]] = []
             for ticket, lt in list(self._trades.items()):
                 if lt.closed:
                     continue
                 price = bid if lt.direction == 1 else ask
-                if lt.direction == 1:
-                    if price <= lt.sl: to_close.append((ticket, "SL"))
-                    elif price >= lt.tp: to_close.append((ticket, "TP1"))
-                else:
-                    if price >= lt.sl: to_close.append((ticket, "SL"))
-                    elif price <= lt.tp: to_close.append((ticket, "TP1"))
-                lt.bars_held += 1
+                hit_sl = (lt.direction == 1 and price <= lt.sl) or (lt.direction == -1 and price >= lt.sl)
+                hit_tp = (lt.direction == 1 and price >= lt.tp) or (lt.direction == -1 and price <= lt.tp)
+                if hit_sl:   to_close.append((ticket, "SL"))
+                elif hit_tp: to_close.append((ticket, "TP1"))
+                # rough running P&L for status line
+                r_mult = (price - lt.entry) / max(abs(lt.tp - lt.entry), 1e-9)
+                if lt.direction == -1:
+                    r_mult = -r_mult
+                lt.pnl = r_mult * lt.risk_pct * self.equity()
             for ticket, reason in to_close:
+                lt = self._trades[ticket]
+                price = bid if lt.direction == 1 else ask
+                lt.close_price = price; lt.closed = True; lt.close_reason = reason
                 if self._close_position(ticket, reason):
                     print(f"    [EXIT] ticket={ticket} reason={reason}")
+            broker_pos: dict[int, dict] = {}
+        else:
+            broker_pos = self._our_open_positions()
+            broker_tickets = set(broker_pos.keys())
+            for ticket, lt in list(self._trades.items()):
+                if ticket not in broker_tickets and not lt.closed:
+                    lt.closed = True
+                    lt.close_reason = "BROKER"
+                    print(f"    [EXIT] ticket={ticket} reason=BROKER (SL/TP hit)")
+
+        # ---------- Per-bar checks (CHoCH emergency + time stop) ---------- #
+        if not new_bar:
             return
-        # Live mode: reconcile broker positions
-        broker_tickets = set(broker_pos.keys())
         for ticket, lt in list(self._trades.items()):
-            if ticket not in broker_tickets and not lt.closed:
-                lt.closed = True
-                lt.close_reason = "BROKER"
-                print(f"    [EXIT] ticket={ticket} reason=BROKER (SL/TP hit)")
-        for ticket in broker_tickets:
-            if ticket not in self._trades:
+            if lt.closed:
                 continue
-            lt = self._trades[ticket]
+            if self.live and ticket not in broker_pos:
+                continue
             lt.bars_held += 1
-            # M15 CHoCH emergency
+
+            # M15 CHoCH emergency exit
             if latest_m1_row is not None:
                 if lt.direction == 1 and bool(latest_m1_row.get(f"{CHOPCH_EMERGENCY_TF}_major_choch_dn", False)):
-                    print(f"    [EMERGENCY M15 CHoCH DOWN against LONG ticket={ticket} — closing")
-                    self._close_position(ticket, "M15_CHOCH")
-                elif lt.direction == -1 and bool(latest_m1_row.get(f"{CHOPCH_EMERGENCY_TF}_major_choch_up", False)):
-                    print(f"    [EMERGENCY M15 CHoCH UP against SHORT ticket={ticket} — closing")
-                    self._close_position(ticket, "M15_CHOCH")
-            if lt.bars_held >= TIME_STOP_BARS and not lt.closed:
-                pos = broker_pos[ticket]
-                cur_profit = float(pos.get("profit", 0.0))
-                if cur_profit < 0:
-                    print(f"    [TIME-STOP] ticket={ticket} profit={cur_profit:.2f} — closing")
-                    self._close_position(ticket, "TIME_STOP")
+                    print(f"    [EMERGENCY M15 CHoCH DOWN against LONG ticket={ticket}] — closing")
+                    self._close_position(ticket, "M15_CHOCH"); continue
+                if lt.direction == -1 and bool(latest_m1_row.get(f"{CHOPCH_EMERGENCY_TF}_major_choch_up", False)):
+                    print(f"    [EMERGENCY M15 CHoCH UP against SHORT ticket={ticket}] — closing")
+                    self._close_position(ticket, "M15_CHOCH"); continue
+
+            # Time-stop: backtest uses time_stop_min_r=0.0 => FLAT after
+            # TIME_STOP_BARS regardless of P&L (parity with backtest engine).
+            if lt.bars_held >= TIME_STOP_BARS:
+                if self.live:
+                    pos = broker_pos.get(ticket, {})
+                    cur_profit = float(pos.get("profit", 0.0))
+                    price = bid if lt.direction == 1 else ask
+                    r_dist = (price - lt.entry) if lt.direction == 1 else (lt.entry - price)
+                    r_mult = r_dist / max(abs(lt.tp - lt.entry), 1e-9)
+                    print(f"    [TIME-STOP] ticket={ticket} bars={lt.bars_held} profit={cur_profit:.2f} r={r_mult:+.2f} — closing")
+                else:
+                    print(f"    [TIME-STOP] ticket={ticket} bars={lt.bars_held} — closing (dry-run)")
+                self._close_position(ticket, "TIME_STOP")
 
     # ------------------------------------------------------------------ #
     # One M1 cycle
     # ------------------------------------------------------------------ #
+    def _prime_state(self, aligned: pd.DataFrame) -> None:
+        """Walk ALL completed historical bars to build zone/trigger state.
+
+        After this call the state machine contains the correct set of active
+        OBs/FVGs, swing pivots, CHoCH/BOS markers, trigger timestamps as of the
+        most recent completed bar. No trades are opened during warmup.
+        """
+        self._state.clear()
+        n = len(aligned)
+        n_err = 0
+        for i in range(n):
+            row = aligned.iloc[i]
+            try:
+                _evaluate_row(int(i), row, self.cfg, self._state)
+            except Exception:
+                n_err += 1
+        if n > 0:
+            self._last_processed_m1_time = aligned.iloc[-1]["time"]
+        self._warmed_up = True
+        if self.verbose:
+            print(f"  [warmup] processed {n} bars ({n_err} suppressed errors)")
+            self._dump_state("post-warmup")
+
+    def _dump_state(self, tag: str) -> None:
+        """Print active zones and trigger state for debugging."""
+        active_zones: list[str] = []
+        trigger_ts: list[str] = []
+        now_ts = pd.Timestamp.now(tz=UTC)
+        for k, v in self._state.items():
+            if k.startswith("_last_"):
+                if v is not None:
+                    try:
+                        age_s = (now_ts - pd.Timestamp(v, tz=UTC)).total_seconds()
+                        trigger_ts.append(f"{k}={pd.Timestamp(v).strftime('%H:%M:%S')} (age={age_s:.0f}s)")
+                    except Exception:
+                        trigger_ts.append(f"{k}={v}")
+                continue
+            if isinstance(v, dict) and not k.endswith("_entered") and not v.get("mitigated", False):
+                try:
+                    top = v.get("top", float("nan")); bot = v.get("bot", float("nan"))
+                    active_zones.append(f"{k} top={top:.1f} bot={bot:.1f}")
+                except Exception:
+                    active_zones.append(f"{k} {dict(v)}")
+        if trigger_ts:
+            print(f"  [{tag}] triggers:")
+            for t in trigger_ts[:10]:
+                print(f"    {t}")
+        print(f"  [{tag}] active zones ({len(active_zones)}):")
+        for z in active_zones[:20]:
+            print(f"    {z}")
+        if len(active_zones) > 20:
+            print(f"    ... and {len(active_zones)-20} more")
+
     def _cycle_fn(self) -> None:
         self._cycle += 1
         m1_raw = fetch_bars(self.mt5, self.symbol, "M1", WARMUP_BARS["M1"])
@@ -426,23 +539,41 @@ class LiveTrader:
         if aligned.empty:
             return
         n = len(aligned)
+
+        # First cycle: walk ALL history to prime state so OBs that formed
+        # before we started are tracked correctly. Without this, zones appear
+        # "out of thin air" and never trigger entries (the bug that caused
+        # zero signals during the sell-off).
+        if not self._warmed_up:
+            self._prime_state(aligned)
+            print(f"  Warmed up on {n} M1 bars — state primed, watching for new signals ...")
+
+        # Only process bars newer than the last one we already evaluated.
         new_mask = pd.Series(True, index=aligned.index)
         if self._last_processed_m1_time is not None:
             new_mask = aligned["time"] > self._last_processed_m1_time
         new_rows = aligned.index[new_mask].tolist()
-        feed_start = max(0, min(new_rows[0] if new_rows else n, n - 200) - 50)
-        for i in range(feed_start, n):
+
+        n_sigs_this_cycle = 0
+        for i in new_rows:
             row = aligned.iloc[i]
             try:
                 sig = _evaluate_row(int(i), row, self.cfg, self._state)
             except Exception:
                 sig = None
-            if sig is not None and i >= (new_rows[0] if new_rows else n):
+            if sig is not None:
                 self._handle_signal(sig)
+                n_sigs_this_cycle += 1
+
         if new_rows:
             self._last_processed_m1_time = aligned.iloc[new_rows[-1]]["time"]
+
+        if self.verbose and (n_sigs_this_cycle > 0 or self._cycle % 5 == 0):
+            bid, ask = self.quote()
+            self._dump_state(f"cycle {self._cycle} bid={bid:.1f} new_bars={len(new_rows)} sigs={n_sigs_this_cycle}")
+
         latest = aligned.iloc[-1]
-        self._monitor_positions(latest)
+        self._monitor_positions(latest, new_bar=True)
         self._print_status(latest)
 
     def _print_status(self, latest: pd.Series) -> None:
@@ -519,6 +650,12 @@ def main() -> None:
     ap.add_argument("--max-open", type=int, default=3)
     ap.add_argument("--usd-zar", type=float, default=18.5)
     ap.add_argument("--leverage", type=int, default=2000)
+    ap.add_argument("--verbose", action="store_true",
+                    help="Dump zone/trigger state every 5 cycles and on every signal.")
+    ap.add_argument("--all", dest="unrestricted", action="store_true",
+                    help="Disable persona gating: emit ALL signals (long+short, all grades, "
+                         "H1+M15+M5 OBs+FVGs, C-grades, Asian+off-hours) for RL-data collection "
+                         "and pre-RL diagnostics. Default: champion persona (long-only, A+/A/B).")
     args = ap.parse_args()
 
     print("Connecting to MT5 bridge ...")
@@ -537,10 +674,15 @@ def main() -> None:
         leverage=int(acc.get("leverage", args.leverage)),
         fx_to_account={"USD": args.usd_zar} if str(acc.get("currency","ZAR")) != "USD" else {"USD": 1.0},
     )
-    cfg = champion_persona()
+    cfg = rl_training_persona() if args.unrestricted else champion_persona()
+    persona_label = "RL-UNRESTRICTED (all signals)" if args.unrestricted else "v0.9.0 champion (long-only A+/A/B)"
+    max_open_eff = args.max_open if not args.unrestricted else max(args.max_open, 10)
+    print(f"  persona       : {persona_label}")
+    print(f"  verbose       : {args.verbose}")
     trader = LiveTrader(
         mt5=mt5, symbol=resolved, spec=spec, cfg=cfg, acct=acct_spec,
-        live=args.live, risk_cap=args.risk_cap, max_open=args.max_open,
+        live=args.live, risk_cap=args.risk_cap, max_open=max_open_eff,
+        verbose=args.verbose,
     )
     try:
         trader.run()
