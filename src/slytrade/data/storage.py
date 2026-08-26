@@ -125,3 +125,45 @@ class MarketDataStorage:
 
     def write_bars(self, symbol: str, timeframe: str, start: datetime, df: pd.DataFrame) -> WriteResult:
         return self.write_frame(df, self.bar_path(symbol, timeframe, start))
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers used by Layer 3/4 pipeline (process/align/scan)
+# ---------------------------------------------------------------------------
+def discover_partitions(root: Path, pattern: str = "**/*.parquet") -> list[Path]:
+    """Return sorted list of parquet files under `root` matching `pattern`."""
+    root = Path(root)
+    if not root.exists():
+        return []
+    return sorted(root.glob(pattern))
+
+
+def _normalize_for_parquet(df: pd.DataFrame, time_col: str = "time") -> pd.DataFrame:
+    """Normalise a DataFrame for parquet writing (ensure UTC datetime, reset index)."""
+    df = df.copy()
+    if time_col in df.columns:
+        df[time_col] = pd.to_datetime(df[time_col], utc=True, errors="coerce")
+    df = df.reset_index(drop=True)
+    return df
+
+
+def _atomic_write_parquet(df: pd.DataFrame, path: Path) -> None:
+    """Atomically write a DataFrame as parquet to `path` (write to tmp, rename)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    df.to_parquet(tmp, index=False)
+    import os
+    os.replace(tmp, path)
+
+
+def ensure_dir(path: Path) -> Path:
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def bar_partition(root: Path, kind: str, symbol: str, timeframe: str, year: int, month: int) -> Path:
+    """Return partitioned directory for bar data."""
+    root = Path(root)
+    return root / f"symbol={symbol}" / f"timeframe={timeframe}" / f"year={year}" / f"month={month:02d}"

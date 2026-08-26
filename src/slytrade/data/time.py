@@ -66,6 +66,88 @@ def date_range_from_lookback(lookback: str, *, end: datetime | None = None) -> t
     return start_dt, end_dt
 
 
+# --------------------------------------------------------------------------- #
+# Timeframe helpers (used by mtf_align.py, per_tf.py)
+# --------------------------------------------------------------------------- #
+
+_TIMEFRAME_DELTAS: dict[str, timedelta] = {
+    "M1":  timedelta(minutes=1),
+    "M2":  timedelta(minutes=2),
+    "M3":  timedelta(minutes=3),
+    "M4":  timedelta(minutes=4),
+    "M5":  timedelta(minutes=5),
+    "M6":  timedelta(minutes=6),
+    "M10": timedelta(minutes=10),
+    "M12": timedelta(minutes=12),
+    "M15": timedelta(minutes=15),
+    "M20": timedelta(minutes=20),
+    "M30": timedelta(minutes=30),
+    "H1":  timedelta(hours=1),
+    "H2":  timedelta(hours=2),
+    "H3":  timedelta(hours=3),
+    "H4":  timedelta(hours=4),
+    "H6":  timedelta(hours=6),
+    "H8":  timedelta(hours=8),
+    "H12": timedelta(hours=12),
+    "D1":  timedelta(days=1),
+    "W1":  timedelta(days=7),
+    "MN1": timedelta(days=30),
+}
+
+
+def timeframe_timedelta(timeframe: str) -> timedelta:
+    """Return the timedelta duration for an MT5-style timeframe string."""
+    tf = timeframe.upper().strip()
+    try:
+        return _TIMEFRAME_DELTAS[tf]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported timeframe: {timeframe!r}") from exc
+
+
+def timeframe_minutes(timeframe: str) -> int:
+    return int(timeframe_timedelta(timeframe).total_seconds() // 60)
+
+
+def iter_months(start: datetime, end: datetime):
+    """Yield (year, month) tuples covering [start, end)."""
+    start = ensure_utc(start); end = ensure_utc(end)
+    y, m = start.year, start.month
+    while True:
+        yield (y, m)
+        if m == 12:
+            y += 1; m = 1
+        else:
+            m += 1
+        if (y, m) > (end.year, end.month):
+            break
+
+
+def _common_dt_unit(*series):
+    """Cast datetime64 Series to a common finest unit (pandas-3 merge_asof safe)."""
+    import pandas as pd
+    unit_order = {"ns": 0, "us": 1, "ms": 2, "s": 3}
+    finest = None
+    casted = []
+    for s in series:
+        s2 = pd.to_datetime(s, utc=True, errors="coerce")
+        try:
+            u = s2.dt.unit
+        except AttributeError:
+            u = "ns"
+        if finest is None or unit_order.get(u, 99) < unit_order.get(finest, 99):
+            finest = u
+        casted.append(s2)
+    if finest is None:
+        finest = "ns"
+    out = []
+    for s in casted:
+        try:
+            out.append(pd.Series(s.array.as_unit(finest), index=s.index, name=s.name))
+        except AttributeError:
+            out.append(s)
+    return tuple(out)
+
+
 def iter_time_chunks(start: datetime, end: datetime, chunk_size: ChunkSize) -> list[tuple[datetime, datetime]]:
     """Split a date range into deterministic UTC chunks."""
     start = ensure_utc(start)

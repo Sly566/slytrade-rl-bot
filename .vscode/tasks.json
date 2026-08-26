@@ -1,0 +1,33 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "setup",
+      "type": "shell",
+      "command": "bash scripts/setup.sh",
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "test",
+      "type": "shell",
+      "command": "source .venv/bin/activate && pytest -v",
+      "group": "test",
+      "problemMatcher": []
+    },
+    {
+      "label": "doctor",
+      "type": "shell",
+      "command": "source .venv/bin/activate && slytrade doctor",
+      "group": "test",
+      "problemMatcher": []
+    },
+    {
+      "label": "backtest",
+      "type": "shell",
+      "command": "source .venv/bin/activate && slytrade backtest --equity 20000",
+      "group": "test",
+      "problemMatcher": []
+    }
+  ]
+}
