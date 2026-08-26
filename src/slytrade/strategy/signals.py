@@ -252,7 +252,7 @@ def _runner_target(direction: int, row, cfg: ConfluenceConfig,
     runner_min_r = 2.0
     runner_max_r = 8.0
     candidates = []
-    for tf in ('M15', 'H1', 'H4', 'D1'):
+    for tf in ('M30', 'M15', 'H1', 'H4', 'D1'):
         b = row.get(f'{tf}_major_bias', 0)
         if pd.isna(b) or int(b) != direction:
             continue
@@ -387,53 +387,62 @@ def _evaluate_row(i: int,
 
     # ================================================================== #
     # SETUP A: LIQUIDITY SWEEP SCALP (stop-run reversal)
-    # Wick takes out a recent minor swing, closes back, then a
-    # displacement candle fires in the reversal direction. Enter the
-    # close of that displacement, SL just beyond the sweep wick extreme,
-    # quick 0.85R TP.
+    # Wick takes out a recent minor swing (sellside/buyside liquidity),
+    # closes back inside, then displacement fires in the reversal
+    # direction within `sweep_window` M1 bars. Enter at displacement
+    # close, SL just beyond the sweep wick extreme, quick 0.85R TP.
     # ================================================================== #
+    sweep_window = 15 if cfg.confluence.persona_gating else 30  # 15-30 min scalp window
+    # Track per-side sweep timestamps + sweep extreme from new sweeps
+    for direction in (1, -1):
+        side = 'bull' if direction == 1 else 'bear'
+        m1_sweep_now = bool(row.get('bull_liq_sweep' if direction==1 else 'bear_liq_sweep', False))
+        tf_sweep_now = bool(row.get(f'{trigger_tf}_{"bull" if direction==1 else "bear"}_liq_sweep', False))
+        if m1_sweep_now or tf_sweep_now:
+            sweep_px = np.nan
+            if m1_sweep_now:
+                sweep_px = row.get('bull_sweep_px' if direction==1 else 'bear_sweep_px', np.nan)
+            if pd.isna(sweep_px) and tf_sweep_now:
+                sweep_px = row.get(f'{trigger_tf}_{"bull" if direction==1 else "bear"}_sweep_px', np.nan)
+            if pd.notna(sweep_px):
+                state[f'_last_{side}_sweep_ts'] = t_now
+                state[f'_last_{side}_sweep_px'] = float(sweep_px)
+
     for direction in (1, -1):
         if direction not in candidates:
             continue
         side = 'bull' if direction == 1 else 'bear'
-        # Need a fresh sweep on trigger_tf OR on M1 directly
-        sweep_flag = f'{trigger_tf}_{side}_liq_sweep' if direction == 1 else f'{trigger_tf}_bear_liq_sweep'
-        if direction == -1:
-            sweep_flag = f'{trigger_tf}_bear_liq_sweep'
-        # Also check M1 directly for sweeps (faster signal)
-        m1_sweep = bool(row.get('bull_liq_sweep' if direction == 1 else 'bear_liq_sweep', False))
-        tf_sweep = bool(row.get(sweep_flag, False))
-        if not (m1_sweep or tf_sweep):
-            # Also allow: displacement fires within 3 bars AFTER a sweep
-            # was registered (sweep_px active + fresh displacement now)
-            disp_now = bool(row.get(f'{trigger_tf}_{side}_disp', False) if direction==1
-                            else row.get(f'{trigger_tf}_bear_disp', False))
-            m1_disp_now = bool(row.get('bull_disp' if direction == 1 else 'bear_disp', False))
-            sweep_active = pd.notna(row.get('bull_sweep_px' if direction==1 else 'bear_sweep_px', np.nan))
-            if not ((disp_now or m1_disp_now) and sweep_active):
-                continue
-        # Get the sweep extreme for SL
-        sweep_col = 'bull_sweep_px' if direction == 1 else 'bear_sweep_px'
-        tf_sweep_col = f'{trigger_tf}_{sweep_col}'
-        sweep_extreme = row.get(tf_sweep_col, np.nan)
-        if pd.isna(sweep_extreme):
-            sweep_extreme = row.get(sweep_col, np.nan)
-        if pd.isna(sweep_extreme):
+        last_sweep_ts = state.get(f'_last_{side}_sweep_ts')
+        if last_sweep_ts is None:
             continue
-        # Require displacement in reversal direction NOW (same bar or next)
+        age_min = (t_now - last_sweep_ts).total_seconds() / 60.0
+        if age_min > sweep_window:
+            continue
+        sweep_extreme = state.get(f'_last_{side}_sweep_px')
+        if sweep_extreme is None:
+            continue
+        # Invalidate if price has already pushed back through the sweep
+        # extreme (sweep failed -> continuation, not reversal)
+        if direction == 1 and c < float(sweep_extreme):
+            continue
+        if direction == -1 and c > float(sweep_extreme):
+            continue
+        # Require displacement/BOS in reversal direction (M1 or trigger_tf)
         m1_disp = bool(row.get('bull_disp' if direction==1 else 'bear_disp', False))
-        tf_disp = bool(row.get(f'{trigger_tf}_bull_disp' if direction==1 else f'{trigger_tf}_bear_disp', False))
+        tf_disp = bool(row.get(f'{trigger_tf}_{"bull" if direction==1 else "bear"}_disp', False))
+        m1_bos = bool(row.get('minor_bos_up' if direction==1 else 'minor_bos_dn', False)) or \
+                 bool(row.get('major_bos_up' if direction==1 else 'major_bos_dn', False))
         vol_surge = bool(row.get('vol_spike', False)) or bool(row.get(f'{trigger_tf}_vol_spike', False))
-        if not (m1_disp or tf_disp or vol_surge):
+        if not (m1_disp or tf_disp or (m1_bos and vol_surge)):
             continue
-        # Dedupe: don't re-fire on the same sweep level
-        sweep_key = f"_swept_{direction}_{float(sweep_extreme):.2f}"
+        # One entry per sweep event (dedupe by timestamp)
+        sweep_key = f"_swept_{direction}_{last_sweep_ts.isoformat()}"
         if state.get(sweep_key):
             continue
         state[sweep_key] = True
 
         entry = c
-        buffer_amt = cfg.exits.ob_invalidation_buffer * atr * 1.5  # slightly wider for sweep wicks
+        buffer_amt = cfg.exits.ob_invalidation_buffer * atr * 1.5
         if direction == 1:
             stop = float(sweep_extreme) - buffer_amt
         else:
@@ -445,13 +454,9 @@ def _evaluate_row(i: int,
         if cfg.confluence.persona_gating and risk_atr < cfg.confluence.min_risk_atr:
             continue
 
-        # Grade sweeps as B/C: sweep scalps are quick, smaller conviction
-        # unless we have HTF bias alignment + killzone
         grade, conf_tags = _grade(direction, row, cfg.confluence,
                                   bonus_killzone=('+' in kz_tag or 'open30' in kz_tag))
         if grade == 'fail':
-            # For scalp setups in unrestricted mode, allow C-grade fallback even if
-            # strict HTF alignment fails — the sweep itself is the edge
             if cfg.confluence.persona_gating:
                 continue
             grade = 'C'
@@ -463,12 +468,12 @@ def _evaluate_row(i: int,
             tp1 = entry + cfg.exits.tp1_r * risk
         else:
             tp1 = entry - cfg.exits.tp1_r * risk
-        tp2 = tp1  # one-shot for scalps
+        tp2 = tp1
         tgt_tf, tgt_px = _runner_target(direction, row, cfg.confluence, entry, risk)
         if tgt_px is None:
             tgt_px = entry + direction * 2.0 * risk
             tgt_tf = '2R_scalp'
-        risk_pct = cfg.grades.risk_fraction(grade) * 0.5  # half-size on quick scalps
+        risk_pct = cfg.grades.risk_fraction(grade) * 0.5
 
         tags = [f'trigger_{trigger_tf}', 'setup_LIQ_SWEEP'] + conf_tags
         tags.append(f'grade_{grade}')
@@ -788,6 +793,8 @@ def _strategy_columns(cfg: StrategyConfig) -> list[str]:
             f'{prefix}minor_choch_up', f'{prefix}minor_choch_dn',
             f'{prefix}major_bos_up', f'{prefix}major_bos_dn',
             f'{prefix}major_choch_up', f'{prefix}major_choch_dn',
+            f'{prefix}bull_liq_sweep', f'{prefix}bear_liq_sweep',
+            f'{prefix}bull_sweep_px', f'{prefix}bear_sweep_px',
             f'{prefix}bull_ob_top', f'{prefix}bull_ob_bottom', f'{prefix}bull_ob_mitigated',
             f'{prefix}bear_ob_top', f'{prefix}bear_ob_bottom', f'{prefix}bear_ob_mitigated',
             f'{prefix}bull_fvg_top', f'{prefix}bull_fvg_bottom', f'{prefix}bull_fvg_mitigated',
@@ -848,7 +855,10 @@ def scan(df: pd.DataFrame,
 
     signals: list[Signal] = []
     n = len(df)
-    warmup = 500  # first 500 M1 bars (~8 hours) for indicator warmup
+    # 3000 M1 bars (~2 trading days) for indicator warmup — long enough for EMA200,
+    # ATR-ZigZag major swings, and zone state to stabilise regardless of how
+    # much history the caller feeds us (live loop feeds 60k M1 bars = 6 weeks).
+    warmup = 3000
     state: dict = {}
 
     progress(f"Scanning {n:,} M1 bars for setups ...")

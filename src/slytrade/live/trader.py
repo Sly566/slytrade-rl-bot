@@ -61,8 +61,29 @@ TIMEFRAME_ATTRS = {
     "D1":  "TIMEFRAME_D1",
 }
 MAGIC = 260810  # SlyTrade magic number
-WARMUP_BARS = {"M1": 600, "M5": 400, "M15": 300, "H1": 200, "H4": 120, "D1": 60}
-HTFS = ["M5", "M15", "H1", "H4", "D1"]
+# Per-TF history windows — GENEROUS by design so the engine sees EVERYTHING.
+#
+# Rule per TF: 3 × EMA200 lookback for full indicator warmup, plus enough
+# swing history for ATR-ZigZag major pivots (mult=4 ATR) to form cleanly,
+# plus enough historical swing reference levels that liquidity sweeps
+# against weeks-old levels are still detectable.
+#
+# M1 is intentionally the LARGEST window — that's where quick scalps fire,
+# and we do NOT want a swing low from last week to fall out of the buffer
+# right as price comes back to sweep it. Total processing per cycle
+# benchmarks at ~1s on a modern CPU — well within our 60-second poll budget.
+#
+#                   bars         ~calendar days   why
+WARMUP_BARS = {
+    "M1":  60000,  # ~42d  (6 wks)   swing refs + liq levels weeks back
+    "M5":  15000,  # ~52d  (7.5 wks) trigger TF: full multi-week structure
+    "M15":  6000,  # ~62d  (9 wks)   OB TF + A+ premium/discount zone
+    "M30":  3000,  # ~62d  (9 wks)   mid-TF confluence for grade/runner
+    "H1":   2400,  # ~100d (14 wks)  OB TF + runners; H1 EMA200 needs ~12d
+    "H4":   1200,  # ~200d (28 wks)  HTF bias for A+; H4 EMA200 needs ~50 days
+    "D1":    500,  # ~500d (~1.4y)   D1 EMA200 = 200d; yearly hi/lo runners
+}
+HTFS = ["M5", "M15", "M30", "H1", "H4", "D1"]
 CHOPCH_EMERGENCY_TF = "M15"
 TIME_STOP_BARS = 240
 
@@ -533,7 +554,7 @@ class LiveTrader:
     def _structure_diagnostics(self, aligned: pd.DataFrame) -> None:
         """Print counts of recent displacements/BOS/CHoCH/liq-sweeps on trigger
         TFs so we can see whether features are firing during big moves."""
-        for tf, lookback in [("M1", 30), ("M5", 60), ("M15", 240), ("H1", 600)]:
+        for tf, lookback in [("M1", 30), ("M5", 60), ("M15", 240), ("M30", 480), ("H1", 600)]:
             tail = aligned.tail(lookback)
             counts: dict[str, int] = {}
             for ev in ("bull_disp", "bear_disp",
