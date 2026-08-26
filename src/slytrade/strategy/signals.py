@@ -219,7 +219,15 @@ def _killzone_tag(row, cfg_sess) -> tuple[bool, str]:
     in_off     = (row.get('session', '') == 'OFF')
 
     tags = []
-    allowed = False
+    # Default policy:
+    #   * block_off_hours=True  (champion) -> only explicit killzones are allowed,
+    #     all other bars (off-hours, mid-session, between KZs) are rejected.
+    #   * block_off_hours=False (RL/unrestricted --all) -> EVERY bar is admissible;
+    #     killzone matches only add bonus tags for grading/BE/trailing logic.
+    #     This is what lets M1 displacements at 17:00+ UTC (NY afternoon / off-
+    #     hours grind-downs) refresh trigger timestamps so LIQ_SWEEP/BOS_CONT
+    #     scalps fire the way Sly expects ("see everything before RL").
+    allowed = not cfg_sess.block_off_hours
     if cfg_sess.trade_london_open30 and in_lon_o30:
         allowed = True; tags.append('london_open30')
     if cfg_sess.trade_ny_open30 and in_ny_o30:
