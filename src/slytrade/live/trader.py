@@ -525,6 +525,34 @@ class LiveTrader:
         if len(active_zones) > 20:
             print(f"    ... and {len(active_zones)-20} more")
 
+    def _structure_diagnostics(self, aligned: pd.DataFrame) -> None:
+        """Print counts of recent displacements/BOS/CHoCH on trigger TFs so we
+        can see whether features are firing during big moves (helps diagnose
+        'no signals during a selloff' situations)."""
+        for tf, lookback in [("M5", 60), ("M15", 240), ("H1", 600)]:
+            tail = aligned.tail(lookback)
+            counts: dict[str, int] = {}
+            for ev in ("bull_disp", "bear_disp",
+                       "minor_bos_up", "minor_bos_dn", "minor_choch_up", "minor_choch_dn",
+                       "major_bos_up", "major_bos_dn", "major_choch_up", "major_choch_dn"):
+                col = f"{tf}_{ev}"
+                if col in tail.columns:
+                    n = int(tail[col].fillna(False).sum())
+                    if n > 0:
+                        counts[ev] = n
+            last_bd = last_bu = None
+            for col, attr in [(f"{tf}_bear_disp", "bd"), (f"{tf}_bull_disp", "bu")]:
+                if col in tail.columns:
+                    hits = tail[tail[col].fillna(False)]["time"]
+                    if len(hits) > 0:
+                        ts = pd.Timestamp(hits.iloc[-1]).strftime("%H:%M")
+                        if attr == "bd":
+                            last_bd = ts
+                        else:
+                            last_bu = ts
+            if counts or last_bd or last_bu:
+                print(f"  [diag] {tf} last {lookback} M1 bars: {counts} last_bull_disp={last_bu} last_bear_disp={last_bd}")
+
     def _cycle_fn(self) -> None:
         self._cycle += 1
         m1_raw = fetch_bars(self.mt5, self.symbol, "M1", WARMUP_BARS["M1"])
@@ -571,6 +599,19 @@ class LiveTrader:
         if self.verbose and (n_sigs_this_cycle > 0 or self._cycle % 5 == 0):
             bid, ask = self.quote()
             self._dump_state(f"cycle {self._cycle} bid={bid:.1f} new_bars={len(new_rows)} sigs={n_sigs_this_cycle}")
+            self._structure_diagnostics(aligned)
+            lb = aligned.iloc[-1]
+            flags: list[str] = []
+            for col in ("M5_bull_disp", "M5_bear_disp",
+                        "M5_minor_bos_up", "M5_minor_bos_dn",
+                        "M5_minor_choch_up", "M5_minor_choch_dn",
+                        "M5_major_bos_up", "M5_major_bos_dn",
+                        "M5_major_choch_up", "M5_major_choch_dn",
+                        "M15_major_choch_up", "M15_major_choch_dn"):
+                if col in aligned.columns and bool(lb.get(col, False)):
+                    flags.append(col.replace("M5_", "").replace("M15_", "M15:"))
+            if flags:
+                print(f"  [latest M1 bar flags] {', '.join(flags)}")
 
         latest = aligned.iloc[-1]
         self._monitor_positions(latest, new_bar=True)

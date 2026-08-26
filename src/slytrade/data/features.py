@@ -573,13 +573,13 @@ def _add_order_blocks(df: pd.DataFrame) -> None:
 
     Bullish OB: last bearish candle before a bullish displacement candle.
         - top = OB high, bottom = OB low
-        - mitigated when a subsequent close < OB bottom
+        - mitigated when a subsequent WICK trades below OB bottom
+          (low[i] < bot) — wick-taps invalidate, not just closes.
     """
     n = len(df)
     direction = df["direction"].to_numpy()
     high = df["high"].to_numpy(dtype=np.float64)
     low = df["low"].to_numpy(dtype=np.float64)
-    close = df["close"].to_numpy(dtype=np.float64)
     bull_disp = df["bull_disp"].to_numpy()
     bear_disp = df["bear_disp"].to_numpy()
 
@@ -603,10 +603,13 @@ def _add_order_blocks(df: pd.DataFrame) -> None:
     act_bear_i: int = -1
 
     for i in range(n):
-        if act_bull_top is not None and close[i] < act_bull_bot:
+        # Wick-based mitigation: low[i] < bull_bot => bull OB mitigated;
+        # high[i] > bear_top => bear OB mitigated. Catches wicks that close
+        # back inside (common during news/London spikes).
+        if act_bull_top is not None and low[i] < act_bull_bot:
             act_bull_top = act_bull_bot = None
             act_bull_i = -1
-        if act_bear_bot is not None and close[i] > act_bear_top:
+        if act_bear_bot is not None and high[i] > act_bear_top:
             act_bear_top = act_bear_bot = None
             act_bear_i = -1
 
@@ -636,6 +639,8 @@ def _add_order_blocks(df: pd.DataFrame) -> None:
         else:
             bear_ob_mit[i] = True
 
+        # Track most recent opposing candle (direction 0 / doji doesn't
+        # advance either pointer so we always have a valid OB source).
         if direction[i] == -1:
             last_bear_idx = i
         elif direction[i] == 1:
@@ -657,13 +662,12 @@ def _add_order_blocks(df: pd.DataFrame) -> None:
 def _add_fvgs(df: pd.DataFrame) -> None:
     """Bull FVG = low[i] > high[i-2] (gap up between t=i-2 and t=i, middle i-1).
     Bear FVG = high[i] < low[i-2].
-    Confirmed at bar i close.  Mitigated when a subsequent close fills
-    back through the gap boundary.
+    Confirmed at bar i close.  Mitigated when a subsequent WICK trades
+    through the gap boundary (low < bull_bot or high > bear_top).
     """
     n = len(df)
     high = df["high"].to_numpy(dtype=np.float64)
     low = df["low"].to_numpy(dtype=np.float64)
-    close = df["close"].to_numpy(dtype=np.float64)
 
     bull_fvg_top = np.full(n, np.nan, dtype=np.float64)
     bull_fvg_bottom = np.full(n, np.nan, dtype=np.float64)
@@ -682,20 +686,23 @@ def _add_fvgs(df: pd.DataFrame) -> None:
     act_bear_mid: int = -1
 
     for i in range(n):
-        if act_bull_top is not None and close[i] < act_bull_bot:
+        # Wick-based mitigation (same rule as OBs: low < bull_bot fills the gap).
+        if act_bull_top is not None and low[i] < act_bull_bot:
             act_bull_top = act_bull_bot = None
             act_bull_mid = -1
-        if act_bear_bot is not None and close[i] > act_bear_top:
+        if act_bear_bot is not None and high[i] > act_bear_top:
             act_bear_top = act_bear_bot = None
             act_bear_mid = -1
 
         if i >= 2:
             t = i - 2
             if low[i] > high[t]:
+                # Bull FVG gap UP: zone is [high[t], low[i]] (bot=high[t], top=low[i]).
                 act_bull_top = float(low[i])
                 act_bull_bot = float(high[t])
                 act_bull_mid = t + 1
             if high[i] < low[t]:
+                # Bear FVG gap DOWN: zone is [high[i], low[t]] (bot=high[i], top=low[t]).
                 act_bear_top = float(low[t])
                 act_bear_bot = float(high[i])
                 act_bear_mid = t + 1
