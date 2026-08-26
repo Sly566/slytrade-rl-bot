@@ -372,8 +372,14 @@ def _evaluate_row(i: int,
     bear_window = _within_window(state.get('_last_bear_trigger'))
 
     candidates: list[int] = []
-    if bull_window and cfg.confluence.accept_longs: candidates.append(1)
-    if bear_window and cfg.confluence.accept_shorts: candidates.append(-1)
+    # Directional filter — when persona_gating is OFF (RL training mode), both
+    # sides are emitted regardless of accept_longs/accept_shorts so the agent
+    # sees the full action space. When gating is ON (default paper-trade
+    # persona), we honor the static directional filter.
+    if bull_window and (cfg.confluence.accept_longs or not cfg.confluence.persona_gating):
+        candidates.append(1)
+    if bear_window and (cfg.confluence.accept_shorts or not cfg.confluence.persona_gating):
+        candidates.append(-1)
     if not candidates:
         return None
 
@@ -403,18 +409,25 @@ def _evaluate_row(i: int,
 
         kind, ztf, ztop, zbot = zone
 
-        # Gate 4: zone kind / TF gating (battle-tested filter)
-        if kind.upper() not in cfg.confluence.accept_zone_kinds:
-            continue
-        if ztf not in cfg.confluence.accept_ob_tfs:
-            continue
+        # Gate 4: zone kind / TF gating (battle-tested filter).
+        # When persona_gating is OFF (RL mode), we accept all discovered zones
+        # on any configured OB TF — the agent learns which to take/skip.
+        if cfg.confluence.persona_gating:
+            if kind.upper() not in cfg.confluence.accept_zone_kinds:
+                continue
+            if ztf not in cfg.confluence.accept_ob_tfs:
+                continue
 
-        # Gate 5: HTF bias agreement + grade assignment
+        # Gate 5: HTF bias agreement + grade assignment.
+        # _grade() always returns a grade ("A+"/"A"/"B"/"C"/"fail"). In persona
+        # mode we reject grades outside accept_grades; in RL mode we emit
+        # everything except hard structural fails (grade=="fail" means HTF
+        # CHoCH against with zero supporting confluence — not a real setup).
         grade, conf_tags = _grade(direction, row, cfg.confluence,
                                   bonus_killzone=('+' in kz_tag or 'open30' in kz_tag))
         if grade == 'fail':
             continue
-        if grade not in cfg.confluence.accept_grades:
+        if cfg.confluence.persona_gating and grade not in cfg.confluence.accept_grades:
             continue
 
         # Asia entries: C-grade only (range-retest, never A+/A/B). Downgrade if enabled.
@@ -456,12 +469,18 @@ def _evaluate_row(i: int,
         if risk > 50.0:
             continue
 
-        # Gate 6: risk-in-ATR width filter (battle-tested: <1.2 ATR stops get hunted)
+        # Gate 6: risk-in-ATR width filter. In persona mode reject setups outside
+        # the configured band; in RL mode tag them but keep all setups within
+        # sane structural bounds (0.3–7 ATR) so the agent learns sizing/SL.
         risk_atr = risk / atr if atr > 0 else 0.0
-        if risk_atr < cfg.confluence.min_risk_atr:
-            continue
-        if risk_atr > cfg.confluence.max_risk_atr:
-            continue
+        if cfg.confluence.persona_gating:
+            if risk_atr < cfg.confluence.min_risk_atr:
+                continue
+            if risk_atr > cfg.confluence.max_risk_atr:
+                continue
+        else:
+            if risk_atr < 0.3 or risk_atr > 7.0:
+                continue
 
         if direction == 1:
             tp1 = entry + cfg.exits.tp1_r * risk

@@ -118,10 +118,18 @@ class ConfluenceConfig:
     # Only accept these grades (C-grade is net negative; blocked by default).
     accept_grades: tuple[str, ...] = ("A+", "A", "B")
     # Directional toggle — Layer 5 battle-tested: LONGS carry ~94% of the edge
-    # (PF 2.15 vs shorts PF 1.01 on 25-month M1 sweep).  SHORTS disabled by default;
-    # flip accept_shorts=True only if you've revalidated on fresh data.
+    # (PF 2.15 vs shorts PF 1.01 on 25-month M1 sweep).  SHORTS disabled for the
+    # default paper-trade persona; flip accept_shorts=True (or set
+    # `persona_gating=False` to turn ALL acceptance filters off for RL training).
     accept_longs: bool = True
     accept_shorts: bool = False
+    # Persona gating: when True (default), signals are filtered by accept_*,
+    # min_risk_atr, accept_ob_tfs, accept_zone_kinds — producing only signals
+    # the v0.9.0 champion persona would trade. When False, ALL candidate
+    # setups (long + short, all grades, M5+M15+H1 OBs, FVGs, C-grades, any
+    # risk width within sane bounds) are emitted, tagged with their full
+    # feature vector so the RL Layer can learn from the whole action space.
+    persona_gating: bool = True
 
 
 @dataclass(frozen=True)
@@ -134,3 +142,53 @@ class StrategyConfig:
     execution_tf: str = "M1"
     trigger_tf:   str = "M5"   # displacement/BOS trigger TF
     entry_tf:     str = "M1"   # precision entry (FVG/OB retest)
+
+
+# --------------------------------------------------------------------------- #
+# Persona presets
+# --------------------------------------------------------------------------- #
+
+def champion_persona() -> StrategyConfig:
+    """v0.9.0 Layer-5 champion persona (PF 2.00, OOS PF 2.57).
+
+    Longs only, 0.85R one-shot TP, min 2.0-ATR stops, grades A+/A/B, OBs on
+    M15+M5, London+NY sessions only. Use this for paper/live trading; use
+    `rl_training_persona()` to generate the full candidate universe for the
+    Layer 6 RL pipeline.
+    """
+    return StrategyConfig()  # defaults are already the champion persona
+
+
+def rl_training_persona() -> StrategyConfig:
+    """Full-universe persona for RL training.
+
+    Turns persona_gating OFF so every candidate setup is emitted with its
+    full feature vector — longs AND shorts, all grades A+/A/B/C, OBs on H1/M15/M5,
+    FVGs included, risk widths from 0.3–7 ATR, Asian + off-hours unlocked.
+    The agent then learns SKIP/LONG/SHORT, sizing, and TP/SL placement from
+    the 25-month feature-rich dataset rather than inheriting my static rules.
+
+    The v0.9.0 champion persona is still reachable via champion_persona() for
+    paper-trade baselines and as a BC (behavioral-cloning) warm-start for RL.
+    """
+    return StrategyConfig(
+        sessions=SessionFilter(
+            trade_london_kz=True,
+            trade_ny_kz=True,
+            trade_asian_kz=True,            # unlock Asia for RL
+            trade_london_open30=True,
+            trade_ny_open30=True,
+            trade_asian_range_retest=True,  # unlock C-grade Asian range retests
+            block_off_hours=False,          # unlock off-hours
+        ),
+        confluence=ConfluenceConfig(
+            min_risk_atr=0.3,
+            max_risk_atr=7.0,
+            accept_ob_tfs=("H1", "M15", "M5"),   # include H1 OBs for RL
+            accept_zone_kinds=("OB", "FVG"),      # include FVGs
+            accept_grades=("A+", "A", "B", "C"),  # include C-grades
+            accept_longs=True,
+            accept_shorts=True,                   # unlock shorts
+            persona_gating=False,                 # **turn off hard persona filters**
+        ),
+    )

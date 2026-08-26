@@ -117,31 +117,41 @@ class BacktestEngine:
             return None
         if self.equity < self.bt.starting_equity * self.bt.min_equity_fraction:
             return None
-        # Directional filter (Layer 5: shorts PF 1.01 -> disabled by default)
         d = int(sig.direction)
-        if d == 1 and not self.cfg.confluence.accept_longs:
-            return None
-        if d == -1 and not self.cfg.confluence.accept_shorts:
-            return None
-        # Risk-in-ATR floor filter (Layer 5: tight stops get hunted)
+        # Directional / persona filters.
+        # When persona_gating is True (default paper-trade persona, v0.9.0), we
+        # hard-reject signals that don't match the profitable long-only config.
+        # When persona_gating is False (RL training mode), we trust the signal
+        # generator to have emitted the right candidates and open every signal
+        # that reaches the engine — the agent decides to act/skip.
+        if self.cfg.confluence.persona_gating:
+            # Directional filter (Layer 5: shorts PF 1.01 -> disabled by default)
+            if d == 1 and not self.cfg.confluence.accept_longs:
+                return None
+            if d == -1 and not self.cfg.confluence.accept_shorts:
+                return None
+            # Risk-in-ATR floor filter (Layer 5: tight stops get hunted)
+            _atr = float(sig.atr_at_entry) if float(sig.atr_at_entry) > 0 else 1.0
+            _risk_w = abs(float(sig.entry) - float(sig.stop))
+            _risk_atr = _risk_w / _atr if _atr > 0 else 999.0
+            if _risk_atr < self.cfg.confluence.min_risk_atr:
+                return None
+            if _risk_atr > self.cfg.confluence.max_risk_atr:
+                return None
+            # OB TF / grade filters
+            obtf = getattr(sig, "ob_tf", None)
+            try:
+                if obtf is None or (isinstance(obtf, float) and pd.isna(obtf)):
+                    obtf = None
+            except (TypeError, ValueError):
+                pass
+            if obtf is not None and obtf not in self.cfg.confluence.accept_ob_tfs:
+                return None
+            if str(sig.grade) not in self.cfg.confluence.accept_grades:
+                return None
+        # Always compute these for fill math:
         _atr = float(sig.atr_at_entry) if float(sig.atr_at_entry) > 0 else 1.0
         _risk_w = abs(float(sig.entry) - float(sig.stop))
-        _risk_atr = _risk_w / _atr if _atr > 0 else 999.0
-        if _risk_atr < self.cfg.confluence.min_risk_atr:
-            return None
-        if _risk_atr > self.cfg.confluence.max_risk_atr:
-            return None
-        # OB TF / grade / zone kind filters
-        obtf = getattr(sig, "ob_tf", None)
-        try:
-            if obtf is None or (isinstance(obtf, float) and pd.isna(obtf)):
-                obtf = None
-        except (TypeError, ValueError):
-            pass
-        if obtf is not None and obtf not in self.cfg.confluence.accept_ob_tfs:
-            return None
-        if str(sig.grade) not in self.cfg.confluence.accept_grades:
-            return None
         spread_pts = float(row.get("spread", 0.0))
         half_spread_price = spread_pts * self.spec.point * 0.5 if self.bt.pay_entry_spread else 0.0
         slip_price_long = self.bt.slippage_points_long * self.spec.point
