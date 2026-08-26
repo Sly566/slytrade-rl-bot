@@ -303,6 +303,17 @@ def _evaluate_row(i: int,
     `state` is mutated across rows; it tracks the most recent unmitigated
     OBs/FVGs on each HTF, keyed by f"{tf}_{side}_{kind}" → dict(top, bot, bar).
 
+    IMPORTANT: structural state updates (OB/FVG zone tracking, trigger
+    timestamps, sweep timestamps/extremes) run on EVERY bar, BEFORE any entry
+    gates are applied. Entry gates (ATR floor, session filter, zone-in-range,
+    grade, risk width) only decide whether we EMIT a Signal this bar -- they
+    must NOT block state tracking, or the state machine drifts blind during
+    the very bars (post-rollover impulses, low-vol breakouts) where we need
+    fresh triggers most. v0.9.2-v0.9.4 had this backwards: Gate 0 returned
+    before state updates, causing triggers to freeze during the first 5-8
+    bars after the 21:00-22:00 UTC broker rollover when ATR(14) was still
+    anchored to dead-chop levels.
+
     Pass `fail_trace=[]` to collect human-readable reject reasons (one string
     per gate that fired, last-wins since order matters). Used by the live
     verbose loop to debug why bars that print disp/sweep flags in diagnostics
@@ -319,33 +330,19 @@ def _evaluate_row(i: int,
 
     c = float(row['close'])
     atr = float(row['atr_14']) if pd.notna(row['atr_14']) else 0.0
-    if atr <= 0:
-        _reject(f"atr<=0 atr={atr}"); return None
-
-    # Gate 0: ATR sanity (skip dead/news-spike bars)
-    atr_pct = atr / c if c > 0 else 0.0
-    if atr_pct < cfg.confluence.min_atr_pct or atr_pct > cfg.confluence.max_atr_pct:
-        _reject(f"atr_pct={atr_pct:.5f} outside band [{cfg.confluence.min_atr_pct},{cfg.confluence.max_atr_pct}] atr={atr:.2f} c={c:.2f}")
-        return None
-
-    # Gate 1: session / killzone
-    allowed, kz_tag = _killzone_tag(row, cfg.sessions)
-    if not allowed:
-        _reject(f"session blocked kz={kz_tag}"); return None
-
-    # Update tracked zones from this row's HTF values. A zone becomes "active"
-    # when it appears (top becomes notnull, mitigated=False) after a
-    # displacement/BOS on the same TF. It stays active while mitigated==False,
-    # and expires after `retest_window` M1 bars.
-    trigger_tf = cfg.trigger_tf
-    # Retest window: 60 M1 bars (~1h) in champion persona, 120 bars (~2h) in
-    # unrestricted/RL mode so we catch longer displacement-to-pullback cycles
-    # common on XAUUSD M5.
-    retest_window = 60 if cfg.confluence.persona_gating else 120
     t_now = row['time']
+    trigger_tf = cfg.trigger_tf
+    retest_window = 60 if cfg.confluence.persona_gating else 120
+    sweep_window = 15 if cfg.confluence.persona_gating else 30
 
+    # ================================================================== #
+    # PHASE 1: STRUCTURAL STATE UPDATE -- runs on EVERY bar, no early
+    # returns here. Zones, triggers, sweeps are tracked regardless of
+    # whether this bar will pass entry gates, so state stays causal.
+    # ================================================================== #
+
+    # --- 1a. Track OBs / FVGs on all OB TFs (+ trigger TF) ---
     def _update_zone(tf: str, side: str, kind: str):
-        """Track active zone if the current HTF row has an unmitigated one."""
         key = f"{tf}_{side}_{kind}"
         top_k = f"{tf}_{side}_{kind}_top"
         bot_k = f"{tf}_{side}_{kind}_bottom"
@@ -354,35 +351,28 @@ def _evaluate_row(i: int,
         bot = row.get(bot_k, np.nan)
         mit = bool(row.get(mit_k, True))
         if pd.notna(top) and pd.notna(bot) and not mit:
-            # Zone is active on this HTF bar; refresh state
             prev = state.get(key)
             if prev is None or (prev['top'] != top or prev['bot'] != bot):
-                # New zone (or zone changed) — reset entry flag
                 state[key] = {'top': float(top), 'bot': float(bot), 'set_at': t_now, 'fresh': True}
                 state[f"{key}_entered"] = False
             else:
-                # Same zone still active; just mark still-present
                 prev['fresh'] = False
         elif key in state:
-            # Zone mitigated or gone; expire and clear entry flag
             state[key]['mitigated'] = True
             state[f"{key}_entered"] = True
 
-    # Track OBs and FVGs on all OB TFs (and on trigger TF)
-    track_tfs = list(dict.fromkeys(list(cfg.confluence.ob_tfs) + [trigger_tf]))
-    for tf in track_tfs:
-        _update_zone(tf, 'bull', 'ob')
-        _update_zone(tf, 'bear', 'ob')
-        _update_zone(tf, 'bull', 'fvg')
-        _update_zone(tf, 'bear', 'fvg')
+    if atr > 0:
+        # Zone tracking requires valid ATR only in the sense that features
+        # need ATR to have formed zones at all; if atr<=0 zones don't exist
+        # yet so skip tracking.
+        track_tfs = list(dict.fromkeys(list(cfg.confluence.ob_tfs) + [trigger_tf]))
+        for tf in track_tfs:
+            _update_zone(tf, 'bull', 'ob')
+            _update_zone(tf, 'bear', 'ob')
+            _update_zone(tf, 'bull', 'fvg')
+            _update_zone(tf, 'bear', 'fvg')
 
-    # Determine whether a fresh displacement/BOS just fired on trigger_tf
-    # OR ON M1 DIRECTLY. Grind-down moves (e.g. $2-3 per M5 bar during a
-    # straight-line selloff) can produce sub-1.5-ATR M5 legs that still
-    # print clear M1 displacements + BOS; we want scalp setups to see
-    # those. Retest OB/FVG runner trades below still require the M5 trigger
-    # to fire (champion PF preservation) because they need M5 displacement
-    # to form the OB/FVG zone in the first place.
+    # --- 1b. Displacement/BOS trigger freshness ---
     bull_trig_fresh = (bool(row.get(f'{trigger_tf}_bull_disp', False)) or
                        bool(row.get(f'{trigger_tf}_minor_bos_up', False)) or
                        bool(row.get(f'{trigger_tf}_major_bos_up', False)) or
@@ -397,13 +387,8 @@ def _evaluate_row(i: int,
                        bool(row.get('bear_disp', False)) or
                        bool(row.get('minor_bos_dn', False)) or
                        bool(row.get('major_bos_dn', False)))
-
-    # For each direction, require that a trigger fired within the last
-    # `retest_window` M1 bars. Track trigger timestamps.
     if bull_trig_fresh:
         state['_last_bull_trigger'] = t_now
-        # Tag whether this trigger had an M5 component (needed for zone-retest
-        # runners which require an M5 displacement to form the zone).
         m5_bull = bool(row.get(f'{trigger_tf}_bull_disp', False)) or \
                  bool(row.get(f'{trigger_tf}_minor_bos_up', False)) or \
                  bool(row.get(f'{trigger_tf}_major_bos_up', False))
@@ -417,6 +402,49 @@ def _evaluate_row(i: int,
         if m5_bear:
             state['_last_bear_trigger_m5'] = t_now
 
+    # --- 1c. Liquidity sweep tracking ---
+    for direction in (1, -1):
+        side = 'bull' if direction == 1 else 'bear'
+        m1_sweep_now = bool(row.get('bull_liq_sweep' if direction==1 else 'bear_liq_sweep', False))
+        tf_sweep_now = bool(row.get(f'{trigger_tf}_{"bull" if direction==1 else "bear"}_liq_sweep', False))
+        if m1_sweep_now or tf_sweep_now:
+            sweep_px = np.nan
+            if m1_sweep_now:
+                sweep_px = row.get('bull_sweep_px' if direction==1 else 'bear_sweep_px', np.nan)
+            if pd.isna(sweep_px) and tf_sweep_now:
+                sweep_px = row.get(f'{trigger_tf}_{"bull" if direction==1 else "bear"}_sweep_px', np.nan)
+            if pd.notna(sweep_px):
+                state[f'_last_{side}_sweep_ts'] = t_now
+                state[f'_last_{side}_sweep_px'] = float(sweep_px)
+
+    # ================================================================== #
+    # PHASE 2: ENTRY GATES -- applied to decide whether to emit a Signal
+    # this bar. If we bail here, state has already been updated above.
+    # ================================================================== #
+
+    if atr <= 0:
+        _reject(f"atr<=0 atr={atr}"); return None
+
+    # Gate 0: ATR sanity. Champion uses tight band [0.0004, 0.02] = ~$1.0
+    # min ATR at $2500 XAU. In unrestricted/--all mode we lower the floor
+    # to ~$0.50 at $4600 so the first 5-8 bars after the broker rollover
+    # (where Wilder ATR14 is still anchored to dead-chop from before the
+    # break) are not rejected -- those are exactly the impulse bars that
+    # start the new move. The upper cap at $90 ATR (0.02) still filters
+    # FOMC/news flash-crashes.
+    atr_pct = atr / c if c > 0 else 0.0
+    min_atr_pct_gate = cfg.confluence.min_atr_pct if cfg.confluence.persona_gating else 0.00010
+    if atr_pct < min_atr_pct_gate or atr_pct > cfg.confluence.max_atr_pct:
+        _reject(f"atr_pct={atr_pct:.5f} outside band [{min_atr_pct_gate},{cfg.confluence.max_atr_pct}] atr={atr:.2f} c={c:.2f}")
+        return None
+
+    # Gate 1: session / killzone
+    allowed, kz_tag = _killzone_tag(row, cfg.sessions)
+    if not allowed:
+        _reject(f"session blocked kz={kz_tag}"); return None
+
+    # Window checks (use post-update state so a trigger firing THIS bar
+    # opens the window immediately rather than waiting one bar).
     def _within_window(ts):
         if ts is None: return False
         return (t_now - ts) <= pd.Timedelta(minutes=retest_window)
@@ -443,22 +471,7 @@ def _evaluate_row(i: int,
     # direction within `sweep_window` M1 bars. Enter at displacement
     # close, SL just beyond the sweep wick extreme, quick 0.85R TP.
     # ================================================================== #
-    sweep_window = 15 if cfg.confluence.persona_gating else 30  # 15-30 min scalp window
-    # Track per-side sweep timestamps + sweep extreme from new sweeps
-    for direction in (1, -1):
-        side = 'bull' if direction == 1 else 'bear'
-        m1_sweep_now = bool(row.get('bull_liq_sweep' if direction==1 else 'bear_liq_sweep', False))
-        tf_sweep_now = bool(row.get(f'{trigger_tf}_{"bull" if direction==1 else "bear"}_liq_sweep', False))
-        if m1_sweep_now or tf_sweep_now:
-            sweep_px = np.nan
-            if m1_sweep_now:
-                sweep_px = row.get('bull_sweep_px' if direction==1 else 'bear_sweep_px', np.nan)
-            if pd.isna(sweep_px) and tf_sweep_now:
-                sweep_px = row.get(f'{trigger_tf}_{"bull" if direction==1 else "bear"}_sweep_px', np.nan)
-            if pd.notna(sweep_px):
-                state[f'_last_{side}_sweep_ts'] = t_now
-                state[f'_last_{side}_sweep_px'] = float(sweep_px)
-
+    # sweep_window is already set above (Phase 1); reuse it.
     for direction in (1, -1):
         if direction not in candidates:
             continue
