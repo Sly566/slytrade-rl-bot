@@ -352,21 +352,45 @@ def _evaluate_row(i: int,
         _update_zone(tf, 'bear', 'fvg')
 
     # Determine whether a fresh displacement/BOS just fired on trigger_tf
+    # OR ON M1 DIRECTLY. Grind-down moves (e.g. $2-3 per M5 bar during a
+    # straight-line selloff) can produce sub-1.5-ATR M5 legs that still
+    # print clear M1 displacements + BOS; we want scalp setups to see
+    # those. Retest OB/FVG runner trades below still require the M5 trigger
+    # to fire (champion PF preservation) because they need M5 displacement
+    # to form the OB/FVG zone in the first place.
     bull_trig_fresh = (bool(row.get(f'{trigger_tf}_bull_disp', False)) or
                        bool(row.get(f'{trigger_tf}_minor_bos_up', False)) or
                        bool(row.get(f'{trigger_tf}_major_bos_up', False)) or
-                       bool(row.get(f'{trigger_tf}_major_choch_up', False)))
+                       bool(row.get(f'{trigger_tf}_major_choch_up', False)) or
+                       bool(row.get('bull_disp', False)) or
+                       bool(row.get('minor_bos_up', False)) or
+                       bool(row.get('major_bos_up', False)))
     bear_trig_fresh = (bool(row.get(f'{trigger_tf}_bear_disp', False)) or
                        bool(row.get(f'{trigger_tf}_minor_bos_dn', False)) or
                        bool(row.get(f'{trigger_tf}_major_bos_dn', False)) or
-                       bool(row.get(f'{trigger_tf}_major_choch_dn', False)))
+                       bool(row.get(f'{trigger_tf}_major_choch_dn', False)) or
+                       bool(row.get('bear_disp', False)) or
+                       bool(row.get('minor_bos_dn', False)) or
+                       bool(row.get('major_bos_dn', False)))
 
     # For each direction, require that a trigger fired within the last
     # `retest_window` M1 bars. Track trigger timestamps.
     if bull_trig_fresh:
         state['_last_bull_trigger'] = t_now
+        # Tag whether this trigger had an M5 component (needed for zone-retest
+        # runners which require an M5 displacement to form the zone).
+        m5_bull = bool(row.get(f'{trigger_tf}_bull_disp', False)) or \
+                 bool(row.get(f'{trigger_tf}_minor_bos_up', False)) or \
+                 bool(row.get(f'{trigger_tf}_major_bos_up', False))
+        if m5_bull:
+            state['_last_bull_trigger_m5'] = t_now
     if bear_trig_fresh:
         state['_last_bear_trigger'] = t_now
+        m5_bear = bool(row.get(f'{trigger_tf}_bear_disp', False)) or \
+                 bool(row.get(f'{trigger_tf}_minor_bos_dn', False)) or \
+                 bool(row.get(f'{trigger_tf}_major_bos_dn', False))
+        if m5_bear:
+            state['_last_bear_trigger_m5'] = t_now
 
     def _within_window(ts):
         if ts is None: return False
@@ -374,6 +398,8 @@ def _evaluate_row(i: int,
 
     bull_window = _within_window(state.get('_last_bull_trigger'))
     bear_window = _within_window(state.get('_last_bear_trigger'))
+    bull_window_m5 = _within_window(state.get('_last_bull_trigger_m5'))
+    bear_window_m5 = _within_window(state.get('_last_bear_trigger_m5'))
 
     candidates: list[int] = []
     # Directional filter — when persona_gating is OFF (RL training mode), both
@@ -601,6 +627,15 @@ def _evaluate_row(i: int,
 
     for direction in candidates:
         side = 'bull' if direction == 1 else 'bear'
+
+        # Zone retest trades (RETEST_OB / RETEST_FVG) REQUIRE an M5 trigger to
+        # have fired in the window — without an M5 displacement, no M5 OB/FVG
+        # zone has formed, so any "entry" would be a phantom. This preserves
+        # the v0.9.0 champion PF 2.00 baseline while letting M1 displacements
+        # drive the LIQ_SWEEP / BOS_CONT scalp setups above.
+        m5_window_ok = bull_window_m5 if direction == 1 else bear_window_m5
+        if not m5_window_ok:
+            continue
 
         # Gate 3: find an active unmitigated zone (OB or FVG) on an OB TF whose
         # price region contains (or was just tapped by) current close.

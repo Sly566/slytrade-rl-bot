@@ -538,23 +538,23 @@ class LiveTrader:
         sweep_px_lines: list[str] = []
         now_ts = pd.Timestamp.now(tz=UTC)
         for k, v in self._state.items():
-            if k.startswith("_last_") and k.endswith("_ts"):
-                # timestamp entries (triggers, sweep events)
-                if v is not None:
+            if k.startswith("_last_"):
+                if isinstance(v, pd.Timestamp) or (v is not None and not isinstance(v, (int, float))):
+                    # timestamp entries (triggers, sweep events)
                     try:
                         age_s = (now_ts - pd.Timestamp(v, tz=UTC)).total_seconds()
                         age_min = age_s / 60.0
                         trigger_ts.append(f"{k}={pd.Timestamp(v).strftime('%H:%M:%S')} (age={age_min:.0f}m)")
                     except Exception:
                         trigger_ts.append(f"{k}={v}")
-                continue
-            if k.startswith("_last_") and k.endswith("_px"):
-                # sweep price levels (floats, not timestamps)
-                try:
-                    sweep_px_lines.append(f"  {k}={float(v):.2f}")
-                except Exception:
-                    sweep_px_lines.append(f"  {k}={v}")
-                continue
+                    continue
+                if isinstance(v, (int, float)) and k.endswith("_px"):
+                    # sweep price levels (floats, not timestamps)
+                    try:
+                        sweep_px_lines.append(f"  {k}={float(v):.2f}")
+                    except Exception:
+                        sweep_px_lines.append(f"  {k}={v}")
+                    continue
             if isinstance(v, dict) and not k.endswith("_entered") and not v.get("mitigated", False):
                 try:
                     top = v.get("top", float("nan")); bot = v.get("bot", float("nan"))
