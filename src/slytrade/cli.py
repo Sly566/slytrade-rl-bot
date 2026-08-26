@@ -10,7 +10,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-app = typer.Typer(help="SlyTrade ICT/SMC scalper v0.8.1")
+app = typer.Typer(help="SlyTrade ICT/SMC scalper v0.9.0")
 console = Console()
 
 
@@ -234,3 +234,61 @@ def backtest_cmd(raw_symbol: str = typer.Option("XAUUSDm", "--symbol"),
 
 if __name__ == "__main__":
     app()
+
+
+# --------------------------------------------------------------------------- #
+# live (real-money / dry-run Layer 5 trading loop)
+# --------------------------------------------------------------------------- #
+@app.command("live")
+def live_cmd(
+    raw_symbol: str = typer.Option("XAUUSDm", "--symbol"),
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(18812, "--port"),
+    live: bool = typer.Option(False, "--live", help="Actually send orders (default: dry-run)."),
+    risk_cap: float = typer.Option(0.01, "--risk-cap", help="Max risk per trade as fraction of equity."),
+    max_open: int = typer.Option(3, "--max-open"),
+    usd_zar: float = typer.Option(18.5, "--usd-zar"),
+    leverage: int = typer.Option(2000, "--leverage"),
+):
+    """Run the live trading loop (Layer 5 champion persona)."""
+    from slytrade.live.trader import (
+        AccountSpec,
+        LiveTrader,
+        champion_persona,
+        connect_mt5,
+        resolve_symbol_spec,
+    )
+    console.print(f"[bold]SlyTrade LIVE v0.9.0[/bold] symbol={raw_symbol} live={live} risk_cap={risk_cap*100:.1f}%")
+    mt5 = connect_mt5(host, port)
+
+    def _to_dict(o):
+        if o is None:
+            return {}
+        if isinstance(o, dict):
+            return o
+        try:
+            return o._asdict()
+        except Exception:
+            return {k: getattr(o, k) for k in dir(o) if not k.startswith("_")}
+
+    acc = _to_dict(mt5.account_info())
+    console.print(f"  login={acc.get('login')} server={acc.get('server')} "
+                  f"balance={acc.get('balance')} equity={acc.get('equity')} {acc.get('currency')}")
+    resolved, spec = resolve_symbol_spec(mt5, raw_symbol, str(acc.get("currency","ZAR")), usd_zar)
+    console.print(f"  symbol={resolved} point={spec.point} digits={spec.digits} "
+                  f"contract={spec.contract_size} vol_min={spec.volume_min}")
+    acct_spec = AccountSpec(
+        starting_equity=float(acc.get("equity", 1000)),
+        currency=str(acc.get("currency", "ZAR")),
+        leverage=int(acc.get("leverage", leverage)),
+        fx_to_account={"USD": usd_zar} if str(acc.get("currency","ZAR")) != "USD" else {"USD": 1.0},
+    )
+    cfg = champion_persona()
+    trader = LiveTrader(
+        mt5=mt5, symbol=resolved, spec=spec, cfg=cfg, acct=acct_spec,
+        live=live, risk_cap=risk_cap, max_open=max_open,
+    )
+    try:
+        trader.run()
+    finally:
+        mt5.shutdown()
