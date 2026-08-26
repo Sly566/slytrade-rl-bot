@@ -1,27 +1,28 @@
 """Tests for Layer 3 MTF causal alignment."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 
+from slytrade.config import DataConfig
+from slytrade.data.features import FeatureConfig, process_bars
 from slytrade.data.mtf_align import (
-    EXECUTION_TF,
-    HTFS,
     _HTF_DROP_COLS as HTF_DROP_COLS,
+)
+from slytrade.data.mtf_align import (
+    HTFS,
     _asof_merge,
     _prep_htf_frame,
     align_all,
     inspect_aligned,
 )
-from slytrade.data.features import FeatureConfig, process_bars
-from slytrade.config import DataConfig
 from slytrade.data.storage import _atomic_write_parquet, _normalize_for_parquet, bar_partition
 
-UTC = timezone.utc
+UTC = UTC
 
 
 def _make_ohlcv(start: datetime, n: int, freq_minutes: int, seed: int = 42) -> pd.DataFrame:
@@ -218,7 +219,6 @@ class TestCausalityEndToEnd:
     """Full pipeline causality check across all HTFs."""
 
     def test_no_future_leak_full_pipeline(self, tmp_path):
-        from slytrade.data.time import timeframe_timedelta
         data_cfg = DataConfig(raw_root=tmp_path / "raw", processed_root=tmp_path / "processed")
         sym = "TEST"
         start = datetime(2025, 1, 1, tzinfo=UTC)

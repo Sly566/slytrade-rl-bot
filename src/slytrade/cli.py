@@ -3,9 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
-import sys
 from pathlib import Path
-from typing import Optional
 
 import pandas as pd
 import typer
@@ -54,9 +52,12 @@ def mt5_info():
         console.print(f"Account:  {mt5.account_info()}")
         mt5.shutdown()
     except ImportError:
-        console.print("[red]mt5linux not installed[/red]"); raise typer.Exit(1)
+        console.print("[red]mt5linux not installed[/red]")
+        raise typer.Exit(1) from None
     except Exception as e:
-        console.print(f"[red]MT5 error: {e}[/red]"); _hint_bridge(); raise typer.Exit(1)
+        console.print(f"[red]MT5 error: {e}[/red]")
+        _hint_bridge()
+        raise typer.Exit(1) from e
 
 
 # --------------------------------------------------------------------------- #
@@ -144,7 +145,7 @@ def align_cmd(raw_symbol: str = typer.Option("XAUUSDm", "--symbol"),
 def scan_cmd(raw_symbol: str = typer.Option("XAUUSDm", "--symbol"),
              raw_root: str = typer.Option("data/raw", "--raw-root"),
              processed_root: str = typer.Option("data/processed", "--processed-root"),
-             output: Optional[str] = typer.Option(None, "--output")):
+             output: str | None = typer.Option(None, "--output")):
     """Scan aligned M1 bars for ICT/SMC signals (Layer 4)."""
     from slytrade.config import DataConfig
     from slytrade.strategy.config import StrategyConfig
@@ -168,17 +169,18 @@ def scan_cmd(raw_symbol: str = typer.Option("XAUUSDm", "--symbol"),
 @app.command("backtest")
 def backtest_cmd(raw_symbol: str = typer.Option("XAUUSDm", "--symbol"),
                  equity: float = typer.Option(20000.0, "--equity"),
-                 signals_path: Optional[str] = typer.Option(None, "--signals"),
+                 signals_path: str | None = typer.Option(None, "--signals"),
                  raw_root: str = typer.Option("data/raw", "--raw-root"),
                  processed_root: str = typer.Option("data/processed", "--processed-root"),
-                 output_dir: Optional[str] = typer.Option(None, "--output"),
+                 output_dir: str | None = typer.Option(None, "--output"),
                  usd_zar: float = typer.Option(18.5, "--usd-zar"),
                  slip_pts: int = typer.Option(5, "--slip-pts"),
                  max_risk: float = typer.Option(0.02, "--max-risk"),
                  commission: float = typer.Option(0.0, "--commission-per-lot")):
     """Run the hedging backtest engine (Layer 5)."""
     import json
-    from slytrade.backtest import run_backtest, BacktestConfig, AccountSpec
+
+    from slytrade.backtest import AccountSpec, BacktestConfig, run_backtest
     from slytrade.config import DataConfig
     from slytrade.strategy.config import StrategyConfig
     cfg = DataConfig.from_paths(Path(raw_root), Path(processed_root))

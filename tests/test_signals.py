@@ -1,20 +1,21 @@
 """Tests for Layer 4 signal engine."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from datetime import UTC, timedelta
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from slytrade.config import DataConfig
 from slytrade.strategy.config import ConfluenceConfig, ExitPlan, SessionFilter, SetupGrades, StrategyConfig
 from slytrade.strategy.signals import (
-    Signal, _evaluate_row, _grade, _killzone_tag, _price_within_ob_bull, _price_within_ob_bear,
-    _runner_target, _strategy_columns,
+    Signal,
+    _evaluate_row,
+    _grade,
+    _killzone_tag,
+    _runner_target,
+    _strategy_columns,
 )
-from slytrade.strategy.scanner import scan_aligned
 
 
 def _permissive_cfg() -> StrategyConfig:
@@ -40,7 +41,7 @@ def _permissive_cfg() -> StrategyConfig:
     )
 
 
-UTC = timezone.utc
+UTC = UTC
 
 
 def _empty_state():

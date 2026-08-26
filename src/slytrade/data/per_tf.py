@@ -16,19 +16,16 @@ when you collect new bars you just re-process.
 from __future__ import annotations
 
 import shutil
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable
 
 import pandas as pd
-import pyarrow.parquet as pq
 
 from ..config import DataConfig
-from .features import FeatureConfig, DEFAULT_CONFIG, process_bars
-from .storage import bar_partition, ensure_dir, _atomic_write_parquet, _normalize_for_parquet
-from .time import iter_months, timeframe_minutes
-
+from .features import DEFAULT_CONFIG, FeatureConfig, process_bars
+from .storage import _atomic_write_parquet, _normalize_for_parquet, bar_partition, ensure_dir
 
 ProgressFn = Callable[[str], None]
 
@@ -133,11 +130,11 @@ def process_all(
                 progress=None,  # silence per-part noise
             )
             # Keep only rows whose time falls within the target month.
-            month_start = datetime(y, m, 1, tzinfo=timezone.utc)
+            month_start = datetime(y, m, 1, tzinfo=UTC)
             if m == 12:
-                next_month_start = datetime(y + 1, 1, 1, tzinfo=timezone.utc)
+                next_month_start = datetime(y + 1, 1, 1, tzinfo=UTC)
             else:
-                next_month_start = datetime(y, m + 1, 1, tzinfo=timezone.utc)
+                next_month_start = datetime(y, m + 1, 1, tzinfo=UTC)
             mask = (processed["time"] >= month_start) & (processed["time"] < next_month_start)
             out_df = processed.loc[mask].reset_index(drop=True)
             if out_df.empty:

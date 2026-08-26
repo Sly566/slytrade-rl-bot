@@ -4,9 +4,9 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from slytrade.backtest.positions import Direction, ExitReason, Position, Tranche
-from slytrade.backtest.specs import SymbolSpec, AccountSpec, spec_for_symbol
 from slytrade.backtest.engine import BacktestConfig, BacktestEngine
+from slytrade.backtest.positions import Direction, ExitReason, Position, Tranche
+from slytrade.backtest.specs import AccountSpec, SymbolSpec, spec_for_symbol
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +164,7 @@ def test_engine_long_hits_tp1_sets_close_reason(spec, acct, bt_cfg):
     for rec in sigs.itertuples(index=False):
         sig_by_time[rec.time].append(rec)
 
-    for i in range(501):
+    for _i in range(501):
         # burn warmup by calling _process_bar with no signal on a dummy row,
         # but simpler: short-circuit warmup via setting the internal flag through
         # the warmup counter by replacing the run loop
@@ -172,7 +172,8 @@ def test_engine_long_hits_tp1_sets_close_reason(spec, acct, bt_cfg):
 
     # Easier: use engine.run() by writing the bars to a temp parquet and
     # reading back. Skip the warmup by inserting 500 filler rows.
-    import tempfile, pathlib
+    import pathlib
+    import tempfile
     with tempfile.TemporaryDirectory() as td:
         warm = pd.DataFrame([{
             "time": pd.Timestamp("2024-01-01", tz="UTC") + pd.Timedelta(minutes=i),

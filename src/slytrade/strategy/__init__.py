@@ -1,7 +1,7 @@
 """Layer 4 — ICT/SMC scalper strategy (config, signal engine)."""
 from __future__ import annotations
 
-from .config import StrategyConfig, SetupGrades, ExitPlan, SessionFilter, ConfluenceConfig
+from .config import ConfluenceConfig, ExitPlan, SessionFilter, SetupGrades, StrategyConfig
 from .signals import Signal, scan, signals_to_frame
 
 __all__ = [

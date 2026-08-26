@@ -7,7 +7,6 @@ per `symbol_info` lives in the backtest/OMS layer).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Tuple
 
 
 # --------------------------------------------------------------------------- #
@@ -87,7 +86,7 @@ class ConfluenceConfig:
     # Must have BOS/CHoCH on trigger TF in direction (M5)
     require_trigger_bos_or_choch: bool = True
     # Order-blocks: which TFs do we accept OBs from (sorted highest-conviction first)
-    ob_tfs: Tuple[str, ...] = ("H1", "M15", "M5")
+    ob_tfs: tuple[str, ...] = ("H1", "M15", "M5")
     # Premium/discount filter: M1 price must be in this zone of the range TF
     pd_range_tf: str = "M15"
     pd_zone_min_pct: float = 0.10   # entries below 10% from edge count as "in zone"
@@ -97,10 +96,10 @@ class ConfluenceConfig:
     #   "a":       H4 + H1 agree (D1 neutral ok)
     #   "b":       H1 + M15 agree
     #   "c":       M15 agrees (counter-H4 allowed only on strong trigger)
-    a_plus_required_tfs: Tuple[str, ...] = ("D1", "H4", "H1")
-    a_required_tfs:      Tuple[str, ...] = ("H4", "H1")
-    b_required_tfs:      Tuple[str, ...] = ("H1", "M15")
-    c_required_tfs:      Tuple[str, ...] = ("M15",)
+    a_plus_required_tfs: tuple[str, ...] = ("D1", "H4", "H1")
+    a_required_tfs:      tuple[str, ...] = ("H4", "H1")
+    b_required_tfs:      tuple[str, ...] = ("H1", "M15")
+    c_required_tfs:      tuple[str, ...] = ("M15",)
     # Kill-zones count as confluence: two killzones overlap => grade bump
     killzone_confluence_bonus: bool = True
     # ATR filter: skip if ATR14 is too small (dead market) or spiking.
@@ -114,10 +113,10 @@ class ConfluenceConfig:
     max_risk_atr: float = 8.0
     # Only accept OBs on these TFs (H1 OBs had PF=0.84 and are filtered out).
     # FVGs are also disabled at default (only OBs passed the OOS test).
-    accept_ob_tfs: Tuple[str, ...] = ("M15", "M5")
-    accept_zone_kinds: Tuple[str, ...] = ("OB",)  # "OB","FVG"
+    accept_ob_tfs: tuple[str, ...] = ("M15", "M5")
+    accept_zone_kinds: tuple[str, ...] = ("OB",)  # "OB","FVG"
     # Only accept these grades (C-grade is net negative; blocked by default).
-    accept_grades: Tuple[str, ...] = ("A+", "A", "B")
+    accept_grades: tuple[str, ...] = ("A+", "A", "B")
     # Directional toggle — Layer 5 battle-tested: LONGS carry ~94% of the edge
     # (PF 2.15 vs shorts PF 1.01 on 25-month M1 sweep).  SHORTS disabled by default;
     # flip accept_shorts=True only if you've revalidated on fresh data.

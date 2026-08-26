@@ -2,16 +2,14 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
-
 # Default timeframes for data collection (M1 as execution TF, plus standard HTFs)
-DEFAULT_TIMEFRAMES: List[str] = ["M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1"]
+DEFAULT_TIMEFRAMES: list[str] = ["M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1"]
 
 # Broker symbol suffixes that MT5 may append (handles XAUUSDm, XAUUSD.a, etc.)
-BROKER_SUFFIXES: List[str] = ["", "m", ".m", ".a", ".r", "c", "-micro", "micro", "!"]
+BROKER_SUFFIXES: list[str] = ["", "m", ".m", ".a", ".r", "c", "-micro", "micro", "!"]
 
 
 class MT5Config(BaseModel):
@@ -21,9 +19,9 @@ class MT5Config(BaseModel):
     timeout: int = Field(default=60)
     initialize_retry_seconds: float = Field(default=5.0)
     # If None, auto-detects from MT5 terminal info
-    account: Optional[int] = None
-    password: Optional[str] = None
-    server: Optional[str] = None
+    account: int | None = None
+    password: str | None = None
+    server: str | None = None
 
 
 class DataConfig(BaseModel):
@@ -90,7 +88,7 @@ class DataConfig(BaseModel):
     # keeps working exactly as before while also setting processed_root
     # to the sibling `data/processed` directory.
     @classmethod
-    def from_paths(cls, raw_root: str | Path, processed_root: str | Path | None = None) -> "DataConfig":
+    def from_paths(cls, raw_root: str | Path, processed_root: str | Path | None = None) -> DataConfig:
         raw = Path(raw_root)
         if processed_root is None:
             # Default: processed sits at <raw_parent>/processed
@@ -105,9 +103,9 @@ class DataConfig(BaseModel):
 class CollectionConfig(BaseModel):
     """Top-level collection run config."""
     symbol: str = "XAUUSD"
-    raw_bar_symbol: Optional[str] = None  # e.g. "XAUUSDm" — auto-detected if None
-    raw_tick_symbol: Optional[str] = None
-    timeframes: List[str] = Field(default_factory=lambda: list(DEFAULT_TIMEFRAMES))
+    raw_bar_symbol: str | None = None  # e.g. "XAUUSDm" — auto-detected if None
+    raw_tick_symbol: str | None = None
+    timeframes: list[str] = Field(default_factory=lambda: list(DEFAULT_TIMEFRAMES))
     lookback_years: float = 2.0
     source: str = "hybrid"  # "mt5", "exness", "hybrid"
     clean: bool = False

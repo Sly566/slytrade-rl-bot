@@ -13,21 +13,23 @@ existing SL/CHoCH/trail logic on the incumbent.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 
 from ..config import DataConfig
-from ..strategy.config import ExitPlan, SetupGrades, StrategyConfig
+from ..strategy.config import StrategyConfig
 from .positions import (
-    Direction, ExitReason, Position, Tranche, TrancheState,
+    ExitReason,
+    Position,
+    Tranche,
+    TrancheState,
 )
 from .specs import AccountSpec, SymbolSpec, spec_for_symbol
-
 
 ProgressFn = Callable[[str], None]
 
@@ -37,7 +39,7 @@ class BacktestResult:
     trades: pd.DataFrame
     tranches: pd.DataFrame
     equity_curve: pd.DataFrame
-    metrics: Dict
+    metrics: dict
     n_bars: int = 0
     n_signals: int = 0
 
@@ -66,9 +68,9 @@ class BacktestEngine:
         self,
         symbol_spec: SymbolSpec,
         account: AccountSpec,
-        cfg: Optional[StrategyConfig] = None,
-        bt_cfg: Optional[BacktestConfig] = None,
-        progress: Optional[ProgressFn] = None,
+        cfg: StrategyConfig | None = None,
+        bt_cfg: BacktestConfig | None = None,
+        progress: ProgressFn | None = None,
     ):
         self.spec = symbol_spec
         self.acct = account
@@ -77,13 +79,13 @@ class BacktestEngine:
         self.progress = progress or (lambda _m: None)
 
         self._pos_id = 0
-        self.positions: List[Position] = []
-        self.closed: List[Position] = []
+        self.positions: list[Position] = []
+        self.closed: list[Position] = []
 
         self.equity = float(self.bt.starting_equity)
         self.balance = float(self.bt.starting_equity)
         self.margin_used_quote = 0.0
-        self._eq_rows: List[Dict] = []
+        self._eq_rows: list[dict] = []
 
     @staticmethod
     def _zone_kind(sig) -> str:
@@ -110,7 +112,7 @@ class BacktestEngine:
                 return r
         return reasons[-1] if reasons else None
 
-    def _open_position(self, row: pd.Series, sig) -> Optional[Position]:
+    def _open_position(self, row: pd.Series, sig) -> Position | None:
         if len(self.positions) >= self.bt.max_open_positions:
             return None
         if self.equity < self.bt.starting_equity * self.bt.min_equity_fraction:
@@ -200,10 +202,10 @@ class BacktestEngine:
         self.positions.append(pos)
         return pos
 
-    def _process_bar(self, row: pd.Series, signals_this_bar: List) -> None:
+    def _process_bar(self, row: pd.Series, signals_this_bar: list) -> None:
         t = row["time"]
         h = float(row["high"]); l = float(row["low"])
-        o = float(row["open"]); c = float(row["close"])
+        float(row["open"]); c = float(row["close"])
         atr_m1 = float(row.get("atr_14", np.nan))
         atr_m5 = float(row.get("M5_atr_14", atr_m1))
         spread_pts = float(row.get("spread", 0))
@@ -290,7 +292,6 @@ class BacktestEngine:
 
     def _update_protective_stops(self, pos: Position, atr: float) -> None:
         """Move stops based on exit plan state."""
-        exits = self.cfg.exits
         # After TP1: move remaining tranches' SL to break-even
         if pos.tp1_hit and not pos.be_lock:
             for t in pos.tranches:
@@ -311,7 +312,6 @@ class BacktestEngine:
                 sl_hit = (l <= sl)
                 tp_hit = (tp is not None and h >= tp)
                 # Update trailing stop for T3 runner
-                trail_triggered = False
                 if pos.runner_trailing and tr.name == "T3" and pos.trail_sl is not None:
                     trail_dist = exits.runner_trail_atr_mult * atr_m5
                     new_trail = max(pos.trail_sl, h - trail_dist)
@@ -399,16 +399,16 @@ class BacktestEngine:
             self._realize(pos, tr)
         pos.close_time = t; pos.close_reason = reason
 
-    def run(self, m1_files: List[Path], signals_df: pd.DataFrame) -> BacktestResult:
+    def run(self, m1_files: list[Path], signals_df: pd.DataFrame) -> BacktestResult:
         signals_df = signals_df.copy()
         signals_df["time"] = pd.to_datetime(signals_df["time"], utc=True)
         # Index signals by bar open time
-        sig_by_time: Dict = {}
+        sig_by_time: dict = {}
         for rec in signals_df.itertuples(index=False):
             sig_by_time.setdefault(rec.time, []).append(rec)
         self.progress(f"Backtesting {len(signals_df):,} signals over {len(m1_files)} partitions...")
         total_rows = 0; n_signals = 0; warmup = True; warmup_rows = 500
-        for f_idx, f in enumerate(m1_files):
+        for _f_idx, f in enumerate(m1_files):
             try:
                 need = ["time","open","high","low","close","spread","tick_volume",
                         "atr_14","M5_atr_14",
@@ -421,7 +421,7 @@ class BacktestEngine:
                 self.progress(f"  skip {f.name}: {e}"); continue
             chunk["time"] = pd.to_datetime(chunk["time"], utc=True)
             chunk = chunk.sort_values("time", kind="mergesort").reset_index(drop=True)
-            for i, row in chunk.iterrows():
+            for _i, row in chunk.iterrows():
                 if warmup:
                     warmup_rows -= 1
                     if warmup_rows <= 0: warmup = False
@@ -436,7 +436,6 @@ class BacktestEngine:
         if self.positions:
             # Capture last close from the final equity row by re-scanning the last file
             # (simpler: mark all open to market at the last bar's close, stored as part of eq_rows via a tracked "last_close")
-            last_close = None
             last_t = None
             if self._eq_rows:
                 last_t = self._eq_rows[-1]["time"]
@@ -487,8 +486,8 @@ class BacktestEngine:
             metrics=metrics, n_bars=total_rows, n_signals=n_signals,
         )
 
-    def _compute_metrics(self, trades, tranches, eq) -> Dict:
-        m: Dict = {}
+    def _compute_metrics(self, trades, tranches, eq) -> dict:
+        m: dict = {}
         if trades.empty:
             m["error"] = "no trades"; return m
         pnl = trades["pnl_acct"].astype(float)
@@ -540,9 +539,9 @@ class BacktestEngine:
 
 def run_backtest(
     data_cfg: DataConfig, raw_symbol: str, signals_df: pd.DataFrame,
-    account: Optional[AccountSpec] = None, bt_cfg: Optional[BacktestConfig] = None,
-    strat_cfg: Optional[StrategyConfig] = None, symbol_overrides: Optional[Dict] = None,
-    progress: Optional[ProgressFn] = None,
+    account: AccountSpec | None = None, bt_cfg: BacktestConfig | None = None,
+    strat_cfg: StrategyConfig | None = None, symbol_overrides: dict | None = None,
+    progress: ProgressFn | None = None,
 ) -> BacktestResult:
     spec = spec_for_symbol(raw_symbol, symbol_overrides)
     acct = account or AccountSpec()

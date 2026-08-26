@@ -6,26 +6,25 @@ rows × ~200 cols ≈ 50 MB) instead of loading the full 2y × 535-col frame.
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 
 from ..config import DataConfig
-from ..data.storage import discover_partitions, _normalize_for_parquet, _atomic_write_parquet
+from ..data.storage import _atomic_write_parquet, _normalize_for_parquet, discover_partitions
 from .config import StrategyConfig
-from .signals import Signal, _strategy_columns, _evaluate_row
-
+from .signals import Signal, _evaluate_row, _strategy_columns
 
 ProgressFn = Callable[[str], None]
 
 
 @dataclass
 class ScanResult:
-    signals: List[Signal]
+    signals: list[Signal]
     rows_scanned: int
 
 
@@ -59,8 +58,8 @@ def _icol(df: pd.DataFrame, name: str) -> np.ndarray:
 def scan_aligned(
     data_cfg: DataConfig,
     raw_symbol: str,
-    cfg: Optional[StrategyConfig] = None,
-    progress: Optional[ProgressFn] = None,
+    cfg: StrategyConfig | None = None,
+    progress: ProgressFn | None = None,
 ) -> ScanResult:
     """Stream-scan every aligned M1 partition and return signals."""
     cfg = cfg or StrategyConfig()
@@ -75,14 +74,14 @@ def scan_aligned(
     files = sorted(files)
     need_cols = list(dict.fromkeys(_strategy_columns(cfg)))
 
-    signals: List[Signal] = []
+    signals: list[Signal] = []
     total_rows = 0
 
     warmup_n = 200  # rows carried across month boundary (zone-state continuity)
     prev_tail = pd.DataFrame()
-    state: Dict = {}  # running zone + trigger state across partitions
+    state: dict = {}  # running zone + trigger state across partitions
 
-    for f_idx, f in enumerate(files):
+    for _f_idx, f in enumerate(files):
         try:
             pf = pq.ParquetFile(str(f))
             have = set(pf.schema.names)
@@ -128,7 +127,7 @@ def scan_aligned(
         # inside _evaluate_row via the state dict so we catch retests that
         # happen N bars after a displacement (not just on the disp bar itself).
         candidate_mask = allowed & atr_ok
-        candidate_idx = np.nonzero(candidate_mask[start_i:])[0] + start_i
+        candidate_idx: list[int] = [int(x) for x in np.nonzero(candidate_mask[start_i:])[0] + start_i]
 
         # Advance state across warmup rows first (so zone mitigations stay
         # consistent at the month boundary) without emitting signals.
@@ -155,7 +154,7 @@ def scan_aligned(
     # Final dedupe (same direction within 5 M1 bars = same setup)
     signals.sort(key=lambda s: s.time)
     grade_rank = {'A+':4,'A':3,'B':2,'C':1}
-    deduped: List[Signal] = []
+    deduped: list[Signal] = []
     for s in signals:
         if deduped and (s.time - deduped[-1].time) < pd.Timedelta(minutes=5) and s.direction == deduped[-1].direction:
             if grade_rank.get(s.grade,0) > grade_rank.get(deduped[-1].grade,0):
@@ -173,10 +172,11 @@ def scan_aligned(
 
 def write_signals(data_cfg: DataConfig,
                   raw_symbol: str,
-                  signals: List[Signal]) -> Path:
+                  signals: list[Signal]) -> Path:
     """Write signal list as a single parquet under data/processed/signals/."""
     import pyarrow as pa
     import pyarrow.parquet as pq
+
     from .signals import signals_to_frame
 
     out_dir = ensure_dir(data_cfg.processed_root / "signals" / f"symbol={raw_symbol}")

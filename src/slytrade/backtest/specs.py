@@ -11,15 +11,13 @@ forex, crypto, indices, energies.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Optional
 
 import numpy as np
-
 
 # --------------------------------------------------------------------------- #
 # Asset-class defaults (used only when no live/persisted info is available)
 # --------------------------------------------------------------------------- #
-_ASSET_DEFAULTS: Dict[str, dict] = {
+_ASSET_DEFAULTS: dict[str, dict] = {
     # Metals: standard 100-oz contract, tick size 0.01 (2-digit) or 0.001 (3-digit raw)
     "XAU": {"contract_size": 100.0, "point": 0.001, "digits": 3},
     "XAG": {"contract_size": 5000.0, "point": 0.001, "digits": 3},
@@ -88,7 +86,7 @@ def _infer_base(symbol: str) -> str:
     return base[:3].upper()
 
 
-def spec_for_symbol(symbol: str, overrides: Optional[Dict] = None) -> SymbolSpec:
+def spec_for_symbol(symbol: str, overrides: dict | None = None) -> SymbolSpec:
     """Build a SymbolSpec using defaults inferred from symbol name.
 
     `overrides` can inject live MT5 fields (point/contract_size/digits/etc.).
@@ -113,7 +111,7 @@ class AccountSpec:
     leverage: int = 2000                # used for margin check only
     # Conversion: profit_currency -> account_currency.
     # For ZAR accounts trading XAUUSD (profit in USD), we need USD/ZAR.
-    fx_to_account: Dict[str, float] = field(default_factory=lambda: {"USD": 18.5})
+    fx_to_account: dict[str, float] = field(default_factory=lambda: {"USD": 18.5})
     commission_per_lot_rt: float = 0.0  # Exness zero/standard: 0; raw: ~$3/lot/side
     # Slippage in points applied on stop/limit fills (guesstimated)
     slippage_points: int = 5

@@ -15,10 +15,7 @@ price, exit reason, and P&L.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import Dict, List, Optional
 
-import numpy as np
 import pandas as pd
 
 
@@ -56,11 +53,11 @@ class Tranche:
     lots: float                # actual lots
     entry: float               # entry price (same for all tranches)
     sl: float                  # current stop price
-    tp: Optional[float]        # current target price (None for runner when trailing)
+    tp: float | None        # current target price (None for runner when trailing)
     state: str = TrancheState.OPEN
-    exit_price: Optional[float] = None
-    exit_reason: Optional[str] = None
-    exit_time: Optional[pd.Timestamp] = None
+    exit_price: float | None = None
+    exit_reason: str | None = None
+    exit_time: pd.Timestamp | None = None
     exit_bars: int = 0
 
     def pnl_ccy(self, price: float, direction: int, spec) -> float:
@@ -104,29 +101,29 @@ class Position:
     swing_target_price: float
     # Confluence / context
     trigger_tf: str
-    ob_tf: Optional[str]
+    ob_tf: str | None
     zone_kind: str                 # "OB" / "FVG"
     killzone: str
     session: str
-    confluence_tags: List[str] = field(default_factory=list)
-    htf_bias_summary: Dict[str, int] = field(default_factory=dict)
+    confluence_tags: list[str] = field(default_factory=list)
+    htf_bias_summary: dict[str, int] = field(default_factory=dict)
 
     # Tranches
-    tranches: List[Tranche] = field(default_factory=list)
+    tranches: list[Tranche] = field(default_factory=list)
 
     # State flags
     tp1_hit: bool = False
     tp2_hit: bool = False
     be_lock: bool = False          # after TP1: SL moved to entry for T2+T3
     runner_trailing: bool = False  # after TP2: SL trails by ATR for T3
-    trail_sl: Optional[float] = None
+    trail_sl: float | None = None
     bars_held: int = 0
     max_favorable_excursion: float = 0.0
     max_adverse_excursion: float = 0.0
 
     # Exit metadata (filled when fully closed)
-    close_time: Optional[pd.Timestamp] = None
-    close_reason: Optional[str] = None
+    close_time: pd.Timestamp | None = None
+    close_reason: str | None = None
 
     # Internal
     _entry_cost_paid: bool = False
@@ -151,11 +148,11 @@ class Position:
             # Fallback: single T1
             active = [("T1", 1.0, self.tp1)]
 
-        n_active = len(active)
-        alloc: Dict[str, float] = {}
+        len(active)
+        alloc: dict[str, float] = {}
         remaining = self.total_lots
         # Snap all but last to volume_step
-        for i, (name, frac, tp) in enumerate(active):
+        for i, (name, frac, _tp) in enumerate(active):
             if i < len(active) - 1:
                 lots = snap(self.total_lots * frac)
                 # Ensure at least volume_min if we allocated >= volume_min in raw terms
@@ -182,7 +179,7 @@ class Position:
                 self.entry_price, self.initial_sl, self.tp1))
 
     # ------------------------------------------------------------------ #
-    def open_tranches(self) -> List[Tranche]:
+    def open_tranches(self) -> list[Tranche]:
         return [t for t in self.tranches if t.state == TrancheState.OPEN]
 
     def is_closed(self) -> bool:
@@ -200,7 +197,7 @@ class Position:
 
     # ------------------------------------------------------------------ #
     def close_tranche(self, name: str, price: float, reason: str,
-                      time: pd.Timestamp) -> Optional[Tranche]:
+                      time: pd.Timestamp) -> Tranche | None:
         for t in self.tranches:
             if t.name == name and t.state == TrancheState.OPEN:
                 t.exit_price = price

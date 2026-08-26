@@ -39,9 +39,9 @@ whose features are attached, for causality sanity-checks.
 from __future__ import annotations
 
 import shutil
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
 
 import pandas as pd
 import pyarrow.parquet as pq
@@ -294,14 +294,8 @@ class AlignedDiagnostics:
     columns: int = 0
     start: str = ""
     end: str = ""
-    htf_cols: dict[str, int] | None = None
-    issues: list[str] | None = None
-
-    def __post_init__(self) -> None:
-        if self.htf_cols is None:
-            self.htf_cols = {}
-        if self.issues is None:
-            self.issues = []
+    htf_cols: dict[str, int] = field(default_factory=dict)
+    issues: list[str] = field(default_factory=list)
 
 
 def inspect_aligned(data_cfg: DataConfig, raw_symbol: str) -> AlignedDiagnostics:

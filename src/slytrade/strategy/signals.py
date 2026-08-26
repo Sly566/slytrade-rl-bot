@@ -15,9 +15,10 @@ Hard-gated checklist philosophy (per Sly's spec):
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
+from collections.abc import Callable
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
@@ -25,7 +26,7 @@ import pandas as pd
 if TYPE_CHECKING:
     pass
 
-from .config import StrategyConfig, ConfluenceConfig, ExitPlan
+from .config import ConfluenceConfig, StrategyConfig
 
 
 # --------------------------------------------------------------------------- #
@@ -43,19 +44,19 @@ class Signal:
     risk_per_unit: float                 # |entry - stop| (USD per unit for XAUUSD)
     grade: str                           # "A+", "A", "B", "C"
     risk_pct: float                      # fraction of equity (from SetupGrades)
-    confluence: List[str] = field(default_factory=list)
-    fails: List[str] = field(default_factory=list)
+    confluence: list[str] = field(default_factory=list)
+    fails: list[str] = field(default_factory=list)
     # Debug
     trigger_tf: str = "M5"
-    ob_tf: Optional[str] = None
-    ob_top: Optional[float] = None
-    ob_bottom: Optional[float] = None
-    fvg_top: Optional[float] = None
-    fvg_bottom: Optional[float] = None
-    swing_target_tf: Optional[str] = None
-    swing_target_price: Optional[float] = None
+    ob_tf: str | None = None
+    ob_top: float | None = None
+    ob_bottom: float | None = None
+    fvg_top: float | None = None
+    fvg_bottom: float | None = None
+    swing_target_tf: str | None = None
+    swing_target_price: float | None = None
     atr_at_entry: float = 0.0
-    htf_bias_summary: Dict[str, int] = field(default_factory=dict)
+    htf_bias_summary: dict[str, int] = field(default_factory=dict)
     session: str = ""
     killzone: str = ""
 
@@ -78,7 +79,7 @@ class Signal:
 # --------------------------------------------------------------------------- #
 
 
-def _price_within_ob_bull(row, tf: str, close_col: str = 'close') -> Optional[Tuple[float, float]]:
+def _price_within_ob_bull(row, tf: str, close_col: str = 'close') -> tuple[float, float] | None:
     """If current M1 close is inside the bullish OB on `tf`, return (ob_top, ob_bottom)."""
     top = row.get(f'{tf}_bull_ob_top', np.nan)
     bot = row.get(f'{tf}_bull_ob_bottom', np.nan)
@@ -93,7 +94,7 @@ def _price_within_ob_bull(row, tf: str, close_col: str = 'close') -> Optional[Tu
     return None
 
 
-def _price_within_ob_bear(row, tf: str, close_col: str = 'close') -> Optional[Tuple[float, float]]:
+def _price_within_ob_bear(row, tf: str, close_col: str = 'close') -> tuple[float, float] | None:
     top = row.get(f'{tf}_bear_ob_top', np.nan)
     bot = row.get(f'{tf}_bear_ob_bottom', np.nan)
     mit = row.get(f'{tf}_bear_ob_mitigated', True)
@@ -105,7 +106,7 @@ def _price_within_ob_bear(row, tf: str, close_col: str = 'close') -> Optional[Tu
     return None
 
 
-def _price_touching_fvg_bull(row, tf: str, close_col: str = 'close') -> Optional[Tuple[float, float]]:
+def _price_touching_fvg_bull(row, tf: str, close_col: str = 'close') -> tuple[float, float] | None:
     """Bull FVG: low[i] > high[i-2]; gap is (high[i-2], low[i]). Price returning
     to the gap = FVG fill area."""
     top = row.get(f'{tf}_bull_fvg_top', np.nan)
@@ -119,7 +120,7 @@ def _price_touching_fvg_bull(row, tf: str, close_col: str = 'close') -> Optional
     return None
 
 
-def _price_touching_fvg_bear(row, tf: str, close_col: str = 'close') -> Optional[Tuple[float, float]]:
+def _price_touching_fvg_bear(row, tf: str, close_col: str = 'close') -> tuple[float, float] | None:
     top = row.get(f'{tf}_bear_fvg_top', np.nan)
     bot = row.get(f'{tf}_bear_fvg_bottom', np.nan)
     mit = row.get(f'{tf}_bear_fvg_mitigated', True)
@@ -138,18 +139,18 @@ def _price_touching_fvg_bear(row, tf: str, close_col: str = 'close') -> Optional
 def _grade(direction: int,
            row: pd.Series,
            cfg: ConfluenceConfig,
-           bonus_killzone: bool) -> Tuple[str, List[str]]:
+           bonus_killzone: bool) -> tuple[str, list[str]]:
     """Return (grade, list_of_confluence_tags). 'fail' if no grade met.
 
     Tags are only added for tiers that *pass*, so we don't pollute the list
     with partial-tier fragments (which caused duplicate TF tags when a higher
     tier checked a TF that a lower tier also checked).
     """
-    tags: List[str] = []
+    tags: list[str] = []
 
-    def _all_agree(tfs: Tuple[str, ...]) -> Tuple[bool, List[str]]:
+    def _all_agree(tfs: tuple[str, ...]) -> tuple[bool, list[str]]:
         """Return (all_ok, [tag_for_each_agreeing_tf])."""
-        ok_tags: List[str] = []
+        ok_tags: list[str] = []
         for tf in tfs:
             b = row.get(f'{tf}_major_bias', 0)
             if pd.isna(b) or int(b) != direction:
@@ -157,8 +158,8 @@ def _grade(direction: int,
             ok_tags.append(f'{tf}_bias_aligned')
         return (True, ok_tags)
 
-    grade: Optional[str] = None
-    extra: List[str] = []
+    grade: str | None = None
+    extra: list[str] = []
 
     # A+ requires D1+H4+H1 all aligned AND price in pd_zone of pd_range_tf
     ok, tier_tags = _all_agree(cfg.a_plus_required_tfs)
@@ -207,7 +208,7 @@ def _grade(direction: int,
 # Killzone/session filter
 # --------------------------------------------------------------------------- #
 
-def _killzone_tag(row, cfg_sess) -> Tuple[bool, str]:
+def _killzone_tag(row, cfg_sess) -> tuple[bool, str]:
     """Return (allowed, tag) for the current M1 bar's session."""
     in_lon_kz = bool(row.get('kz_london', False))
     in_ny_kz  = bool(row.get('kz_ny', False))
@@ -239,7 +240,7 @@ def _killzone_tag(row, cfg_sess) -> Tuple[bool, str]:
 # --------------------------------------------------------------------------- #
 
 def _runner_target(direction: int, row, cfg: ConfluenceConfig,
-                   entry: float, risk: float) -> Tuple[Optional[str], Optional[float]]:
+                   entry: float, risk: float) -> tuple[str | None, float | None]:
     """Runner target = nearest opposing major swing on a bias-aligned TF.
 
     We look at M15, H1, H4, D1 in that order (closest-liquidity first). The
@@ -249,7 +250,6 @@ def _runner_target(direction: int, row, cfg: ConfluenceConfig,
     """
     runner_min_r = 2.0
     runner_max_r = 8.0
-    fallback_r = 3.0
     candidates = []
     for tf in ('M15', 'H1', 'H4', 'D1'):
         b = row.get(f'{tf}_major_bias', 0)
@@ -286,7 +286,7 @@ def _evaluate_row(i: int,
                   # State carried across rows: dict[str, dict] tracking per-TF
                   # active (unmitigated) OB/FVG zones after a displacement.
                   state: dict,
-                  ) -> Optional[Signal]:
+                  ) -> Signal | None:
     """Evaluate one M1 bar and return a Signal if all gates pass, else None.
 
     `state` is mutated across rows; it tracks the most recent unmitigated
@@ -371,7 +371,7 @@ def _evaluate_row(i: int,
     bull_window = _within_window(state.get('_last_bull_trigger'))
     bear_window = _within_window(state.get('_last_bear_trigger'))
 
-    candidates: List[int] = []
+    candidates: list[int] = []
     if bull_window and cfg.confluence.accept_longs: candidates.append(1)
     if bear_window and cfg.confluence.accept_shorts: candidates.append(-1)
     if not candidates:
@@ -528,7 +528,7 @@ def _evaluate_row(i: int,
 # Batch scan
 # --------------------------------------------------------------------------- #
 
-def _strategy_columns(cfg: StrategyConfig) -> List[str]:
+def _strategy_columns(cfg: StrategyConfig) -> list[str]:
     """Return the list of columns actually needed by the strategy engine."""
     cols = ['time', 'open', 'high', 'low', 'close', 'atr_14', 'session',
             'kz_asian', 'kz_london', 'kz_ny', 'london_open_30', 'ny_open_30',
@@ -568,15 +568,14 @@ def _strategy_columns(cfg: StrategyConfig) -> List[str]:
 
 
 def _load_aligned_partitions(root: Path, symbol: str,
-                             columns: Optional[List[str]] = None) -> pd.DataFrame:
+                             columns: list[str] | None = None) -> pd.DataFrame:
     """Load aligned M1 partitions into one frame (month-by-month concat)."""
-    import pyarrow.parquet as pq
     from ..data.storage import discover_partitions
     base = root / f"symbol={symbol}" / "timeframe=M1"
     files = discover_partitions(base, "**/*.parquet")
     if not files:
         return pd.DataFrame()
-    frames: List[pd.DataFrame] = []
+    frames: list[pd.DataFrame] = []
     for f in sorted(files):
         try:
             frames.append(pd.read_parquet(f, columns=columns))
@@ -595,8 +594,8 @@ def _load_aligned_partitions(root: Path, symbol: str,
 
 
 def scan(df: pd.DataFrame,
-         cfg: Optional[StrategyConfig] = None,
-         progress: Optional[Callable[[str], None]] = None) -> List[Signal]:
+         cfg: StrategyConfig | None = None,
+         progress: Callable[[str], None] | None = None) -> list[Signal]:
     """Scan an M1-aligned DataFrame and return a list of Signal objects.
 
     `df` must be sorted by `time` ascending and contain the full set of
@@ -613,10 +612,10 @@ def scan(df: pd.DataFrame,
     df['time'] = pd.to_datetime(df['time'], utc=True, errors='coerce')
     df = df.dropna(subset=['time']).sort_values('time', kind='mergesort').reset_index(drop=True)
 
-    signals: List[Signal] = []
+    signals: list[Signal] = []
     n = len(df)
     warmup = 500  # first 500 M1 bars (~8 hours) for indicator warmup
-    state: Dict = {}
+    state: dict = {}
 
     progress(f"Scanning {n:,} M1 bars for setups ...")
     report_every = max(n // 20, 1)
@@ -640,7 +639,7 @@ def scan(df: pd.DataFrame,
     # Dedupe: same direction within 5 M1 bars = same setup, keep higher grade
     signals.sort(key=lambda s: s.time)
     grade_rank = {'A+': 4, 'A': 3, 'B': 2, 'C': 1}
-    deduped: List[Signal] = []
+    deduped: list[Signal] = []
     for s in signals:
         if deduped and (s.time - deduped[-1].time) < pd.Timedelta(minutes=5) \
                 and s.direction == deduped[-1].direction:
@@ -653,7 +652,7 @@ def scan(df: pd.DataFrame,
 
 
 
-def signals_to_frame(signals: List[Signal]) -> pd.DataFrame:
+def signals_to_frame(signals: list[Signal]) -> pd.DataFrame:
     """Convert a list of Signal objects to a DataFrame (for inspection/CSV)."""
     if not signals:
         return pd.DataFrame()
