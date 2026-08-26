@@ -1,4 +1,4 @@
-"""SlyTrade v0.9.3 CLI — ICT/SMC scalping bot (Layers 0-5 + live scalper)."""
+"""SlyTrade v0.9.4 CLI — ICT/SMC scalping bot (Layers 0-5 + live scalper)."""
 from __future__ import annotations
 
 import importlib.util
@@ -10,7 +10,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-app = typer.Typer(help="SlyTrade ICT/SMC scalper v0.9.3")
+app = typer.Typer(help="SlyTrade ICT/SMC scalper v0.9.4")
 console = Console()
 
 
@@ -24,7 +24,7 @@ def _hint_bridge():
 @app.command()
 def doctor():
     """Check dependencies and data dirs."""
-    table = Table(title="SlyTrade Doctor v0.9.3"); table.add_column("Check"); table.add_column("Status")
+    table = Table(title="SlyTrade Doctor v0.9.4"); table.add_column("Check"); table.add_column("Status")
     for mod in ["numpy", "pandas", "pyarrow", "pydantic", "typer", "rich"]:
         table.add_row(f"required:{mod}", "OK" if importlib.util.find_spec(mod) else "MISSING")
     for opt in ["mt5linux"]:
@@ -251,7 +251,7 @@ def live_cmd(
                                       help="Disable persona gating: emit ALL signals (long+short, all grades, "
                                            "H1+M15+M5 OBs+FVGs, C-grades, Asian+off-hours) for pre-RL diagnostics."),
 ):
-    """Run the live trading loop. Default: v0.9.3 champion persona (long-only A+/A/B RETEST_OB).
+    """Run the live trading loop. Default: v0.9.4 champion persona (long-only A+/A/B RETEST_OB).
 
     Use --all to fire EVERY setup the engine sees — longs AND shorts, all
     grades, all sessions, ALL 4 setup kinds (RETEST_OB, RETEST_FVG, LIQ_SWEEP,
@@ -266,8 +266,8 @@ def live_cmd(
         resolve_symbol_spec,
         rl_training_persona,
     )
-    persona_label = "SCALPER-UNRESTRICTED (long+short, all 4 setups)" if unrestricted else "v0.9.3 champion (long-only A+/A/B RETEST_OB)"
-    console.print(f"[bold]SlyTrade LIVE v0.9.3[/bold] symbol={raw_symbol} live={live} "
+    persona_label = "SCALPER-UNRESTRICTED (long+short, all 4 setups)" if unrestricted else "v0.9.4 champion (long-only A+/A/B RETEST_OB)"
+    console.print(f"[bold]SlyTrade LIVE v0.9.4[/bold] symbol={raw_symbol} live={live} "
                   f"risk_cap={risk_cap*100:.1f}% persona={persona_label} verbose={verbose}")
     mt5 = connect_mt5(host, port)
 

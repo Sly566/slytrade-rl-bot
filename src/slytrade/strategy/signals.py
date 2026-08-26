@@ -478,14 +478,24 @@ def _evaluate_row(i: int,
             continue
         if direction == -1 and c > float(sweep_extreme):
             continue
-        # Require displacement/BOS in reversal direction (M1 or trigger_tf)
+        # Require displacement/BOS in reversal direction (M1 or trigger_tf).
+        # In persona mode (champion) keep the vol-spike confirmation on BOS
+        # legs to filter fakeouts; in --all unrestricted mode we want to SEE
+        # every displacement+BOS combo so the RL agent learns which ones
+        # work, so we drop the vol-spike gate (low-volume grind-downs are
+        # real setups, as Sly saw in the 20:14 selloff where vol was sub-2x
+        # SMA for 45 min while price dropped $10).
         m1_disp = bool(row.get('bull_disp' if direction==1 else 'bear_disp', False))
         tf_disp = bool(row.get(f'{trigger_tf}_{"bull" if direction==1 else "bear"}_disp', False))
         m1_bos = bool(row.get('minor_bos_up' if direction==1 else 'minor_bos_dn', False)) or \
                  bool(row.get('major_bos_up' if direction==1 else 'major_bos_dn', False))
         vol_surge = bool(row.get('vol_spike', False)) or bool(row.get(f'{trigger_tf}_vol_spike', False))
-        if not (m1_disp or tf_disp or (m1_bos and vol_surge)):
-            continue
+        if cfg.confluence.persona_gating:
+            if not (m1_disp or tf_disp or (m1_bos and vol_surge)):
+                continue
+        else:
+            if not (m1_disp or tf_disp or m1_bos):
+                continue
         # One entry per sweep event (dedupe by timestamp)
         sweep_key = f"_swept_{direction}_{last_sweep_ts.isoformat()}"
         if state.get(sweep_key):
@@ -568,13 +578,25 @@ def _evaluate_row(i: int,
             m1_bos = bool(row.get('minor_bos_dn', False)) or bool(row.get('major_bos_dn', False))
         if not (bos_now or m1_bos):
             continue
-        # Require displacement + volume confirmation (no fakeouts)
+        # Momentum confirmation. Champion (persona_gating=True) requires
+        # displacement AND volume spike (PF 2.00 preservation); unrestricted
+        # --all mode relaxes this to displacement OR BOS (vol spike is a
+        # bonus tag, not a gate) so we don't miss low-volume grind
+        # continuations like the 20:14-20:20 selloff Sly watched go
+        # signal-less for 45 minutes.
         disp_flag = f'{trigger_tf}_bull_disp' if direction == 1 else f'{trigger_tf}_bear_disp'
         m1_disp_flag = 'bull_disp' if direction == 1 else 'bear_disp'
         has_disp = bool(row.get(disp_flag, False)) or bool(row.get(m1_disp_flag, False))
         has_vol = bool(row.get(f'{trigger_tf}_vol_spike', False)) or bool(row.get('vol_spike', False))
-        if not (has_disp and has_vol):
-            continue
+        if cfg.confluence.persona_gating:
+            if not (has_disp and has_vol):
+                continue
+        else:
+            if not has_disp:
+                # In unrestricted mode a pure BOS (no displacement flag yet)
+                # is acceptable -- displacement often prints the bar after a
+                # sharp BOS break, and waiting a bar costs us the scalp.
+                pass
         # Dedupe per BOS bar
         bos_key = f"_bos_{direction}_{t_now.isoformat()}"
         if state.get(bos_key):
