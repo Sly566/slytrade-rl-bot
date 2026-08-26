@@ -186,7 +186,7 @@ class TestAlignAllEndToEnd:
         res = align_all(data_cfg, symbol="TEST", raw_symbol=sym)
         assert res.rows > 0
         assert res.files > 0
-        assert res.columns > 87
+        assert res.columns > 91
         for tf in HTFS:
             assert res.per_tf_cols[tf] > 50
 
@@ -212,7 +212,7 @@ class TestAlignAllEndToEnd:
         _write_processed_bars(data_cfg.processed_bars_path, sym, "M1", proc)
         res = align_all(data_cfg, symbol="TEST", raw_symbol=sym)
         assert res.rows == 2000
-        assert res.columns == 87
+        assert res.columns == 91
 
 
 class TestCausalityEndToEnd:

@@ -44,6 +44,7 @@ class Signal:
     risk_per_unit: float                 # |entry - stop| (USD per unit for XAUUSD)
     grade: str                           # "A+", "A", "B", "C"
     risk_pct: float                      # fraction of equity (from SetupGrades)
+    setup_kind: str = "RETEST_OB"        # RETEST_OB | RETEST_FVG | LIQ_SWEEP | BOS_CONT
     confluence: list[str] = field(default_factory=list)
     fails: list[str] = field(default_factory=list)
     # Debug
@@ -312,7 +313,10 @@ def _evaluate_row(i: int,
     # displacement/BOS on the same TF. It stays active while mitigated==False,
     # and expires after `retest_window` M1 bars.
     trigger_tf = cfg.trigger_tf
-    retest_window = 60  # M1 bars (~1 hour) to wait for a retest after displacement
+    # Retest window: 60 M1 bars (~1h) in champion persona, 120 bars (~2h) in
+    # unrestricted/RL mode so we catch longer displacement-to-pullback cycles
+    # common on XAUUSD M5.
+    retest_window = 60 if cfg.confluence.persona_gating else 120
     t_now = row['time']
 
     def _update_zone(tf: str, side: str, kind: str):
@@ -380,6 +384,213 @@ def _evaluate_row(i: int,
         candidates.append(1)
     if bear_window and (cfg.confluence.accept_shorts or not cfg.confluence.persona_gating):
         candidates.append(-1)
+
+    # ================================================================== #
+    # SETUP A: LIQUIDITY SWEEP SCALP (stop-run reversal)
+    # Wick takes out a recent minor swing, closes back, then a
+    # displacement candle fires in the reversal direction. Enter the
+    # close of that displacement, SL just beyond the sweep wick extreme,
+    # quick 0.85R TP.
+    # ================================================================== #
+    for direction in (1, -1):
+        if direction not in candidates:
+            continue
+        side = 'bull' if direction == 1 else 'bear'
+        # Need a fresh sweep on trigger_tf OR on M1 directly
+        sweep_flag = f'{trigger_tf}_{side}_liq_sweep' if direction == 1 else f'{trigger_tf}_bear_liq_sweep'
+        if direction == -1:
+            sweep_flag = f'{trigger_tf}_bear_liq_sweep'
+        # Also check M1 directly for sweeps (faster signal)
+        m1_sweep = bool(row.get('bull_liq_sweep' if direction == 1 else 'bear_liq_sweep', False))
+        tf_sweep = bool(row.get(sweep_flag, False))
+        if not (m1_sweep or tf_sweep):
+            # Also allow: displacement fires within 3 bars AFTER a sweep
+            # was registered (sweep_px active + fresh displacement now)
+            disp_now = bool(row.get(f'{trigger_tf}_{side}_disp', False) if direction==1
+                            else row.get(f'{trigger_tf}_bear_disp', False))
+            m1_disp_now = bool(row.get('bull_disp' if direction == 1 else 'bear_disp', False))
+            sweep_active = pd.notna(row.get('bull_sweep_px' if direction==1 else 'bear_sweep_px', np.nan))
+            if not ((disp_now or m1_disp_now) and sweep_active):
+                continue
+        # Get the sweep extreme for SL
+        sweep_col = 'bull_sweep_px' if direction == 1 else 'bear_sweep_px'
+        tf_sweep_col = f'{trigger_tf}_{sweep_col}'
+        sweep_extreme = row.get(tf_sweep_col, np.nan)
+        if pd.isna(sweep_extreme):
+            sweep_extreme = row.get(sweep_col, np.nan)
+        if pd.isna(sweep_extreme):
+            continue
+        # Require displacement in reversal direction NOW (same bar or next)
+        m1_disp = bool(row.get('bull_disp' if direction==1 else 'bear_disp', False))
+        tf_disp = bool(row.get(f'{trigger_tf}_bull_disp' if direction==1 else f'{trigger_tf}_bear_disp', False))
+        vol_surge = bool(row.get('vol_spike', False)) or bool(row.get(f'{trigger_tf}_vol_spike', False))
+        if not (m1_disp or tf_disp or vol_surge):
+            continue
+        # Dedupe: don't re-fire on the same sweep level
+        sweep_key = f"_swept_{direction}_{float(sweep_extreme):.2f}"
+        if state.get(sweep_key):
+            continue
+        state[sweep_key] = True
+
+        entry = c
+        buffer_amt = cfg.exits.ob_invalidation_buffer * atr * 1.5  # slightly wider for sweep wicks
+        if direction == 1:
+            stop = float(sweep_extreme) - buffer_amt
+        else:
+            stop = float(sweep_extreme) + buffer_amt
+        risk = abs(entry - stop)
+        if risk <= 0 or risk < 0.2 * atr or risk > 7.0 * atr or risk > 40.0:
+            continue
+        risk_atr = risk / atr if atr > 0 else 0
+        if cfg.confluence.persona_gating and risk_atr < cfg.confluence.min_risk_atr:
+            continue
+
+        # Grade sweeps as B/C: sweep scalps are quick, smaller conviction
+        # unless we have HTF bias alignment + killzone
+        grade, conf_tags = _grade(direction, row, cfg.confluence,
+                                  bonus_killzone=('+' in kz_tag or 'open30' in kz_tag))
+        if grade == 'fail':
+            # For scalp setups in unrestricted mode, allow C-grade fallback even if
+            # strict HTF alignment fails — the sweep itself is the edge
+            if cfg.confluence.persona_gating:
+                continue
+            grade = 'C'
+            conf_tags = ['scalp_fallback_c']
+        elif cfg.confluence.persona_gating and grade not in cfg.confluence.accept_grades:
+            continue
+
+        if direction == 1:
+            tp1 = entry + cfg.exits.tp1_r * risk
+        else:
+            tp1 = entry - cfg.exits.tp1_r * risk
+        tp2 = tp1  # one-shot for scalps
+        tgt_tf, tgt_px = _runner_target(direction, row, cfg.confluence, entry, risk)
+        if tgt_px is None:
+            tgt_px = entry + direction * 2.0 * risk
+            tgt_tf = '2R_scalp'
+        risk_pct = cfg.grades.risk_fraction(grade) * 0.5  # half-size on quick scalps
+
+        tags = [f'trigger_{trigger_tf}', 'setup_LIQ_SWEEP'] + conf_tags
+        tags.append(f'grade_{grade}')
+        tags.append(f'kz_{kz_tag}')
+        if vol_surge:
+            tags.append('vol_surge')
+        bias_summary = {}
+        for tf in ('W1','D1','H4','H1','M30','M15','M5'):
+            b = row.get(f'{tf}_major_bias', 0)
+            if pd.notna(b): bias_summary[tf] = int(b)
+
+        sig = Signal(
+            time=t_now, direction=direction, entry=entry, stop=stop,
+            tp1=tp1, tp2=tp2, tp_runner=float(tgt_px), risk_per_unit=risk,
+            grade=grade, risk_pct=risk_pct, setup_kind="LIQ_SWEEP",
+            confluence=tags, swing_target_tf=tgt_tf, swing_target_price=float(tgt_px),
+            atr_at_entry=atr, htf_bias_summary=bias_summary,
+            session=str(row.get('session','')), killzone=kz_tag,
+        )
+        return sig
+
+    # ================================================================== #
+    # SETUP B: BOS / CHoCH CONTINUATION SCALP
+    # Minor/major BOS fires with displacement + vol spike — ride the
+    # impulse, don't wait for retest. SL below last swing low (bull) or
+    # above last swing high (bear), TP at 0.85R momentum scalp.
+    # ================================================================== #
+    for direction in (1, -1):
+        if direction not in candidates:
+            continue
+        # Fresh BOS/CHoCH on trigger_tf in this direction
+        if direction == 1:
+            bos_now = bool(row.get(f'{trigger_tf}_minor_bos_up', False)) or \
+                      bool(row.get(f'{trigger_tf}_major_bos_up', False)) or \
+                      bool(row.get(f'{trigger_tf}_major_choch_up', False))
+            m1_bos = bool(row.get('minor_bos_up', False)) or bool(row.get('major_bos_up', False))
+        else:
+            bos_now = bool(row.get(f'{trigger_tf}_minor_bos_dn', False)) or \
+                      bool(row.get(f'{trigger_tf}_major_bos_dn', False)) or \
+                      bool(row.get(f'{trigger_tf}_major_choch_dn', False))
+            m1_bos = bool(row.get('minor_bos_dn', False)) or bool(row.get('major_bos_dn', False))
+        if not (bos_now or m1_bos):
+            continue
+        # Require displacement + volume confirmation (no fakeouts)
+        disp_flag = f'{trigger_tf}_bull_disp' if direction == 1 else f'{trigger_tf}_bear_disp'
+        m1_disp_flag = 'bull_disp' if direction == 1 else 'bear_disp'
+        has_disp = bool(row.get(disp_flag, False)) or bool(row.get(m1_disp_flag, False))
+        has_vol = bool(row.get(f'{trigger_tf}_vol_spike', False)) or bool(row.get('vol_spike', False))
+        if not (has_disp and has_vol):
+            continue
+        # Dedupe per BOS bar
+        bos_key = f"_bos_{direction}_{t_now.isoformat()}"
+        if state.get(bos_key):
+            continue
+        state[bos_key] = True
+
+        # SL anchor: last opposing minor swing (the level just broken FROM)
+        if direction == 1:
+            sl_anchor = row.get(f'{trigger_tf}_minor_swing_low', np.nan)
+            if pd.isna(sl_anchor): sl_anchor = row.get('minor_swing_low', np.nan)
+        else:
+            sl_anchor = row.get(f'{trigger_tf}_minor_swing_high', np.nan)
+            if pd.isna(sl_anchor): sl_anchor = row.get('minor_swing_high', np.nan)
+        if pd.isna(sl_anchor):
+            continue
+        entry = c
+        buffer_amt = cfg.exits.ob_invalidation_buffer * atr
+        if direction == 1:
+            stop = float(sl_anchor) - buffer_amt
+        else:
+            stop = float(sl_anchor) + buffer_amt
+        risk = abs(entry - stop)
+        if risk <= 0 or risk < 0.5 * atr or risk > 7.0 * atr or risk > 40.0:
+            continue
+        risk_atr = risk / atr if atr > 0 else 0
+        if cfg.confluence.persona_gating and risk_atr < cfg.confluence.min_risk_atr:
+            # Contiuation scalps naturally have tighter stops than retests;
+            # relax min_risk in persona mode for BOS_CONT
+            pass
+
+        grade, conf_tags = _grade(direction, row, cfg.confluence,
+                                  bonus_killzone=('+' in kz_tag or 'open30' in kz_tag))
+        if grade == 'fail':
+            if cfg.confluence.persona_gating:
+                continue
+            grade = 'C'
+            conf_tags = ['scalp_fallback_c']
+        elif cfg.confluence.persona_gating and grade not in cfg.confluence.accept_grades:
+            # Champion persona only: only BOS_CONT with A+/A/B grade
+            continue
+
+        if direction == 1:
+            tp1 = entry + cfg.exits.tp1_r * risk
+        else:
+            tp1 = entry - cfg.exits.tp1_r * risk
+        tp2 = tp1
+        tgt_tf, tgt_px = _runner_target(direction, row, cfg.confluence, entry, risk)
+        if tgt_px is None:
+            tgt_px = entry + direction * 2.0 * risk
+            tgt_tf = '2R_scalp'
+        # BOS continuation scalps are half-size by default (quick in-out)
+        risk_pct = cfg.grades.risk_fraction(grade) * 0.6
+
+        tags = [f'trigger_{trigger_tf}', 'setup_BOS_CONT'] + conf_tags
+        tags.append(f'grade_{grade}')
+        tags.append(f'kz_{kz_tag}')
+        tags.append('vol_spike')
+        bias_summary = {}
+        for tf in ('W1','D1','H4','H1','M30','M15','M5'):
+            b = row.get(f'{tf}_major_bias', 0)
+            if pd.notna(b): bias_summary[tf] = int(b)
+
+        sig = Signal(
+            time=t_now, direction=direction, entry=entry, stop=stop,
+            tp1=tp1, tp2=tp2, tp_runner=float(tgt_px), risk_per_unit=risk,
+            grade=grade, risk_pct=risk_pct, setup_kind="BOS_CONT",
+            confluence=tags, swing_target_tf=tgt_tf, swing_target_price=float(tgt_px),
+            atr_at_entry=atr, htf_bias_summary=bias_summary,
+            session=str(row.get('session','')), killzone=kz_tag,
+        )
+        return sig
+
     if not candidates:
         return None
 
@@ -511,6 +722,7 @@ def _evaluate_row(i: int,
         # `kind` here is uppercase ("OB"/"FVG"); normalize for state key.
         kind_key = kind.lower()
 
+        setup_kind_label = "RETEST_OB" if kind == "OB" else "RETEST_FVG"
         sig = Signal(
             time=t_now,
             direction=direction,
@@ -522,6 +734,7 @@ def _evaluate_row(i: int,
             risk_per_unit=risk,
             grade=grade,
             risk_pct=risk_pct,
+            setup_kind=setup_kind_label,
             confluence=tags,
             ob_tf=ztf if kind == 'OB' else None,
             ob_top=ztop if kind == 'OB' else None,
@@ -554,7 +767,9 @@ def _strategy_columns(cfg: StrategyConfig) -> list[str]:
             'vol_spike',
             'bull_disp', 'bear_disp',
             'minor_bos_up', 'minor_bos_dn', 'minor_choch_up', 'minor_choch_dn',
-            'major_bos_up', 'major_bos_dn', 'major_choch_up', 'major_choch_dn']
+            'major_bos_up', 'major_bos_dn', 'major_choch_up', 'major_choch_dn',
+            'bull_liq_sweep', 'bear_liq_sweep', 'bull_sweep_px', 'bear_sweep_px',
+            'minor_swing_high', 'minor_swing_low']
     tfs = set(cfg.confluence.ob_tfs) | set(cfg.confluence.a_plus_required_tfs) | \
           set(cfg.confluence.a_required_tfs) | set(cfg.confluence.b_required_tfs) | \
           set(cfg.confluence.c_required_tfs)

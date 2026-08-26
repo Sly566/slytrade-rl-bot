@@ -49,6 +49,16 @@ Output columns (grouped):
         bull_disp, bear_disp (full-body impulsive candle)
         vol_spike (tick_volume > 2x 20-bar SMA)
 
+    Liquidity sweeps (stop-runs before reversal):
+        bull_liq_sweep — wick takes out a recent minor swing LOW (sellside
+            liquidity), then closes BACK ABOVE it (rejection / trap). The
+            sweep wick extreme (the liquidity level) is recorded for SL.
+        bear_liq_sweep — symmetric: wick takes out a recent minor swing
+            HIGH (buyside liq), closes back BELOW it.
+        bull_sweep_px, bear_sweep_px — extreme price of the most recent
+            un-reclaimed sweep wick (SL anchor), NaN once price closes
+            beyond the sweep level (invalidation / BOS instead).
+
     Order Blocks (last opposite-colour close before displacement):
         bull_ob_top, bull_ob_bottom, bull_ob_idx, bull_ob_mitigated
         bear_ob_top, bear_ob_bottom, bear_ob_idx, bear_ob_mitigated
@@ -733,6 +743,85 @@ def _add_fvgs(df: pd.DataFrame) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Liquidity sweeps (stop-runs)
+#
+# A bull LIQUIDITY SWEEP occurs when the wick takes out a recent minor swing
+# LOW (sellside liquidity hunted below stops) then closes BACK ABOVE that
+# swing low -- rejection + reversal displacement. That wick low is the sweep
+# extreme; SL goes beyond it. The sweep remains "live" as a bullish scalp
+# setup until price closes below it (sweep fails = continuation).
+#
+# Bear sweep is symmetric: wick takes recent minor swing HIGH, closes back
+# below it -- buyside liquidity hunted before a drop.
+#
+# The sweep is *active for reversal* for up to `sweep_window` bars after the
+# sweep candle close, AND while price hasn't closed back beyond the sweep
+# extreme (invalidation).
+# --------------------------------------------------------------------------- #
+def _add_liquidity_sweeps(df: pd.DataFrame) -> None:
+    n = len(df)
+    high = df["high"].to_numpy(dtype=np.float64)
+    low = df["low"].to_numpy(dtype=np.float64)
+    close = df["close"].to_numpy(dtype=np.float64)
+    min_sh = df["minor_swing_high"].ffill().to_numpy(dtype=np.float64)
+    min_sl = df["minor_swing_low"].ffill().to_numpy(dtype=np.float64)
+
+    bull_sweep = np.zeros(n, dtype=bool)
+    bear_sweep = np.zeros(n, dtype=bool)
+    bull_sweep_px = np.full(n, np.nan, dtype=np.float64)
+    bear_sweep_px = np.full(n, np.nan, dtype=np.float64)
+
+    # Track last swing high/low that's been "printed" (available to be swept)
+    # We need at least 1 bar after the swing pivot for it to exist.
+    # wick_penetration_pts is the number of points past the swing we need
+    # to count as a sweep (not just a tap). For XAUUSD this is a small buffer.
+    wick_buffer_pts = 0.05  # ~5 cents on XAUUSD -- any wick past the swing counts
+
+    last_bull_extreme: float | None = None  # last active bull sweep low
+    last_bear_extreme: float | None = None  # last active bear sweep high
+
+    for i in range(n):
+        h = float(high[i])
+        l = float(low[i])
+        c = float(close[i])
+
+        # Carry forward previous sweep levels (active until invalidated).
+        if last_bull_extreme is not None:
+            # Invalidation: price CLOSES below the sweep low => sweep fails,
+            # it was a continuation not a reversal.
+            if c < last_bull_extreme - wick_buffer_pts:
+                last_bull_extreme = None
+            else:
+                bull_sweep_px[i] = last_bull_extreme
+        if last_bear_extreme is not None:
+            if c > last_bear_extreme + wick_buffer_pts:
+                last_bear_extreme = None
+            else:
+                bear_sweep_px[i] = last_bear_extreme
+
+        # Detect NEW sweeps on this bar.
+        # Bull sweep: low[i] takes out last minor swing low, close[i] back above it
+        ref_sl = float(min_sl[i]) if np.isfinite(min_sl[i]) else np.nan
+        if np.isfinite(ref_sl) and l < ref_sl - wick_buffer_pts and c > ref_sl:
+            # Wick took out the swing low and closed back above => bull sweep
+            bull_sweep[i] = True
+            last_bull_extreme = l
+            bull_sweep_px[i] = l
+
+        # Bear sweep: high[i] takes out last minor swing high, close[i] back below it
+        ref_sh = float(min_sh[i]) if np.isfinite(min_sh[i]) else np.nan
+        if np.isfinite(ref_sh) and h > ref_sh + wick_buffer_pts and c < ref_sh:
+            bear_sweep[i] = True
+            last_bear_extreme = h
+            bear_sweep_px[i] = h
+
+    df["bull_liq_sweep"] = bull_sweep
+    df["bear_liq_sweep"] = bear_sweep
+    df["bull_sweep_px"] = bull_sweep_px
+    df["bear_sweep_px"] = bear_sweep_px
+
+
+# --------------------------------------------------------------------------- #
 # Premium / Discount within current major swing range
 # --------------------------------------------------------------------------- #
 def _add_premium_discount(df: pd.DataFrame) -> None:
@@ -791,6 +880,7 @@ def process_bars(
         progress(f"    {timeframe}: order blocks + FVGs ...")
     _add_order_blocks(out)
     _add_fvgs(out)
+    _add_liquidity_sweeps(out)
     _add_premium_discount(out)
     if progress:
         progress(f"    {timeframe}: done ({len(out):,} rows, {len(out.columns)} cols)")

@@ -1,4 +1,4 @@
-"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.0 champion persona.
+"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.1 scalper persona.
 
 Connects to MT5 via the mt5linux RPyC bridge (run `bash start_mt5_bridge.sh`
 in another terminal first), pulls multi-timeframe bars, computes Layer 2
@@ -18,10 +18,12 @@ Run:
     python -m slytrade.live.trader --symbol XAUUSDm --all --verbose  # see ALL signals
     python -m slytrade.live.trader --symbol XAUUSDm --live     # real trading (champion)
 
-Default persona: v0.9.0 champion (longs-only, 0.85R one-shot, >=2 ATR stops,
+Default persona: v0.9.1 champion (longs-only, 0.85R one-shot, >=2 ATR stops,
 grades A+/A/B, M5+M15 OBs, London/NY). Use --all to switch to the unrestricted
-RL-training persona (long+short, all grades, H1+M15+M5 OBs+FVGs, Asian+off-hours
-unlocked, persona_gating=False) so you see everything the engine sees.
+scalper persona (long+short, all grades, H1+M15+M5 OBs+FVGs, LIQ_SWEEP + BOS_CONT
+quick scalps, Asian+off-hours unlocked, persona_gating=False) so you see
+EVERYTHING the engine fires -- including the money-printing liquidity grabs
+and momentum bursts the champion filters out.
 """
 from __future__ import annotations
 
@@ -339,19 +341,21 @@ class LiveTrader:
             print(f"    [SIG] {msg}")
 
     def _handle_signal(self, sig) -> None:
-        key = f"{sig.time.isoformat()}|{sig.direction}|{sig.grade}|{sig.ob_tf or ''}"
+        zone_id = sig.ob_tf or (f"fvg{sig.fvg_top:.0f}" if sig.fvg_top else "-")
+        key = f"{sig.time.isoformat()}|{sig.direction}|{sig.grade}|{sig.setup_kind}|{zone_id}"
         side = "LONG" if sig.direction == 1 else "SHORT"
+        setup = getattr(sig, 'setup_kind', 'RETEST_OB')
         if key in self._signals_fired:
-            self._vlog(f"dupe {side} {sig.grade} {sig.ob_tf} @ {sig.time} — skip")
+            self._vlog(f"dupe {side} {setup}/{sig.grade} @ {sig.time} — skip")
             return
         # Directional safety net (engine already filters when persona_gating=True)
         if sig.direction == -1 and not self.cfg.confluence.accept_shorts:
-            self._vlog(f"{side} blocked by accept_shorts=False"); self._signals_fired.add(key); return
+            self._vlog(f"{side} {setup} blocked by accept_shorts=False"); self._signals_fired.add(key); return
         if sig.direction == 1 and not self.cfg.confluence.accept_longs:
-            self._vlog(f"{side} blocked by accept_longs=False"); self._signals_fired.add(key); return
+            self._vlog(f"{side} {setup} blocked by accept_longs=False"); self._signals_fired.add(key); return
         open_n = len(self._our_open_positions()) + sum(1 for t in self._trades.values() if not t.closed)
         if open_n >= self.max_open:
-            self._vlog(f"{side} {sig.grade} rejected: max_open={self.max_open} reached (open={open_n})")
+            self._vlog(f"{side} {setup}/{sig.grade} rejected: max_open={self.max_open} reached (open={open_n})")
             return
         equity = self.equity()
         bid, ask = self.quote()
@@ -361,36 +365,37 @@ class LiveTrader:
         fill = entry_approx + (half_spread + slip_pts) if sig.direction == 1 else entry_approx - (half_spread + slip_pts)
         risk_per_unit = abs(fill - float(sig.stop))
         if risk_per_unit <= 0:
-            self._vlog(f"{side} {sig.grade} rejected: invalid risk_per_unit={risk_per_unit}")
+            self._vlog(f"{side} {setup}/{sig.grade} rejected: invalid risk_per_unit={risk_per_unit}")
             return
         risk_pct = min(float(sig.risk_pct), self.risk_cap)
         risk_acct = risk_pct * equity
         risk_quote = risk_acct / self.acct.fx_to_account.get(self.spec.currency_profit, 1.0)
         lots = self.spec.lots_for_risk(risk_per_unit, risk_quote)
         if lots < self.spec.volume_min - 1e-9:
-            self._vlog(f"{side} {sig.grade} rejected: lots={lots:.4f} < vol_min={self.spec.volume_min} (eq={equity:.0f} risk_pct={risk_pct:.4f})")
+            self._vlog(f"{side} {setup}/{sig.grade} rejected: lots={lots:.4f} < vol_min={self.spec.volume_min} (eq={equity:.0f} risk_pct={risk_pct:.4f})")
             return
         tp = fill + sig.direction * self.cfg.exits.tp1_r * risk_per_unit
         sl = float(sig.stop)
         margin_quote = (lots * self.spec.contract_size * fill) / max(self.acct.leverage, 1)
         margin_acct = self.acct.to_account_ccy(margin_quote, self.spec.currency_profit)
         if margin_acct > equity * 0.95:
-            self._vlog(f"{side} {sig.grade} rejected: margin {margin_acct:.0f} > 95% equity {equity:.0f}")
+            self._vlog(f"{side} {setup}/{sig.grade} rejected: margin {margin_acct:.0f} > 95% equity {equity:.0f}")
             return
-        self._vlog(f"{side} {sig.grade} ob={sig.ob_tf} kz={sig.killzone} fill={fill:.{self.spec.digits}f} "
+        zone_label = sig.ob_tf or (f"FVG@{sig.fvg_top:.0f}" if sig.fvg_top else "")
+        self._vlog(f"{side} {setup}/{sig.grade} {zone_label} kz={sig.killzone} fill={fill:.{self.spec.digits}f} "
                    f"sl={sl:.{self.spec.digits}f} tp={tp:.{self.spec.digits}f} lots={lots:.2f} risk={risk_pct*100:.2f}%")
-        comment = f"L5 {sig.grade} {sig.ob_tf or ''} {sig.killzone}"
+        comment = f"L5 {sig.grade} {setup} {sig.killzone}"
         ticket = self._place_market(sig.direction, lots, sl, tp, comment)
         if ticket is None:
-            self._vlog(f"{side} {sig.grade} ORDER REJECTED by broker")
+            self._vlog(f"{side} {setup}/{sig.grade} ORDER REJECTED by broker")
             return
         self._signals_fired.add(key)
         self._trades[ticket] = LiveTrade(
             ticket=ticket, direction=sig.direction, entry=fill, sl=sl, tp=tp,
             lots=lots, open_time=datetime.now(UTC), grade=sig.grade, risk_pct=risk_pct,
         )
-        print(f"    [ENTRY] ticket={ticket} {side} {lots} lots @ {fill:.{self.spec.digits}f} "
-              f"grade={sig.grade} ob={sig.ob_tf} kz={sig.killzone} SL={sl:.{self.spec.digits}f} TP={tp:.{self.spec.digits}f}")
+        print(f"    [ENTRY] ticket={ticket} {side} {setup} {lots} lots @ {fill:.{self.spec.digits}f} "
+              f"grade={sig.grade} {zone_label} kz={sig.killzone} SL={sl:.{self.spec.digits}f} TP={tp:.{self.spec.digits}f}")
 
     # ------------------------------------------------------------------ #
     # Position monitoring
@@ -526,32 +531,38 @@ class LiveTrader:
             print(f"    ... and {len(active_zones)-20} more")
 
     def _structure_diagnostics(self, aligned: pd.DataFrame) -> None:
-        """Print counts of recent displacements/BOS/CHoCH on trigger TFs so we
-        can see whether features are firing during big moves (helps diagnose
-        'no signals during a selloff' situations)."""
-        for tf, lookback in [("M5", 60), ("M15", 240), ("H1", 600)]:
+        """Print counts of recent displacements/BOS/CHoCH/liq-sweeps on trigger
+        TFs so we can see whether features are firing during big moves."""
+        for tf, lookback in [("M1", 30), ("M5", 60), ("M15", 240), ("H1", 600)]:
             tail = aligned.tail(lookback)
             counts: dict[str, int] = {}
             for ev in ("bull_disp", "bear_disp",
                        "minor_bos_up", "minor_bos_dn", "minor_choch_up", "minor_choch_dn",
-                       "major_bos_up", "major_bos_dn", "major_choch_up", "major_choch_dn"):
-                col = f"{tf}_{ev}"
+                       "major_bos_up", "major_bos_dn", "major_choch_up", "major_choch_dn",
+                       "bull_liq_sweep", "bear_liq_sweep"):
+                col = f"{tf}_{ev}" if tf != "M1" else ev
                 if col in tail.columns:
                     n = int(tail[col].fillna(False).sum())
                     if n > 0:
                         counts[ev] = n
             last_bd = last_bu = None
-            for col, attr in [(f"{tf}_bear_disp", "bd"), (f"{tf}_bull_disp", "bu")]:
+            last_bullsw = last_bearsw = None
+            for col, attr in [(f"{tf}_bear_disp" if tf != "M1" else "bear_disp", "bd"),
+                              (f"{tf}_bull_disp" if tf != "M1" else "bull_disp", "bu"),
+                              (f"{tf}_bear_liq_sweep" if tf != "M1" else "bear_liq_sweep", "bs"),
+                              (f"{tf}_bull_liq_sweep" if tf != "M1" else "bull_liq_sweep", "bl")]:
                 if col in tail.columns:
                     hits = tail[tail[col].fillna(False)]["time"]
                     if len(hits) > 0:
                         ts = pd.Timestamp(hits.iloc[-1]).strftime("%H:%M")
-                        if attr == "bd":
-                            last_bd = ts
-                        else:
-                            last_bu = ts
-            if counts or last_bd or last_bu:
-                print(f"  [diag] {tf} last {lookback} M1 bars: {counts} last_bull_disp={last_bu} last_bear_disp={last_bd}")
+                        if attr == "bd": last_bd = ts
+                        elif attr == "bu": last_bu = ts
+                        elif attr == "bs": last_bearsw = ts
+                        elif attr == "bl": last_bullsw = ts
+            if counts or last_bd or last_bu or last_bullsw or last_bearsw:
+                print(f"  [diag] {tf} last {lookback}M1: {counts} "
+                      f"bull_disp={last_bu} bear_disp={last_bd} "
+                      f"bull_sweep={last_bullsw} bear_sweep={last_bearsw}")
 
     def _cycle_fn(self) -> None:
         self._cycle += 1
@@ -640,7 +651,10 @@ class LiveTrader:
 
     # ------------------------------------------------------------------ #
     def run(self) -> None:
-        print(f"SlyTrade LIVE v0.9.0  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  max_open={self.max_open}")
+        persona_label = "v0.9.1 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.1 champion (long-only A+/A/B RETEST_OB)"
+        print(f"SlyTrade LIVE v0.9.1  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  max_open={self.max_open}")
+        print(f"persona: {persona_label}")
+        print("setups : RETEST_OB RETEST_FVG LIQ_SWEEP BOS_CONT  (champion gates apply unless --all)")
         print(f"Magic={MAGIC}")
         print("-"*80)
         running = {"v": True}
@@ -682,7 +696,7 @@ class LiveTrader:
 # --------------------------------------------------------------------------- #
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="SlyTrade v0.9.0 LIVE trader")
+    ap = argparse.ArgumentParser(description="SlyTrade v0.9.1 SCALPER LIVE trader (OB/FVG retests + liq sweeps + BOS continuation)")
     ap.add_argument("--symbol", default="XAUUSDm")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=18812)
@@ -716,10 +730,10 @@ def main() -> None:
         fx_to_account={"USD": args.usd_zar} if str(acc.get("currency","ZAR")) != "USD" else {"USD": 1.0},
     )
     cfg = rl_training_persona() if args.unrestricted else champion_persona()
-    persona_label = "RL-UNRESTRICTED (all signals)" if args.unrestricted else "v0.9.0 champion (long-only A+/A/B)"
     max_open_eff = args.max_open if not args.unrestricted else max(args.max_open, 10)
-    print(f"  persona       : {persona_label}")
     print(f"  verbose       : {args.verbose}")
+    print(f"  risk_cap      : {args.risk_cap*100:.1f}% per trade")
+    print(f"  max_open      : {max_open_eff}")
     trader = LiveTrader(
         mt5=mt5, symbol=resolved, spec=spec, cfg=cfg, acct=acct_spec,
         live=args.live, risk_cap=args.risk_cap, max_open=max_open_eff,
