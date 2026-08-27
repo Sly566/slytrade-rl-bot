@@ -1,4 +1,4 @@
-"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.13 scalper persona.
+"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.13.1 scalper persona.
 
 Connects to MT5 via the mt5linux RPyC bridge (run `bash start_mt5_bridge.sh`
 in another terminal first), pulls multi-timeframe bars, computes Layer 2
@@ -18,7 +18,7 @@ Run:
     python -m slytrade.live.trader --symbol XAUUSDm --all --verbose  # see ALL signals
     python -m slytrade.live.trader --symbol XAUUSDm --live     # real trading (champion)
 
-Default persona: v0.9.13 champion (longs-only, 0.85R one-shot, >=2 ATR stops,
+Default persona: v0.9.13.1 champion (longs-only, 0.85R one-shot, >=2 ATR stops,
 grades A+/A/B, M5+M15 OBs, London/NY). Use --all to switch to the unrestricted
 scalper persona (long+short, all grades, H1+M15+M5 OBs+FVGs, LIQ_SWEEP + BOS_CONT
 quick scalps, Asian+off-hours unlocked, persona_gating=False) so you see
@@ -1021,9 +1021,52 @@ class LiveTrader:
         )
 
     # ------------------------------------------------------------------ #
+    # Sleep hardening
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _clamp_sleep(seconds: float, *, max_seconds: float | None = None) -> float:
+        """Clamp a computed sleep duration so ``time.sleep`` NEVER gets a negative value.
+
+        Python raises ``ValueError: sleep length must be non-negative`` for
+        negative durations, and an uncaught ValueError inside the run loop
+        kills the whole trader. The bar-boundary poller races the wall clock::
+
+            while running["v"] and time.time() < end_wait:
+                ...monitor...
+                time.sleep(min(self.poll_interval, end_wait - time.time()))
+
+        If the monitor call (or scheduler jitter) crosses ``end_wait`` between
+        the loop check and the sleep computation, ``end_wait - time.time()``
+        goes negative and ``min()`` hands a negative value straight to
+        ``time.sleep`` — that is the 13:14 crash. v0.9.13.1 routes every
+        ``time.sleep`` through this guard.
+
+        Returns a safe, non-negative duration, optionally capped at
+        ``max_seconds`` (cap itself is clamped to >= 0). NaN / +/-inf /
+        non-numeric garbage collapse to 0.0 so erratic inputs can never crash
+        the loop either.
+        """
+        try:
+            seconds = float(seconds)
+        except (TypeError, ValueError):
+            return 0.0
+        if seconds != seconds or seconds in (float("inf"), float("-inf")):
+            seconds = 0.0
+        if max_seconds is not None:
+            try:
+                cap = float(max_seconds)
+            except (TypeError, ValueError):
+                cap = 0.0
+            if cap != cap:  # NaN
+                cap = 0.0
+            # cap=+inf means "no cap"; cap=-inf clamps to 0
+            seconds = min(seconds, max(0.0, cap))
+        return max(0.0, seconds)
+
+    # ------------------------------------------------------------------ #
     def run(self) -> None:
-        persona_label = "v0.9.13 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.13 champion (long-only A+/A/B RETEST_OB)"
-        print(f"SlyTrade LIVE v0.9.13  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  max_open={self.max_open}")
+        persona_label = "v0.9.13.1 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.13.1 champion (long-only A+/A/B RETEST_OB)"
+        print(f"SlyTrade LIVE v0.9.13.1  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  max_open={self.max_open}")
         print(f"persona: {persona_label}")
         print("setups : RETEST_OB RETEST_FVG LIQ_SWEEP BOS_CONT  (champion gates apply unless --all)")
         print(f"Magic={MAGIC}")
@@ -1052,14 +1095,17 @@ class LiveTrader:
                         self._monitor_positions(None)
                     except Exception:
                         pass
-                time.sleep(min(self.poll_interval, end_wait - time.time()))
+                # v0.9.13.1: clamp BEFORE sleep — a negative remaining
+                # duration (clock crossing end_wait mid-iteration) made
+                # time.sleep raise ValueError and killed the loop at 13:14.
+                time.sleep(self._clamp_sleep(end_wait - time.time(), max_seconds=self.poll_interval))
             if not running["v"]: break
             try:
                 self._cycle_fn()
             except Exception as e:
                 print(f"[ERROR] cycle: {e}")
                 traceback.print_exc()
-                time.sleep(10)
+                time.sleep(self._clamp_sleep(10.0))
 
 
 # --------------------------------------------------------------------------- #
@@ -1067,7 +1113,7 @@ class LiveTrader:
 # --------------------------------------------------------------------------- #
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="SlyTrade v0.9.13 SCALPER LIVE trader (OB/FVG retests + liq sweeps + BOS continuation)")
+    ap = argparse.ArgumentParser(description="SlyTrade v0.9.13.1 SCALPER LIVE trader (OB/FVG retests + liq sweeps + BOS continuation)")
     ap.add_argument("--symbol", default="XAUUSDm")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=18812)

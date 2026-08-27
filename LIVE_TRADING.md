@@ -1,4 +1,4 @@
-# SlyTrade v0.9.13 SCALPER LIVE — Quick Start
+# SlyTrade v0.9.13.1 SCALPER LIVE — Quick Start
 
 v0.9.13 ships **4 setup kinds** so the bot is IN the move printing money, not
 sitting on hands waiting for a retest that may never come:
@@ -15,7 +15,7 @@ persona (default, no flags) trades ONLY `RETEST_OB` longs A+/A/B with the
 v0.9.0 long-only bias — PF 2.00, OOS 2.57 preserved. `--all` (unrestricted)
 fires ALL 4 setups long+short so we gauge what needs fixing before Layer 6 RL.
 
-### v0.9.13 risk + restart safety (current)
+### v0.9.13 risk + restart safety
 
 - **Hard-REJECT oversize vol_min scalps**: if the broker `volume_min` floor
   forces actual risk above `max(risk_cap, 1.5%)` **or** `3×` the grade target,
@@ -26,6 +26,16 @@ fires ALL 4 setups long+short so we gauge what needs fixing before Layer 6 RL.
   so M15 CHoCH emergency + time-stop keep protecting it across restarts.
   `bars_held` is seeded from wall-clock age (a 3h-old orphan still times out
   after ~1 more hour, not a fresh 4h clock).
+
+### v0.9.13.1 sleep-crash fix (current)
+
+- **`_clamp_sleep` guard**: every `time.sleep` in the run loop now routes
+  through `LiveTrader._clamp_sleep(...)`, which clamps to `>= 0` before
+  sleeping. The bar-boundary poller raced the wall clock — if a monitor call
+  crossed `end_wait` mid-iteration, `end_wait - time.time()` went negative and
+  `time.sleep(negative)` raised `ValueError: sleep length must be
+  non-negative`, killing the trader (the 13:14 crash). NaN/±inf/garbage also
+  collapse to 0.0 so no input can take the loop down.
 
 ## 1. Start the MT5 bridge (terminal 1)
 
@@ -98,6 +108,7 @@ All positions carry magic number **260810** so the bot only manages its own trad
 - **Max open positions** (default 3, bumped to 10 with `--all`); orphans count against the cap
 - **M15 CHoCH emergency** — closes immediately if M15 CHoCH prints against (including adopted orphans)
 - **Time-stop** — closes after 240 M1 bars (4h) regardless of P&L; orphan age seeds `bars_held`
+- **Clamped sleeps** (v0.9.13.1) — every `time.sleep` goes through `_clamp_sleep` so a negative remaining duration (wall-clock crossing `end_wait` mid-iteration) can never raise `ValueError` and kill the loop
 - **Champion persona filters** (longs-only, ≥2 ATR stops, A+/A/B, M5+M15 OBs, London+NY only, Asian off) are ON by default
 - **500-point deviation** budget on market orders; IOC fill with RETURN fallback
 - **Graceful Ctrl+C** — finishes current cycle, disconnects cleanly

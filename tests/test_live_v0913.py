@@ -1,9 +1,11 @@
-"""Unit tests for v0.9.13 live-trader risk + orphan-adoption helpers.
+"""Unit tests for v0.9.13 / v0.9.13.1 live-trader risk + orphan-adoption helpers.
 
 These pin the incomplete-merge regressions that bit the first v0.9.13 land:
   1. vol_min floor must HARD-REJECT when actual risk > max(risk_cap, 1.5%) or 3× target
   2. orphan adoption must seed bars_held from wall-clock age (time-stop continuity)
   3. broker open-time parsing must accept unix ints and datetime objects
+  4. _clamp_sleep must guarantee time.sleep NEVER gets a negative duration
+     (the 13:14 ValueError crash in the bar-boundary poll loop)
 """
 from __future__ import annotations
 
@@ -14,9 +16,8 @@ from typing import Any
 import pytest
 
 from slytrade.backtest.specs import AccountSpec, spec_for_symbol
-from slytrade.live.trader import LiveTrade, LiveTrader, MAGIC
+from slytrade.live.trader import MAGIC, LiveTrade, LiveTrader
 from slytrade.strategy.config import champion_persona
-
 
 # --------------------------------------------------------------------------- #
 # Fixtures
@@ -210,6 +211,49 @@ class TestOrphanAge:
         assert lt is not None
         assert lt.direction == -1
         assert lt.lots == 0.02
+
+
+# --------------------------------------------------------------------------- #
+# _clamp_sleep: time.sleep must NEVER get a negative duration (13:14 crash)
+# --------------------------------------------------------------------------- #
+
+class TestClampSleep:
+    def test_negative_remaining_clamps_to_zero(self):
+        # The 13:14 crash: clock crossed end_wait mid-iteration, so
+        # end_wait - time.time() went negative and time.sleep raised ValueError.
+        assert LiveTrader._clamp_sleep(-0.5) == 0.0
+        assert LiveTrader._clamp_sleep(-1e-9) == 0.0
+
+    def test_negative_remaining_with_cap_clamps_to_zero(self):
+        # Old code: min(poll_interval, negative) → negative still reaches sleep
+        assert LiveTrader._clamp_sleep(-0.5, max_seconds=5.0) == 0.0
+
+    def test_positive_duration_unchanged(self):
+        assert LiveTrader._clamp_sleep(4.2) == 4.2
+
+    def test_cap_applies(self):
+        assert LiveTrader._clamp_sleep(7.0, max_seconds=5.0) == 5.0
+        # cap >= duration → unchanged
+        assert LiveTrader._clamp_sleep(4.2, max_seconds=5.0) == 4.2
+
+    def test_zero_is_fine(self):
+        assert LiveTrader._clamp_sleep(0.0) == 0.0
+        assert LiveTrader._clamp_sleep(0.0, max_seconds=5.0) == 0.0
+
+    def test_nan_and_inf_collapse_to_zero(self):
+        assert LiveTrader._clamp_sleep(float("nan")) == 0.0
+        assert LiveTrader._clamp_sleep(float("inf")) == 0.0
+        assert LiveTrader._clamp_sleep(float("-inf")) == 0.0
+
+    def test_garbage_collapses_to_zero(self):
+        assert LiveTrader._clamp_sleep(None) == 0.0
+        assert LiveTrader._clamp_sleep("not-a-number") == 0.0
+
+    def test_negative_or_nan_cap_clamps_safe(self):
+        assert LiveTrader._clamp_sleep(5.0, max_seconds=-1.0) == 0.0
+        assert LiveTrader._clamp_sleep(5.0, max_seconds=float("nan")) == 0.0
+        # +inf cap == no cap
+        assert LiveTrader._clamp_sleep(5.0, max_seconds=float("inf")) == 5.0
 
 
 # --------------------------------------------------------------------------- #
