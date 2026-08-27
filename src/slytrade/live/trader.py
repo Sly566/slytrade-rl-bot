@@ -431,6 +431,28 @@ class LiveTrader:
                 out[int(d["ticket"])] = d
         return out
 
+    def _deal_profit(self, ticket: int) -> float | None:
+        """Try to pull realized profit (account ccy) from MT5 history deals for a closed position ticket."""
+        try:
+            from datetime import datetime as _dt
+            from datetime import timedelta as _td
+            utc_to = _dt.utcnow() + _td(minutes=2)
+            utc_from = utc_to - _td(hours=1)
+            self.mt5.history_deals_select(utc_from, utc_to)
+            deals = self.mt5.history_deals_get(position=int(ticket)) or []
+            total = 0.0
+            for d in deals:
+                dd = _to_dict(d)
+                # entry deals have profit=0; closing/out deals carry the P&L
+                p = float(dd.get("profit", 0.0))
+                total += p
+                # commission/swap also in their own fields on some brokers
+                total += float(dd.get("commission", 0.0))
+                total += float(dd.get("swap", 0.0))
+            return total if deals else None
+        except Exception:
+            return None
+
     # ------------------------------------------------------------------ #
     # Core signal handling
     # ------------------------------------------------------------------ #

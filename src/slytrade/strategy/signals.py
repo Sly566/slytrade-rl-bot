@@ -624,13 +624,19 @@ def _evaluate_row(i: int,
         state[sweep_key] = True
 
         entry = c
-        buffer_amt = cfg.exits.ob_invalidation_buffer * atr * 1.5
+        # LIQ_SWEEP SL buffer: 0.30 ATR past the wick (not 0.075). A liquidity
+        # sweep is a stop-run rejection — price frequently retests the wick by
+        # 0.10-0.25 ATR (20-50c on XAU) before reversing. v0.9.9- used
+        # ob_invalidation_buffer*1.5 = 0.075 ATR (~14c) which got hunted
+        # instantly on the 11:55 bear sweep (fill 4598.79, wick 4600.07, SL
+        # 4600.21 — price wick-retested to 4599.8 and clipped).
+        sweep_sl_buffer = max(0.30 * atr, 0.50)
         if direction == 1:
-            stop = float(sweep_extreme) - buffer_amt
+            stop = float(sweep_extreme) - sweep_sl_buffer
         else:
-            stop = float(sweep_extreme) + buffer_amt
+            stop = float(sweep_extreme) + sweep_sl_buffer
         risk = abs(entry - stop)
-        if risk <= 0 or risk < 0.2 * atr or risk > 7.0 * atr or risk > 40.0:
+        if risk <= 0 or risk < 0.5 * atr or risk > 7.0 * atr or risk > 40.0:
             continue
         risk_atr = risk / atr if atr > 0 else 0
         if cfg.confluence.persona_gating and risk_atr < cfg.confluence.min_risk_atr:
