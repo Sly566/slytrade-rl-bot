@@ -1,4 +1,4 @@
-"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.12 scalper persona.
+"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.13 scalper persona.
 
 Connects to MT5 via the mt5linux RPyC bridge (run `bash start_mt5_bridge.sh`
 in another terminal first), pulls multi-timeframe bars, computes Layer 2
@@ -18,7 +18,7 @@ Run:
     python -m slytrade.live.trader --symbol XAUUSDm --all --verbose  # see ALL signals
     python -m slytrade.live.trader --symbol XAUUSDm --live     # real trading (champion)
 
-Default persona: v0.9.12 champion (longs-only, 0.85R one-shot, >=2 ATR stops,
+Default persona: v0.9.13 champion (longs-only, 0.85R one-shot, >=2 ATR stops,
 grades A+/A/B, M5+M15 OBs, London/NY). Use --all to switch to the unrestricted
 scalper persona (long+short, all grades, H1+M15+M5 OBs+FVGs, LIQ_SWEEP + BOS_CONT
 quick scalps, Asian+off-hours unlocked, persona_gating=False) so you see
@@ -506,8 +506,20 @@ class LiveTrader:
         if lots < self.spec.volume_min - 1e-9:
             self._vlog(f"{side} {setup}/{sig.grade} rejected: lots={lots:.4f} < vol_min={self.spec.volume_min} (eq={equity:.0f} risk_pct={risk_pct:.4f})")
             return
+        # vol_min floor safety: if min-lot forces ACTUAL risk > 1.5% (or 3x the
+        # target risk_pct), REJECT the trade. C-grade LIQ_SWEEP/BOS_CONT scalps
+        # with wide stops (5+ pts) get floored to 0.01 lots which can push real
+        # risk to 3%+ — that's 20x the intended size and violates the scalping
+        # ethos (quick 0.25-0.5% nibbles, not 3% gambles). Don't let min-lots
+        # turn scalps into swing bets. v0.9.13 only warned; v0.9.13 hard-rejects.
+        max_risk_cap = max(self.risk_cap, 0.015)
+        if actual_risk_pct > max_risk_cap or actual_risk_pct > risk_pct * 3.0:
+            print(f"    [REJECT] {side} {setup}/{sig.grade} vol_min={self.spec.volume_min} forces "
+                  f"risk={actual_risk_pct*100:.2f}% > cap={max_risk_cap*100:.2f}% "
+                  f"(target {risk_pct*100:.2f}%) — SKIPPING (stop {risk_per_unit:.2f}pt too wide for min-lot)")
+            return
         if actual_risk_pct > risk_pct * 1.25:
-            # vol_min floor forced us into larger size than grade requested
+            # mild oversizing within bounds — warn but proceed
             print(f"    [SIZE-WARN] {side} {setup}/{sig.grade} vol_min={self.spec.volume_min} forced "
                   f"risk={actual_risk_pct*100:.2f}% (target {risk_pct*100:.2f}%) eq={equity:.0f}")
             risk_pct = actual_risk_pct
@@ -783,6 +795,34 @@ class LiveTrader:
         # zero signals during the sell-off).
         if not self._warmed_up:
             self._prime_state(aligned)
+            # Adopt any existing magic-260810 positions already open on the
+            # broker (orphans from prior bot runs / restarts) so CHoCH/
+            # time-stop protection applies and P&L bookkeeping tracks them.
+            # Without this, an open scalp from the previous run would sit
+            # unmonitored until broker SL/TP — no emergency exit, no time-stop.
+            for ticket, pos in self._our_open_positions().items():
+                if ticket not in self._trades:
+                    ptype = int(pos.get("type", 0))
+                    direction = 1 if ptype == 0 else -1
+                    op = float(pos.get("price_open", 0.0))
+                    sl_p = float(pos.get("sl", 0.0))
+                    tp_p = float(pos.get("tp", 0.0))
+                    vol = float(pos.get("volume", self.spec.volume_min))
+                    ot = pos.get("time", datetime.now(UTC))
+                    try:
+                        ot = datetime.fromtimestamp(int(ot), tz=UTC)
+                    except Exception:
+                        ot = datetime.now(UTC)
+                    # best-effort risk_pct (orphan; we don't know original grade)
+                    r_pct_est = 0.005
+                    self._trades[ticket] = LiveTrade(
+                        ticket=ticket, direction=direction, entry=op, sl=sl_p,
+                        tp=tp_p, lots=vol, open_time=ot, grade="?",
+                        risk_pct=r_pct_est,
+                    )
+                    print(f"  [adopt] orphan ticket={ticket} {'LONG' if direction==1 else 'SHORT'} "
+                          f"{vol} lots @ {op:.{self.spec.digits}f} SL={sl_p:.{self.spec.digits}f} TP={tp_p:.{self.spec.digits}f}")
+            self._last_broker_pos = self._our_open_positions()
             print(f"  Warmed up on {n} M1 bars — state primed, watching for new signals ...")
 
         # Only process bars newer than the last one we already evaluated.
@@ -893,8 +933,8 @@ class LiveTrader:
 
     # ------------------------------------------------------------------ #
     def run(self) -> None:
-        persona_label = "v0.9.12 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.12 champion (long-only A+/A/B RETEST_OB)"
-        print(f"SlyTrade LIVE v0.9.12  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  max_open={self.max_open}")
+        persona_label = "v0.9.13 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.13 champion (long-only A+/A/B RETEST_OB)"
+        print(f"SlyTrade LIVE v0.9.13  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  max_open={self.max_open}")
         print(f"persona: {persona_label}")
         print("setups : RETEST_OB RETEST_FVG LIQ_SWEEP BOS_CONT  (champion gates apply unless --all)")
         print(f"Magic={MAGIC}")
@@ -938,7 +978,7 @@ class LiveTrader:
 # --------------------------------------------------------------------------- #
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="SlyTrade v0.9.12 SCALPER LIVE trader (OB/FVG retests + liq sweeps + BOS continuation)")
+    ap = argparse.ArgumentParser(description="SlyTrade v0.9.13 SCALPER LIVE trader (OB/FVG retests + liq sweeps + BOS continuation)")
     ap.add_argument("--symbol", default="XAUUSDm")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=18812)
