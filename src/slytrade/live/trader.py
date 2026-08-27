@@ -1,4 +1,4 @@
-"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.10 scalper persona.
+"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.11 scalper persona.
 
 Connects to MT5 via the mt5linux RPyC bridge (run `bash start_mt5_bridge.sh`
 in another terminal first), pulls multi-timeframe bars, computes Layer 2
@@ -18,7 +18,7 @@ Run:
     python -m slytrade.live.trader --symbol XAUUSDm --all --verbose  # see ALL signals
     python -m slytrade.live.trader --symbol XAUUSDm --live     # real trading (champion)
 
-Default persona: v0.9.10 champion (longs-only, 0.85R one-shot, >=2 ATR stops,
+Default persona: v0.9.11 champion (longs-only, 0.85R one-shot, >=2 ATR stops,
 grades A+/A/B, M5+M15 OBs, London/NY). Use --all to switch to the unrestricted
 scalper persona (long+short, all grades, H1+M15+M5 OBs+FVGs, LIQ_SWEEP + BOS_CONT
 quick scalps, Asian+off-hours unlocked, persona_gating=False) so you see
@@ -473,9 +473,19 @@ class LiveTrader:
         risk_acct = risk_pct * equity
         risk_quote = risk_acct / self.acct.fx_to_account.get(self.spec.currency_profit, 1.0)
         lots = self.spec.lots_for_risk(risk_per_unit, risk_quote)
+        # Compute the *actual* risk the broker will enforce for the chosen lots
+        # (vol_min floors lots, which can oversize risk on tiny accounts/grades).
+        actual_risk_quote = self.spec.profit_per_lot(risk_per_unit) * lots
+        actual_risk_acct = self.acct.to_account_ccy(actual_risk_quote, self.spec.currency_profit)
+        actual_risk_pct = actual_risk_acct / max(equity, 1e-9)
         if lots < self.spec.volume_min - 1e-9:
             self._vlog(f"{side} {setup}/{sig.grade} rejected: lots={lots:.4f} < vol_min={self.spec.volume_min} (eq={equity:.0f} risk_pct={risk_pct:.4f})")
             return
+        if actual_risk_pct > risk_pct * 1.25:
+            # vol_min floor forced us into larger size than grade requested
+            print(f"    [SIZE-WARN] {side} {setup}/{sig.grade} vol_min={self.spec.volume_min} forced "
+                  f"risk={actual_risk_pct*100:.2f}% (target {risk_pct*100:.2f}%) eq={equity:.0f}")
+            risk_pct = actual_risk_pct
         tp = fill + sig.direction * self.cfg.exits.tp1_r * risk_per_unit
         sl = float(sig.stop)
         margin_quote = (lots * self.spec.contract_size * fill) / max(self.acct.leverage, 1)
@@ -547,9 +557,24 @@ class LiveTrader:
             broker_tickets = set(broker_pos.keys())
             for ticket, lt in list(self._trades.items()):
                 if ticket not in broker_tickets and not lt.closed:
+                    # Broker closed the position (SL/TP/hit). Reconcile P&L
+                    # from LiveTrade book vs fill price so wins/realized track
+                    # correctly in live mode (v0.9.9- bug: lt.pnl stayed 0
+                    # because only dry-run path populated it, leading to
+                    # `wins=0` after winners).
+                    pos_at_open = lt.entry
+                    # Estimate exit price: if TP side hit, exit≈tp; else≈sl.
+                    # Use bid/ask now as best-effort (broker already closed).
+                    bid_now, ask_now = self.quote()
+                    exit_px = bid_now if lt.direction == 1 else ask_now
+                    move = (exit_px - pos_at_open) if lt.direction == 1 else (pos_at_open - exit_px)
+                    # P&L in account ccy: move * contract * lots * fx
+                    pnl_quote = move * self.spec.contract_size * lt.lots
+                    lt.pnl = self.acct.to_account_ccy(pnl_quote, self.spec.currency_profit)
                     lt.closed = True
+                    lt.close_price = exit_px
                     lt.close_reason = "BROKER"
-                    print(f"    [EXIT] ticket={ticket} reason=BROKER (SL/TP hit)")
+                    print(f"    [EXIT] ticket={ticket} reason=BROKER (SL/TP hit) pnl={lt.pnl:+.2f}{self.acct.currency}")
 
         # ---------- Per-bar checks (CHoCH emergency + time stop) ---------- #
         if not new_bar:
@@ -836,8 +861,8 @@ class LiveTrader:
 
     # ------------------------------------------------------------------ #
     def run(self) -> None:
-        persona_label = "v0.9.10 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.10 champion (long-only A+/A/B RETEST_OB)"
-        print(f"SlyTrade LIVE v0.9.10  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  max_open={self.max_open}")
+        persona_label = "v0.9.11 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.11 champion (long-only A+/A/B RETEST_OB)"
+        print(f"SlyTrade LIVE v0.9.11  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  max_open={self.max_open}")
         print(f"persona: {persona_label}")
         print("setups : RETEST_OB RETEST_FVG LIQ_SWEEP BOS_CONT  (champion gates apply unless --all)")
         print(f"Magic={MAGIC}")
@@ -881,7 +906,7 @@ class LiveTrader:
 # --------------------------------------------------------------------------- #
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="SlyTrade v0.9.10 SCALPER LIVE trader (OB/FVG retests + liq sweeps + BOS continuation)")
+    ap = argparse.ArgumentParser(description="SlyTrade v0.9.11 SCALPER LIVE trader (OB/FVG retests + liq sweeps + BOS continuation)")
     ap.add_argument("--symbol", default="XAUUSDm")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=18812)
