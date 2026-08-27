@@ -1,19 +1,31 @@
-# SlyTrade v0.9.1 SCALPER LIVE — Quick Start
+# SlyTrade v0.9.13 SCALPER LIVE — Quick Start
 
-v0.9.1 ships **4 setup kinds** so the bot is IN the move printing money, not
+v0.9.13 ships **4 setup kinds** so the bot is IN the move printing money, not
 sitting on hands waiting for a retest that may never come:
 
 | Setup kind     | Edge                                                                 | SL anchor                          | Grade profile | Size    |
 |----------------|----------------------------------------------------------------------|------------------------------------|---------------|---------|
 | `RETEST_OB`    | v0.9.0 champion: pullback into OB after displacement                 | Beyond OB edge + 0.05 ATR          | A+/A/B/C      | Full    |
 | `RETEST_FVG`   | Price returns to a freshly-printed fair-value gap                    | Beyond FVG edge + 0.05 ATR         | A+/A/B/C      | Full    |
-| `LIQ_SWEEP`    | Wick takes out a minor swing (stop-run) → reversal displacement      | Beyond the sweep wick extreme      | B/C (quick)   | Half    |
+| `LIQ_SWEEP`    | Wick takes out a minor swing (stop-run) → reversal displacement      | Wick extreme − max(0.30 ATR, $0.50) | B/C (quick)   | Half    |
 | `BOS_CONT`     | BOS/CHoCH + displacement + vol spike — ride the impulse              | Last opposing minor swing          | B/C (quick)   | 0.6×    |
 
 All scalps use the same 0.85R one-shot TP that battle-tested PF 2.00. Champion
 persona (default, no flags) trades ONLY `RETEST_OB` longs A+/A/B with the
 v0.9.0 long-only bias — PF 2.00, OOS 2.57 preserved. `--all` (unrestricted)
 fires ALL 4 setups long+short so we gauge what needs fixing before Layer 6 RL.
+
+### v0.9.13 risk + restart safety (current)
+
+- **Hard-REJECT oversize vol_min scalps**: if the broker `volume_min` floor
+  forces actual risk above `max(risk_cap, 1.5%)` **or** `3×` the grade target,
+  the trade is skipped (`[REJECT] … vol_min=… forces risk=…`). Mild 1.25–3×
+  oversize still only warns (`[SIZE-WARN]`).
+- **Orphan adoption at startup**: after warmup, any open `magic=260810`
+  position is booked into the LiveTrade ledger (`[adopt] orphan ticket=…`)
+  so M15 CHoCH emergency + time-stop keep protecting it across restarts.
+  `bars_held` is seeded from wall-clock age (a 3h-old orphan still times out
+  after ~1 more hour, not a fresh 4h clock).
 
 ## 1. Start the MT5 bridge (terminal 1)
 
@@ -80,18 +92,20 @@ All positions carry magic number **260810** so the bot only manages its own trad
 ## 4. Safety rules hard-coded into the live loop
 
 - **Min-lot floor** (0.01 for XAUUSDm) — skip if risk_pct would produce less than min lot
+- **vol_min oversize REJECT** (v0.9.13) — if min-lot forces actual risk > `max(risk_cap, 1.5%)` or > `3×` target, skip the trade (`[REJECT]`); mild 1.25–3× only `[SIZE-WARN]`s
 - **Margin check** — rejects trade if margin > 95% equity
 - **Max risk cap** (`--risk-cap`) caps per-trade risk
-- **Max open positions** (default 3, bumped to 10 with `--all`)
-- **M15 CHoCH emergency** — closes immediately if M15 CHoCH prints against
-- **Time-stop** — closes after 240 M1 bars (4h) regardless of P&L
+- **Max open positions** (default 3, bumped to 10 with `--all`); orphans count against the cap
+- **M15 CHoCH emergency** — closes immediately if M15 CHoCH prints against (including adopted orphans)
+- **Time-stop** — closes after 240 M1 bars (4h) regardless of P&L; orphan age seeds `bars_held`
 - **Champion persona filters** (longs-only, ≥2 ATR stops, A+/A/B, M5+M15 OBs, London+NY only, Asian off) are ON by default
-- **30-point slippage** budget on market orders; IOC fill
+- **500-point deviation** budget on market orders; IOC fill with RETURN fallback
 - **Graceful Ctrl+C** — finishes current cycle, disconnects cleanly
-- **Restart-safe** — existing positions picked up by magic number and resume monitoring
+- **Restart-safe orphan adoption** — existing `magic=260810` positions are adopted at warmup and resume CHoCH/time-stop monitoring
 - **Entry slip** — longs pay half-spread + 5pts; shorts same (matches backtest)
 - **Quick scalps sized smaller**: LIQ_SWEEP at 50%, BOS_CONT at 60% of tier size (quick in-out)
 - **Retest window extended to 120 M1 bars (2h)** in unrestricted mode so M5 displacements with slow pullbacks still fire
+- **LIQ_SWEEP SL buffer** (v0.9.12+) — `max(0.30 ATR, $0.50)` past the sweep wick so retests don't clip the stop
 
 ## 5. Monitoring
 

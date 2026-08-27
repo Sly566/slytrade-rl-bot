@@ -460,6 +460,116 @@ class LiveTrader:
         if self.verbose:
             print(f"    [SIG] {msg}")
 
+    def _vol_min_risk_ok(
+        self,
+        actual_risk_pct: float,
+        target_risk_pct: float,
+        side: str = "?",
+        setup: str = "?",
+        grade: str = "?",
+        risk_per_unit: float = 0.0,
+        equity: float = 0.0,
+        *,
+        silent: bool = False,
+    ) -> bool:
+        """Return True if vol_min-floored size is within safe risk bounds.
+
+        Hard-REJECT when actual risk exceeds max(risk_cap, 1.5%) OR 3× the
+        grade's target risk. Mild 1.25–3× oversize is still allowed (caller
+        may SIZE-WARN). Extracted so unit tests can pin the thresholds without
+        needing a live MT5 bridge.
+        """
+        max_risk_cap = max(self.risk_cap, 0.015)
+        if actual_risk_pct > max_risk_cap or actual_risk_pct > target_risk_pct * 3.0:
+            if not silent:
+                print(
+                    f"    [REJECT] {side} {setup}/{grade} vol_min={self.spec.volume_min} forces "
+                    f"risk={actual_risk_pct*100:.2f}% > cap={max_risk_cap*100:.2f}% "
+                    f"(target {target_risk_pct*100:.2f}%) — SKIPPING "
+                    f"(stop {risk_per_unit:.2f}pt too wide for min-lot)"
+                )
+            return False
+        return True
+
+    @staticmethod
+    def _parse_broker_time(raw: Any, fallback: datetime | None = None) -> datetime:
+        """Coerce MT5 position.time (unix int / datetime / str) to aware UTC.
+
+        MT5 returns position.time as a unix-seconds int. Try that first —
+        ``pd.Timestamp(int)`` treats bare ints as *nanoseconds* which maps
+        epoch-2026 seconds into 1970 and poisons orphan age / time-stop.
+        """
+        fb = fallback or datetime.now(UTC)
+        if raw is None:
+            return fb
+        if isinstance(raw, datetime):
+            return raw if raw.tzinfo is not None else raw.replace(tzinfo=UTC)
+        # Numeric unix seconds (MT5 default). Reject absurd values so a
+        # stray ms/ns epoch doesn't seed bars_held in the millions.
+        try:
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                sec = float(raw)
+                # allow ms timestamps too (13-digit) by scaling down
+                if sec > 1e12:  # ms
+                    sec /= 1000.0
+                if sec > 1e12:  # still ns-ish — bail
+                    return fb
+                # sanity: between 2000-01-01 and 2100-01-01
+                if 946684800.0 <= sec <= 4102444800.0:
+                    return datetime.fromtimestamp(sec, tz=UTC)
+        except Exception:
+            pass
+        try:
+            ts = pd.Timestamp(raw)
+            if pd.isna(ts):
+                return fb
+            if ts.tzinfo is None:
+                ts = ts.tz_localize("UTC")
+            else:
+                ts = ts.tz_convert("UTC")
+            return ts.to_pydatetime()
+        except Exception:
+            return fb
+
+    @staticmethod
+    def _orphan_bars_held(open_time: datetime, now: datetime | None = None) -> int:
+        """Seed bars_held from wall-clock age so time-stop doesn't reset on restart.
+
+        A position open for 3h before a bot restart must still time-stop after
+        ~1 more hour (240 M1 bars total), not get a fresh 4h clock.
+        """
+        now = now or datetime.now(UTC)
+        ot = open_time if open_time.tzinfo is not None else open_time.replace(tzinfo=UTC)
+        age_s = max(0.0, (now - ot).total_seconds())
+        return int(age_s // 60)  # 1 M1 bar ≈ 60s
+
+    def _adopt_orphan_position(self, ticket: int, pos: dict) -> LiveTrade | None:
+        """Book a pre-existing magic-260810 position so CHoCH/time-stop apply."""
+        if ticket in self._trades:
+            return None
+        ptype = int(pos.get("type", 0))
+        direction = 1 if ptype == 0 else -1
+        op = float(pos.get("price_open", 0.0))
+        sl_p = float(pos.get("sl", 0.0))
+        tp_p = float(pos.get("tp", 0.0))
+        vol = float(pos.get("volume", self.spec.volume_min))
+        ot = self._parse_broker_time(pos.get("time"), datetime.now(UTC))
+        bars_held = self._orphan_bars_held(ot)
+        # best-effort risk_pct (orphan; we don't know original grade)
+        r_pct_est = 0.005
+        lt = LiveTrade(
+            ticket=ticket, direction=direction, entry=op, sl=sl_p,
+            tp=tp_p, lots=vol, open_time=ot, grade="?",
+            risk_pct=r_pct_est, bars_held=bars_held,
+        )
+        self._trades[ticket] = lt
+        print(
+            f"  [adopt] orphan ticket={ticket} {'LONG' if direction == 1 else 'SHORT'} "
+            f"{vol} lots @ {op:.{self.spec.digits}f} SL={sl_p:.{self.spec.digits}f} "
+            f"TP={tp_p:.{self.spec.digits}f} age≈{bars_held}m"
+        )
+        return lt
+
     def _handle_signal(self, sig) -> None:
         zone_id = sig.ob_tf or (f"fvg{sig.fvg_top:.0f}" if sig.fvg_top else "-")
         key = f"{sig.time.isoformat()}|{sig.direction}|{sig.grade}|{sig.setup_kind}|{zone_id}"
@@ -511,12 +621,9 @@ class LiveTrader:
         # with wide stops (5+ pts) get floored to 0.01 lots which can push real
         # risk to 3%+ — that's 20x the intended size and violates the scalping
         # ethos (quick 0.25-0.5% nibbles, not 3% gambles). Don't let min-lots
-        # turn scalps into swing bets. v0.9.13 only warned; v0.9.13 hard-rejects.
-        max_risk_cap = max(self.risk_cap, 0.015)
-        if actual_risk_pct > max_risk_cap or actual_risk_pct > risk_pct * 3.0:
-            print(f"    [REJECT] {side} {setup}/{sig.grade} vol_min={self.spec.volume_min} forces "
-                  f"risk={actual_risk_pct*100:.2f}% > cap={max_risk_cap*100:.2f}% "
-                  f"(target {risk_pct*100:.2f}%) — SKIPPING (stop {risk_per_unit:.2f}pt too wide for min-lot)")
+        # turn scalps into swing bets. v0.9.11/v0.9.12 only SIZE-WARNed;
+        # v0.9.13 hard-rejects.
+        if not self._vol_min_risk_ok(actual_risk_pct, risk_pct, side, setup, sig.grade, risk_per_unit, equity):
             return
         if actual_risk_pct > risk_pct * 1.25:
             # mild oversizing within bounds — warn but proceed
@@ -800,28 +907,10 @@ class LiveTrader:
             # time-stop protection applies and P&L bookkeeping tracks them.
             # Without this, an open scalp from the previous run would sit
             # unmonitored until broker SL/TP — no emergency exit, no time-stop.
+            # bars_held is seeded from wall-clock age so a 3h-old orphan still
+            # time-stops after ~1 more hour (not a fresh 4h clock on restart).
             for ticket, pos in self._our_open_positions().items():
-                if ticket not in self._trades:
-                    ptype = int(pos.get("type", 0))
-                    direction = 1 if ptype == 0 else -1
-                    op = float(pos.get("price_open", 0.0))
-                    sl_p = float(pos.get("sl", 0.0))
-                    tp_p = float(pos.get("tp", 0.0))
-                    vol = float(pos.get("volume", self.spec.volume_min))
-                    ot = pos.get("time", datetime.now(UTC))
-                    try:
-                        ot = datetime.fromtimestamp(int(ot), tz=UTC)
-                    except Exception:
-                        ot = datetime.now(UTC)
-                    # best-effort risk_pct (orphan; we don't know original grade)
-                    r_pct_est = 0.005
-                    self._trades[ticket] = LiveTrade(
-                        ticket=ticket, direction=direction, entry=op, sl=sl_p,
-                        tp=tp_p, lots=vol, open_time=ot, grade="?",
-                        risk_pct=r_pct_est,
-                    )
-                    print(f"  [adopt] orphan ticket={ticket} {'LONG' if direction==1 else 'SHORT'} "
-                          f"{vol} lots @ {op:.{self.spec.digits}f} SL={sl_p:.{self.spec.digits}f} TP={tp_p:.{self.spec.digits}f}")
+                self._adopt_orphan_position(ticket, pos)
             self._last_broker_pos = self._our_open_positions()
             print(f"  Warmed up on {n} M1 bars — state primed, watching for new signals ...")
 
