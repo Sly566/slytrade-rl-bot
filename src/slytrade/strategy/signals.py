@@ -1145,6 +1145,16 @@ def scan(df: pd.DataFrame,
         if i < warmup:
             continue
         if sig is not None:
+            # BOS_CONT one-shot arm: mirror live trader — after a fill (in
+            # scan, signal emit == fill since there's no broker-rejection
+            # simulation), arm the key so subsequent consecutive BOS bars in
+            # the same leg don't pyramid additional positions. Reset by
+            # opposite CHoCH in Phase 1b of _evaluate_row (signals.py).
+            # v0.9.10 live already does this in LiveTrader._handle_signal();
+            # scan()/backtest missed it, letting pyramid storms like the
+            # v0.9.7 08:35→08:39 5x SHORT re-appear in batch backtests.
+            if sig.setup_kind == "BOS_CONT":
+                state[f"_bos_entered_{sig.direction:+d}"] = True
             signals.append(sig)
         if i % report_every == 0:
             progress(f"  ... bar {i:,}/{n:,}  signals found: {len(signals)}")

@@ -1,4 +1,4 @@
-"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.9 scalper persona.
+"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.10 scalper persona.
 
 Connects to MT5 via the mt5linux RPyC bridge (run `bash start_mt5_bridge.sh`
 in another terminal first), pulls multi-timeframe bars, computes Layer 2
@@ -18,7 +18,7 @@ Run:
     python -m slytrade.live.trader --symbol XAUUSDm --all --verbose  # see ALL signals
     python -m slytrade.live.trader --symbol XAUUSDm --live     # real trading (champion)
 
-Default persona: v0.9.9 champion (longs-only, 0.85R one-shot, >=2 ATR stops,
+Default persona: v0.9.10 champion (longs-only, 0.85R one-shot, >=2 ATR stops,
 grades A+/A/B, M5+M15 OBs, London/NY). Use --all to switch to the unrestricted
 scalper persona (long+short, all grades, H1+M15+M5 OBs+FVGs, LIQ_SWEEP + BOS_CONT
 quick scalps, Asian+off-hours unlocked, persona_gating=False) so you see
@@ -836,8 +836,8 @@ class LiveTrader:
 
     # ------------------------------------------------------------------ #
     def run(self) -> None:
-        persona_label = "v0.9.9 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.9 champion (long-only A+/A/B RETEST_OB)"
-        print(f"SlyTrade LIVE v0.9.9  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  max_open={self.max_open}")
+        persona_label = "v0.9.10 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.10 champion (long-only A+/A/B RETEST_OB)"
+        print(f"SlyTrade LIVE v0.9.10  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  max_open={self.max_open}")
         print(f"persona: {persona_label}")
         print("setups : RETEST_OB RETEST_FVG LIQ_SWEEP BOS_CONT  (champion gates apply unless --all)")
         print(f"Magic={MAGIC}")
@@ -881,7 +881,7 @@ class LiveTrader:
 # --------------------------------------------------------------------------- #
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="SlyTrade v0.9.9 SCALPER LIVE trader (OB/FVG retests + liq sweeps + BOS continuation)")
+    ap = argparse.ArgumentParser(description="SlyTrade v0.9.10 SCALPER LIVE trader (OB/FVG retests + liq sweeps + BOS continuation)")
     ap.add_argument("--symbol", default="XAUUSDm")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=18812)
