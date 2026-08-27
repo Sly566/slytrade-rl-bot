@@ -1,4 +1,4 @@
-"""Unit tests for v0.9.13 / v0.9.13.1 / v0.9.13.2 live-trader risk + orphan-adoption helpers.
+"""Unit tests for v0.9.13 / v0.9.13.1+ live-trader risk + orphan-adoption helpers.
 
 These pin the incomplete-merge regressions that bit the first v0.9.13 land:
   1. vol_min floor must HARD-REJECT when actual risk > max(risk_cap, 1.5%) or 3× target
@@ -145,6 +145,34 @@ class TestVolMinRiskOk:
         assert trader._vol_min_risk_ok(0.018, 0.01, silent=True) is True
         # 2.1% still REJECTS against the 2% cap
         assert trader._vol_min_risk_ok(0.021, 0.01, silent=True) is False
+
+    def test_reject_log_names_3x_rule_when_under_cap(self, trader: LiveTrader, capsys):
+        """The 17:00 live BOS_CONT/C: actual 3.32% < 5% cap but > 3× 0.15%
+        target — the log must name the 3× rule, not claim '> cap=5.00%'."""
+        trader.risk_cap = 0.05
+        assert trader._vol_min_risk_ok(
+            0.0332, 0.0015, side="LONG", setup="BOS_CONT", grade="C",
+            risk_per_unit=6.25, equity=3484.46,
+        ) is False
+        out = capsys.readouterr().out
+        assert "3× target 0.15%" in out
+        assert "cap=5.00%" in out
+        assert "> cap=5.00%" not in out  # old misleading wording
+
+    def test_reject_log_names_cap_when_cap_is_binder(self, trader: LiveTrader, capsys):
+        trader.risk_cap = 0.02
+        # 2.1% > 2% cap but < 3× 1% target → the cap is the binder
+        assert trader._vol_min_risk_ok(0.021, 0.01, side="SHORT", setup="LIQ_SWEEP") is False
+        out = capsys.readouterr().out
+        assert "risk=2.10% > cap=2.00%" in out
+        assert "3× target" not in out
+
+    def test_reject_log_names_both_when_both_hit(self, trader: LiveTrader, capsys):
+        trader.risk_cap = 0.01  # effective floor cap = 1.5%
+        # 3.5% > 1.5% cap AND > 3× 1% target → both named
+        assert trader._vol_min_risk_ok(0.035, 0.01) is False
+        out = capsys.readouterr().out
+        assert "> cap=1.50% and > 3× target 1.00%" in out
 
 
 # --------------------------------------------------------------------------- #

@@ -1,4 +1,4 @@
-"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.13.2 scalper persona.
+"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.13.3 scalper persona.
 
 Connects to MT5 via the mt5linux RPyC bridge (run `bash start_mt5_bridge.sh`
 in another terminal first), pulls multi-timeframe bars, computes Layer 2
@@ -18,7 +18,7 @@ Run:
     python -m slytrade.live.trader --symbol XAUUSDm --all --verbose  # see ALL signals
     python -m slytrade.live.trader --symbol XAUUSDm --live     # real trading (champion)
 
-Default persona: v0.9.13.2 champion (longs-only, 0.85R one-shot, >=2 ATR stops,
+Default persona: v0.9.13.3 champion (longs-only, 0.85R one-shot, >=2 ATR stops,
 grades A+/A/B, M5+M15 OBs, London/NY). Use --all to switch to the unrestricted
 scalper persona (long+short, all grades, H1+M15+M5 OBs+FVGs, LIQ_SWEEP + BOS_CONT
 quick scalps, Asian+off-hours unlocked, persona_gating=False) so you see
@@ -480,12 +480,21 @@ class LiveTrader:
         needing a live MT5 bridge.
         """
         max_risk_cap = max(self.risk_cap, 0.015)
-        if actual_risk_pct > max_risk_cap or actual_risk_pct > target_risk_pct * 3.0:
+        cap_hit = actual_risk_pct > max_risk_cap
+        triple_hit = actual_risk_pct > target_risk_pct * 3.0
+        if cap_hit or triple_hit:
             if not silent:
+                if cap_hit and triple_hit:
+                    why = (f"risk={actual_risk_pct*100:.2f}% > cap={max_risk_cap*100:.2f}% "
+                           f"and > 3× target {target_risk_pct*100:.2f}%")
+                elif cap_hit:
+                    why = f"risk={actual_risk_pct*100:.2f}% > cap={max_risk_cap*100:.2f}%"
+                else:
+                    why = (f"risk={actual_risk_pct*100:.2f}% > 3× target {target_risk_pct*100:.2f}% "
+                           f"(cap={max_risk_cap*100:.2f}%)")
                 print(
                     f"    [REJECT] {side} {setup}/{grade} vol_min={self.spec.volume_min} forces "
-                    f"risk={actual_risk_pct*100:.2f}% > cap={max_risk_cap*100:.2f}% "
-                    f"(target {target_risk_pct*100:.2f}%) — SKIPPING "
+                    f"{why} — SKIPPING "
                     f"(stop {risk_per_unit:.2f}pt too wide for min-lot)"
                 )
             return False
@@ -1047,7 +1056,7 @@ class LiveTrader:
         If the monitor call (or scheduler jitter) crosses ``end_wait`` between
         the loop check and the sleep computation, ``end_wait - time.time()``
         goes negative and ``min()`` hands a negative value straight to
-        ``time.sleep`` — that is the 13:14 crash. v0.9.13.2 routes every
+        ``time.sleep`` — that is the 13:14 crash. v0.9.13.1+ routes every
         ``time.sleep`` through this guard.
 
         Returns a safe, non-negative duration, optionally capped at
@@ -1074,8 +1083,8 @@ class LiveTrader:
 
     # ------------------------------------------------------------------ #
     def run(self) -> None:
-        persona_label = "v0.9.13.2 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.13.2 champion (long-only A+/A/B RETEST_OB)"
-        print(f"SlyTrade LIVE v0.9.13.2  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  max_open={self.max_open}")
+        persona_label = "v0.9.13.3 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.13.3 champion (long-only A+/A/B RETEST_OB)"
+        print(f"SlyTrade LIVE v0.9.13.3  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  max_open={self.max_open}")
         print(f"persona: {persona_label}")
         print("setups : RETEST_OB RETEST_FVG LIQ_SWEEP BOS_CONT  (champion gates apply unless --all)")
         print(f"Magic={MAGIC}")
@@ -1104,7 +1113,7 @@ class LiveTrader:
                         self._monitor_positions(None)
                     except Exception:
                         pass
-                # v0.9.13.2: clamp BEFORE sleep — a negative remaining
+                # v0.9.13.1: clamp BEFORE sleep — a negative remaining
                 # duration (clock crossing end_wait mid-iteration) made
                 # time.sleep raise ValueError and killed the loop at 13:14.
                 time.sleep(self._clamp_sleep(end_wait - time.time(), max_seconds=self.poll_interval))
@@ -1122,7 +1131,7 @@ class LiveTrader:
 # --------------------------------------------------------------------------- #
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="SlyTrade v0.9.13.2 SCALPER LIVE trader (OB/FVG retests + liq sweeps + BOS continuation)")
+    ap = argparse.ArgumentParser(description="SlyTrade v0.9.13.3 SCALPER LIVE trader (OB/FVG retests + liq sweeps + BOS continuation)")
     ap.add_argument("--symbol", default="XAUUSDm")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=18812)

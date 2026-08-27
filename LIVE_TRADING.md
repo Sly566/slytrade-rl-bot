@@ -1,4 +1,4 @@
-# SlyTrade v0.9.13.2 SCALPER LIVE — Quick Start
+# SlyTrade v0.9.13.3 SCALPER LIVE — Quick Start
 
 v0.9.13 ships **4 setup kinds** so the bot is IN the move printing money, not
 sitting on hands waiting for a retest that may never come:
@@ -37,7 +37,7 @@ fires ALL 4 setups long+short so we gauge what needs fixing before Layer 6 RL.
   non-negative`, killing the trader (the 13:14 crash). NaN/±inf/garbage also
   collapse to 0.0 so no input can take the loop down.
 
-### v0.9.13.2 loss accounting + BOS_CONT anchor fix (current)
+### v0.9.13.2 loss accounting + BOS_CONT anchor fix
 
 - **Realized P&L from broker deal history**: when a position closes between
   polls, the bot now pulls the actual fill P&L from MT5 deal history
@@ -53,6 +53,15 @@ fires ALL 4 setups long+short so we gauge what needs fixing before Layer 6 RL.
   every BOS_CONT stop to that stale level and the 0.5–7 ATR band rejected it,
   so BOS_CONT could never fire in trending/choppy markets. Now the fresh M1
   level (the one the bar actually broke FROM) is used when it's nearer.
+
+### v0.9.13.3 truthful REJECT logging (current)
+
+- **`[REJECT]` log names the actual bound** the vol_min floor violated. v0.9.13.2
+  always printed `risk=… > cap=…` even when it was the **3× target** rule that
+  fired — the 17:00 live `BOS_CONT/C` showed `risk=3.32% > cap=5.00%` (false:
+  3.32% is under the 5% cap; the true binder was `> 3× target 0.15% = 0.45%`).
+  Now the line states `> cap=X%`, `> 3× target Y%`, or `> cap=X% and > 3×
+  target Y%` exactly as triggered, so the log can't mislead the operator.
 
 ## 1. Start the MT5 bridge (terminal 1)
 
@@ -128,6 +137,7 @@ All positions carry magic number **260810** so the bot only manages its own trad
 - **Clamped sleeps** (v0.9.13.1) — every `time.sleep` goes through `_clamp_sleep` so a negative remaining duration (wall-clock crossing `end_wait` mid-iteration) can never raise `ValueError` and kill the loop
 - **Ground-truth trade P&L** (v0.9.13.2) — broker-side closes are reconciled from MT5 deal history, not the last-poll unrealized estimate, so wins/losses and realized stats match the account
 - **BOS_CONT fresh anchor** (v0.9.13.2) — SL uses the nearest opposing M1/TF minor swing, so a stale M5 pivot can't inflate a scalp stop to 19×ATR and get it auto-rejected
+- **Truthful REJECT logs** (v0.9.13.3) — the `[REJECT]` line names which risk bound was violated (cap vs 3× target), so a 3×-rule reject can never be misread as a cap failure
 - **Champion persona filters** (longs-only, ≥2 ATR stops, A+/A/B, M5+M15 OBs, London+NY only, Asian off) are ON by default
 - **500-point deviation** budget on market orders; IOC fill with RETURN fallback
 - **Graceful Ctrl+C** — finishes current cycle, disconnects cleanly
