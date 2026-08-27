@@ -1156,7 +1156,11 @@ def scan(df: pd.DataFrame,
             # simulation), arm the key so subsequent consecutive BOS bars in
             # the same leg don't pyramid additional positions. Reset by
             # opposite CHoCH in Phase 1b of _evaluate_row (signals.py).
+<<<<<<< HEAD
             # v0.9.12 live already does this in LiveTrader._handle_signal();
+=======
+            # v0.9.13 live already does this in LiveTrader._handle_signal();
+>>>>>>> 632c6b0083f2ba707b49623e55b97ddc92eb79b2
             # scan()/backtest missed it, letting pyramid storms like the
             # v0.9.7 08:35→08:39 5x SHORT re-appear in batch backtests.
             if sig.setup_kind == "BOS_CONT":
