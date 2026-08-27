@@ -150,22 +150,29 @@ def fetch_bars(mt5: Any, symbol: str, timeframe: str, count: int) -> pd.DataFram
     """Fetch `count` COMPLETED bars ending 'now' from MT5, normalized.
 
     CRITICAL CAUSALITY RULE: MT5's copy_rates_from_pos(symbol, tf, 0, N) ALWAYS
-    returns the CURRENTLY-FORMING bar as the LAST row -- its OHLC mutates in
-    real time and must NEVER be fed into the feature pipeline or signal
+    returns the CURRENTLY-FORMING bar as the LAST row -- its OHLC is mutating
+    in real time and must NEVER be fed into the feature pipeline or signal
     engine. v0.9.6 guard:
 
-      1. Wall-clock filter with 2s grace: keep bars whose close time
-         (time+dur) is at least 2 seconds in the past on host clock. This
-         tolerates Wine/RPyC/NTP jitter up to ~2s without admitting the
-         forming bar (whose close is `dur` in the future).
-      2. For M1 ONLY: unconditionally drop the last bar as belt-and-
+      1. Wall-clock filter: keep bars whose close time has already passed
+         on host clock (`time+dur <= now`). Same parity as v0.9.5 wall
+         filter -- this tolerates arbitrary Wine/RPyC/NTP clock drift
+         between host and MT5 server without filtering out legitimately
+         closed bars (the first v0.9.6 build used `<= now - 2s` which
+         filtered every bar on Sly's Pop-OS host when host clock lagged
+         MT5 server time by ~3s under Wine, producing 0 bars / 'not
+         enough M1 data yet' on every cycle). The forming bar's close is
+         always >= now (it closes dur in the future) so it is excluded.
+      2. For M1 ONLY: unconditionally drop the last row as belt-and-
          suspenders. M1 forming-bar OHLC poisons feature state
          (displacements, swings) within seconds, and a ~60s lag is
          acceptable for scalps. For M5+ the forming bar closes 5-1440
          minutes in the future, so the wall filter ALONE excludes it
-         safely; an extra tail drop there (v0.9.5 bug) cut off the most
-         recently CLOSED HTF bar, leaving structural flags (bull_disp,
-         minor_choch_up, etc.) always one HTF period stale.
+         safely; an extra unconditional tail drop there (v0.9.5 bug)
+         cut off the most recently CLOSED HTF bar, leaving structural
+         flags (bull_disp, minor_choch_up, etc.) always one HTF period
+         stale. v0.9.6 fixes that so HTF structure updates the moment
+         the HTF bar closes.
     """
     tf_const = getattr(mt5, TIMEFRAME_ATTRS[timeframe])
     dur = timeframe_timedelta(timeframe)
@@ -176,22 +183,25 @@ def fetch_bars(mt5: Any, symbol: str, timeframe: str, count: int) -> pd.DataFram
     df = normalize_bar_frame(raw, symbol, timeframe)
     if df.empty:
         return df
-    # Wall-clock filter with a 2-second safety buffer: keep only bars
-    # whose close time is at least 2 seconds in the past on host clock.
-    # This tolerates Wine/RPyC/NTP jitter up to ~2s without admitting the
-    # forming bar (which always closes `dur` in the future).
+    # Wall-clock filter: drop bars whose close time has not yet passed on
+    # host clock. This is the primary guard against the forming bar, whose
+    # close time is always `dur` in the future (so it fails `<= now`).
+    # Using `<= now` (v0.9.5 parity) not `< now - grace`: the latter caused
+    # 0 bars on Sly's Pop-OS host when host clock was a few seconds behind
+    # MT5 server time -- every bar's close looked "in the future" by more
+    # than the grace window.
     now = datetime.now(UTC)
-    safe_grace = timedelta(seconds=2)
-    df = df[df["time"] + dur <= now - safe_grace].copy()
-    # For M1 ONLY: unconditionally drop the last bar as belt-and-suspenders.
-    # M1 forming-bar OHLC poisons feature state (displacements, swings)
-    # within seconds, and a 1-bar (~60s) lag on M1 is acceptable for
-    # scalps. For higher TFs (M5+), the forming bar closes 5-1440 minutes
-    # in the future so the wall filter above ALWAYS excludes it; an
-    # unconditional drop there (v0.9.5 bug) cuts off the most recently
-    # CLOSED HTF bar, making M5/M15/M30/H1 structural flags (bull_disp,
-    # minor_choch_up, etc.) always one bar (~5-60 min) stale. v0.9.6 fixes
-    # that so HTF structure updates the moment the HTF bar closes.
+    df = df[df["time"] + dur <= now].copy()
+    # M1 only: unconditional 1-bar tail drop as belt-and-suspenders.
+    # Rationale: M1 forming-bar OHLC poisons displacements/swings within
+    # seconds, and host-clock can be up to several seconds ahead of MT5
+    # server under Wine, which lets the forming M1 bar slip past the wall
+    # filter above. Dropping one more M1 bar costs ~60s latency which is
+    # acceptable for scalps. For M5+ the forming bar's close is 5-1440
+    # minutes in the future, so the wall filter ALONE excludes it safely
+    # even with many seconds of clock skew; an extra tail drop there
+    # (v0.9.5 bug) cut off the most recently CLOSED HTF bar, leaving
+    # structural flags one HTF period stale. v0.9.6 fixes that.
     if timeframe == "M1" and len(df) > 1:
         df = df.iloc[:-1].copy()
     # Keep only the last `count` completed bars
