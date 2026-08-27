@@ -1,4 +1,4 @@
-"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.13.3 scalper persona.
+"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.13.4 scalper persona.
 
 Connects to MT5 via the mt5linux RPyC bridge (run `bash start_mt5_bridge.sh`
 in another terminal first), pulls multi-timeframe bars, computes Layer 2
@@ -18,7 +18,7 @@ Run:
     python -m slytrade.live.trader --symbol XAUUSDm --all --verbose  # see ALL signals
     python -m slytrade.live.trader --symbol XAUUSDm --live     # real trading (champion)
 
-Default persona: v0.9.13.3 champion (longs-only, 0.85R one-shot, >=2 ATR stops,
+Default persona: v0.9.13.4 champion (longs-only, 0.85R one-shot, >=2 ATR stops,
 grades A+/A/B, M5+M15 OBs, London/NY). Use --all to switch to the unrestricted
 scalper persona (long+short, all grades, H1+M15+M5 OBs+FVGs, LIQ_SWEEP + BOS_CONT
 quick scalps, Asian+off-hours unlocked, persona_gating=False) so you see
@@ -436,8 +436,18 @@ class LiveTrader:
         try:
             from datetime import datetime as _dt
             from datetime import timedelta as _td
-            utc_to = _dt.utcnow() + _td(minutes=2)
-            utc_from = utc_to - _td(hours=1)
+            # MT5's history_deals_select date range is interpreted in SERVER
+            # time (the mt5linux bridge passes naive datetimes straight to the
+            # Windows-side MT5 API). Exness MT5Trial9 runs at UTC+3, so the
+            # v0.9.13.2 window of [now-1h, now+2min] in naive UTC excluded the
+            # real deal — e.g. a close at 19:16 UTC = 22:16 server time was
+            # outside 18:17-19:19 server, history_deals_get returned [], and
+            # the bot fell back to the last-poll estimate (16:14: -9.60 booked
+            # vs -37.75 real; 19:17: -3.68 booked vs -28.18 total). Use a
+            # generous window that covers any server offset / DST: 7 days back
+            # → now + 1 day.
+            utc_to = _dt.utcnow() + _td(days=1)
+            utc_from = utc_to - _td(days=7)
             self.mt5.history_deals_select(utc_from, utc_to)
             deals = self.mt5.history_deals_get(position=int(ticket)) or []
             total = 0.0
@@ -725,6 +735,8 @@ class LiveTrader:
                         last_profit = realized
                     else:
                         last_profit = float(prev.get(ticket, {}).get("profit", 0.0)) if prev else 0.0
+                        print(f"    [WARN] ticket={ticket} no deal in MT5 history — using last-poll estimate "
+                              f"{last_profit:+.2f}{self.acct.currency}")
                     lt.closed = True
                     lt.close_reason = "BROKER"
                     lt.pnl = last_profit
@@ -1083,8 +1095,8 @@ class LiveTrader:
 
     # ------------------------------------------------------------------ #
     def run(self) -> None:
-        persona_label = "v0.9.13.3 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.13.3 champion (long-only A+/A/B RETEST_OB)"
-        print(f"SlyTrade LIVE v0.9.13.3  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  max_open={self.max_open}")
+        persona_label = "v0.9.13.4 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.13.4 champion (long-only A+/A/B RETEST_OB)"
+        print(f"SlyTrade LIVE v0.9.13.4  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  max_open={self.max_open}")
         print(f"persona: {persona_label}")
         print("setups : RETEST_OB RETEST_FVG LIQ_SWEEP BOS_CONT  (champion gates apply unless --all)")
         print(f"Magic={MAGIC}")
@@ -1131,7 +1143,7 @@ class LiveTrader:
 # --------------------------------------------------------------------------- #
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="SlyTrade v0.9.13.3 SCALPER LIVE trader (OB/FVG retests + liq sweeps + BOS continuation)")
+    ap = argparse.ArgumentParser(description="SlyTrade v0.9.13.4 SCALPER LIVE trader (OB/FVG retests + liq sweeps + BOS continuation)")
     ap.add_argument("--symbol", default="XAUUSDm")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=18812)

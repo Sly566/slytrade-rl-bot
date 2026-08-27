@@ -1,4 +1,4 @@
-# SlyTrade v0.9.13.3 SCALPER LIVE — Quick Start
+# SlyTrade v0.9.13.4 SCALPER LIVE — Quick Start
 
 v0.9.13 ships **4 setup kinds** so the bot is IN the move printing money, not
 sitting on hands waiting for a retest that may never come:
@@ -54,7 +54,7 @@ fires ALL 4 setups long+short so we gauge what needs fixing before Layer 6 RL.
   so BOS_CONT could never fire in trending/choppy markets. Now the fresh M1
   level (the one the bar actually broke FROM) is used when it's nearer.
 
-### v0.9.13.3 truthful REJECT logging (current)
+### v0.9.13.3 truthful REJECT logging
 
 - **`[REJECT]` log names the actual bound** the vol_min floor violated. v0.9.13.2
   always printed `risk=… > cap=…` even when it was the **3× target** rule that
@@ -62,6 +62,17 @@ fires ALL 4 setups long+short so we gauge what needs fixing before Layer 6 RL.
   3.32% is under the 5% cap; the true binder was `> 3× target 0.15% = 0.45%`).
   Now the line states `> cap=X%`, `> 3× target Y%`, or `> cap=X% and > 3×
   target Y%` exactly as triggered, so the log can't mislead the operator.
+
+### v0.9.13.4 deal-history window fix (current)
+
+- **`_deal_profit` now selects a 7-day history window.** v0.9.13.2's
+  `[now-1h, now+2min]` range was interpreted by MT5 in **server time**
+  (Exness MT5Trial9 = UTC+3), so the close deal was outside the window,
+  `history_deals_get` returned nothing, and the bot silently fell back to the
+  last-poll estimate again — the 19:17 exit booked `-3.68ZAR` while the broker
+  really lost `-28.18ZAR`. The wide window covers any server offset/DST, and a
+  `[WARN]` is printed if the lookup ever fails so a fallback can't pass
+  unnoticed again.
 
 ## 1. Start the MT5 bridge (terminal 1)
 
@@ -138,6 +149,7 @@ All positions carry magic number **260810** so the bot only manages its own trad
 - **Ground-truth trade P&L** (v0.9.13.2) — broker-side closes are reconciled from MT5 deal history, not the last-poll unrealized estimate, so wins/losses and realized stats match the account
 - **BOS_CONT fresh anchor** (v0.9.13.2) — SL uses the nearest opposing M1/TF minor swing, so a stale M5 pivot can't inflate a scalp stop to 19×ATR and get it auto-rejected
 - **Truthful REJECT logs** (v0.9.13.3) — the `[REJECT]` line names which risk bound was violated (cap vs 3× target), so a 3×-rule reject can never be misread as a cap failure
+- **Server-time-safe deal lookup** (v0.9.13.4) — `_deal_profit` selects a 7-day history window (works with Exness UTC+3 server time) and warns if it has to fall back to the last-poll estimate
 - **Champion persona filters** (longs-only, ≥2 ATR stops, A+/A/B, M5+M15 OBs, London+NY only, Asian off) are ON by default
 - **500-point deviation** budget on market orders; IOC fill with RETURN fallback
 - **Graceful Ctrl+C** — finishes current cycle, disconnects cleanly

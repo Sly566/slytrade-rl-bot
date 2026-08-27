@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "slytrade-rl-bot"
-version = "0.9.13.3"
+version = "0.9.13.4"
 description = "Production-grade MT5 tick-and-bar based ICT/SMC scalper (OB retests + liq sweeps + BOS continuation) pre-RL"
 requires-python = ">=3.11"
 dependencies = [

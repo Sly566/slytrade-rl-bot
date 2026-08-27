@@ -40,8 +40,11 @@ class _FakeMT5:
         self._positions = list(positions or [])
         self._equity = equity
         self._history = list(history_deals or [])
+        self._select_calls: list[tuple[Any, Any]] = []
 
-    def history_deals_select(self, *_args, **_kwargs) -> bool:
+    def history_deals_select(self, date_from: Any = None, date_to: Any = None,
+                             *_args, **_kwargs) -> bool:
+        self._select_calls.append((date_from, date_to))
         return True
 
     def history_deals_get(self, **kwargs: Any) -> list[SimpleNamespace]:
@@ -272,6 +275,26 @@ class TestDealProfit:
 
     def test_returns_none_when_no_deals(self, trader: LiveTrader):
         assert trader._deal_profit(999) is None
+
+    def test_history_window_covers_server_time_offset(self, trader: LiveTrader):
+        """Regression (v0.9.13.4): the old [now-1h, now+2min] naive-UTC window
+        is interpreted in SERVER time (Exness MT5Trial9 = UTC+3), so the close
+        deal was excluded and _deal_profit returned None — the bot booked the
+        last-poll unrealized estimate instead of the real P&L."""
+        mt5 = _FakeMT5(
+            history_deals=[
+                {"position": 3149064313, "profit": -28.18, "commission": 0.0, "swap": 0.0},
+            ]
+        )
+        trader.mt5 = mt5
+        assert trader._deal_profit(3149064313) == pytest.approx(-28.18)
+        # The selection window must span ~7 days and reach into the future so
+        # a ±hours/DST server offset can never exclude the deal.
+        assert len(mt5._select_calls) == 1
+        frm, to = mt5._select_calls[0]
+        # _deal_profit uses naive utcnow() (MT5 server-time convention)
+        assert to > datetime.utcnow()
+        assert (to - frm) >= timedelta(days=6, hours=23)
 
     def test_exit_prefers_deal_history_over_last_poll_estimate(self, trader: LiveTrader):
         """Regression: a stop filled between polls must book the REALIZED
