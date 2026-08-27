@@ -579,6 +579,23 @@ def _evaluate_row(i: int,
             if fail_trace is not None:
                 _reject(f"LIQ_SWEEP {side}: c={c:.2f} > sweep_px={float(sweep_extreme):.2f} (failed reversal)")
             continue
+
+        # v0.9.8 PROXIMITY GATE: close must be within 2.0 ATR of the sweep wick.
+        # A liquidity-sweep scalp fires on the REJECTION immediately after the
+        # wick — not after price has already run 10-18 points in the reversal
+        # direction. The 09:36 bear sweep at wick=4599 entered SHORT at fill
+        # =4580.97 (18 points below the wick, ~7.2 ATR away after ATR expanded
+        # on the crash bar) — pure chase into a waterfall, not a scalp. The
+        # existing risk<7ATR gate failed because ATR itself expanded to ~2.6 on
+        # the crash bar, letting 18 points slip through as "6.9 ATR". Require
+        # close within 2 ATR of the wick so we only take the first bar or two
+        # of rejection, not the whole continuation.
+        dist_from_wick = abs(c - float(sweep_extreme))
+        if atr > 0 and dist_from_wick > 2.0 * atr:
+            if fail_trace is not None:
+                _reject(f"LIQ_SWEEP {side}: c={c:.2f} too far from sweep_px={float(sweep_extreme):.2f} "
+                        f"(dist={dist_from_wick:.2f} > 2ATR={2.0*atr:.2f}) — chasing")
+            continue
         # Require displacement/BOS/CHoCH in reversal direction (M1 or trigger_tf).
         # v0.9.5 only checked disp and major/minor BOS; CHoCH breaks (which
         # are the primary signal after a liquidity grab) were silently
