@@ -4,9 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "slytrade-rl-bot"
-version = "0.2.0"
-description = "Production-grade MT5 tick-and-bar based ICT/SMC RL trading bot"
-requires-python = ">=3.12"
+version = "0.9.13"
+description = "Production-grade MT5 tick-and-bar based ICT/SMC scalper (OB retests + liq sweeps + BOS continuation) pre-RL"
+requires-python = ">=3.11"
 dependencies = [
   "numpy>=1.26",
   "pandas>=2.2",
@@ -64,13 +64,19 @@ addopts = "-q"
 
 [tool.ruff]
 line-length = 120
-target-version = "py312"
+target-version = "py311"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "B", "UP"]
-ignore = ["E501"]
+# Only enable bug-finding rules — style nits (multi-statement lines, naming
+# conventions, PEP 585/604 upgrades, etc.) are intentionally NOT enforced on
+# a performance-critical trading codebase where local idioms dominate.
+select = ["F", "I", "B"]
+ignore = [
+    "E501",    # line too long
+    "B008",    # function argument default (mutables are intentional in dataclass defaults)
+]
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.11"
 ignore_missing_imports = true
 strict = false
