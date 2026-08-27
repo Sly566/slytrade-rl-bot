@@ -1,4 +1,4 @@
-"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.11 scalper persona.
+"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.12 scalper persona.
 
 Connects to MT5 via the mt5linux RPyC bridge (run `bash start_mt5_bridge.sh`
 in another terminal first), pulls multi-timeframe bars, computes Layer 2
@@ -18,7 +18,7 @@ Run:
     python -m slytrade.live.trader --symbol XAUUSDm --all --verbose  # see ALL signals
     python -m slytrade.live.trader --symbol XAUUSDm --live     # real trading (champion)
 
-Default persona: v0.9.11 champion (longs-only, 0.85R one-shot, >=2 ATR stops,
+Default persona: v0.9.12 champion (longs-only, 0.85R one-shot, >=2 ATR stops,
 grades A+/A/B, M5+M15 OBs, London/NY). Use --all to switch to the unrestricted
 scalper persona (long+short, all grades, H1+M15+M5 OBs+FVGs, LIQ_SWEEP + BOS_CONT
 quick scalps, Asian+off-hours unlocked, persona_gating=False) so you see
@@ -290,6 +290,9 @@ class LiveTrader:
         self._signals_fired: set[str] = set()   # dedupe keys
         self._cycle = 0
         self._warmed_up = False
+        self._starting_balance: float | None = None  # set after warmup
+        self._last_broker_pos: dict[int, dict] = {}  # snapshot for P&L diffing
+        self._wins_count: int = 0
 
     # ------------------------------------------------------------------ #
     # Account info
@@ -555,26 +558,21 @@ class LiveTrader:
         else:
             broker_pos = self._our_open_positions()
             broker_tickets = set(broker_pos.keys())
+            # Detect positions that closed between polls by comparing snapshot
+            # to previous open positions. The last-known profit from the
+            # previous poll is the best estimate we have (broker has removed
+            # the position by now so we can't query it post-close).
+            prev = getattr(self, "_last_broker_pos", {}) or {}
             for ticket, lt in list(self._trades.items()):
                 if ticket not in broker_tickets and not lt.closed:
-                    # Broker closed the position (SL/TP/hit). Reconcile P&L
-                    # from LiveTrade book vs fill price so wins/realized track
-                    # correctly in live mode (v0.9.9- bug: lt.pnl stayed 0
-                    # because only dry-run path populated it, leading to
-                    # `wins=0` after winners).
-                    pos_at_open = lt.entry
-                    # Estimate exit price: if TP side hit, exit≈tp; else≈sl.
-                    # Use bid/ask now as best-effort (broker already closed).
-                    bid_now, ask_now = self.quote()
-                    exit_px = bid_now if lt.direction == 1 else ask_now
-                    move = (exit_px - pos_at_open) if lt.direction == 1 else (pos_at_open - exit_px)
-                    # P&L in account ccy: move * contract * lots * fx
-                    pnl_quote = move * self.spec.contract_size * lt.lots
-                    lt.pnl = self.acct.to_account_ccy(pnl_quote, self.spec.currency_profit)
+                    last_profit = float(prev.get(ticket, {}).get("profit", 0.0)) if prev else 0.0
                     lt.closed = True
-                    lt.close_price = exit_px
                     lt.close_reason = "BROKER"
-                    print(f"    [EXIT] ticket={ticket} reason=BROKER (SL/TP hit) pnl={lt.pnl:+.2f}{self.acct.currency}")
+                    lt.pnl = last_profit
+                    if last_profit > 0:
+                        self._wins_count += 1
+                    print(f"    [EXIT] ticket={ticket} reason=BROKER (SL/TP hit) pnl={last_profit:+.2f}{self.acct.currency}")
+            self._last_broker_pos = dict(broker_pos)
 
         # ---------- Per-bar checks (CHoCH emergency + time stop) ---------- #
         if not new_bar:
@@ -844,25 +842,37 @@ class LiveTrader:
         acc = self.account()
         n_open = len(self._our_open_positions()) if self.live else sum(1 for t in self._trades.values() if not t.closed)
         closed = [t for t in self._trades.values() if t.closed]
-        wins = sum(1 for t in closed if t.pnl > 0) if closed else 0
+        # wins count from per-trade reconciled pnl (snapshot-based in live,
+        # r_mult-based in dry-run)
+        wins = sum(1 for t in closed if t.pnl > 0)
         total_pnl = sum(t.pnl for t in closed) if closed else 0.0
+        # ground-truth realized P&L from broker balance (includes trades
+        # from before bot restart + commissions)
+        bal = float(acc.get("balance", eq))
+        if self._starting_balance is None:
+            self._starting_balance = bal
+        realized_gt = bal - self._starting_balance
         floating = 0.0
         if self.live:
+            # MT5 position.profit is ALREADY in account (deposit) currency
+            # on Exness ZAR accounts -- broker does USD->ZAR server-side.
+            # Multiplying by fx again (v0.9.9 bug) 18.5x'd the display.
             for p in self._our_open_positions().values():
-                floating += float(p.get("profit", 0.0)) * self.acct.fx_to_account.get(self.spec.currency_profit, 1.0)
+                floating += float(p.get("profit", 0.0))
         now_str = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
         bar_time = pd.to_datetime(latest["time"]).strftime("%H:%M") if "time" in latest.index else "?"
         print(
             f"[{now_str}] M1 {bar_time}  bid={bid:.{self.spec.digits}f} ask={ask:.{self.spec.digits}f}  "
             f"eq={eq:.2f}{acc.get('currency','ZAR')}  open={n_open}  floating={floating:+.2f}  "
-            f"closed={len(closed)} wins={wins} realized={total_pnl:+.2f}",
+            f"closed={len(closed)} wins={wins} realized_session={total_pnl:+.2f} "
+            f"realized_total={realized_gt:+.2f}",
             flush=True,
         )
 
     # ------------------------------------------------------------------ #
     def run(self) -> None:
-        persona_label = "v0.9.11 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.11 champion (long-only A+/A/B RETEST_OB)"
-        print(f"SlyTrade LIVE v0.9.11  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  max_open={self.max_open}")
+        persona_label = "v0.9.12 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.12 champion (long-only A+/A/B RETEST_OB)"
+        print(f"SlyTrade LIVE v0.9.12  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  max_open={self.max_open}")
         print(f"persona: {persona_label}")
         print("setups : RETEST_OB RETEST_FVG LIQ_SWEEP BOS_CONT  (champion gates apply unless --all)")
         print(f"Magic={MAGIC}")
@@ -906,7 +916,7 @@ class LiveTrader:
 # --------------------------------------------------------------------------- #
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="SlyTrade v0.9.11 SCALPER LIVE trader (OB/FVG retests + liq sweeps + BOS continuation)")
+    ap = argparse.ArgumentParser(description="SlyTrade v0.9.12 SCALPER LIVE trader (OB/FVG retests + liq sweeps + BOS continuation)")
     ap.add_argument("--symbol", default="XAUUSDm")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=18812)
