@@ -1,4 +1,4 @@
-"""Unit tests for v0.9.13 / v0.9.13.1 live-trader risk + orphan-adoption helpers.
+"""Unit tests for v0.9.13 / v0.9.13.1 / v0.9.13.2 live-trader risk + orphan-adoption helpers.
 
 These pin the incomplete-merge regressions that bit the first v0.9.13 land:
   1. vol_min floor must HARD-REJECT when actual risk > max(risk_cap, 1.5%) or 3× target
@@ -35,9 +35,22 @@ class _FakeMT5:
     TRADE_RETCODE_DONE = 10009
     TRADE_RETCODE_DONE_PARTIAL = 10010
 
-    def __init__(self, positions: list[dict] | None = None, equity: float = 3000.0):
+    def __init__(self, positions: list[dict] | None = None, equity: float = 3000.0,
+                 history_deals: list[dict] | None = None):
         self._positions = list(positions or [])
         self._equity = equity
+        self._history = list(history_deals or [])
+
+    def history_deals_select(self, *_args, **_kwargs) -> bool:
+        return True
+
+    def history_deals_get(self, **kwargs: Any) -> list[SimpleNamespace]:
+        pos_id = kwargs.get("position", -1)
+        out = []
+        for d in self._history:
+            if int(d.get("position", -1)) == int(pos_id):
+                out.append(SimpleNamespace(**d))
+        return out
 
     def account_info(self) -> SimpleNamespace:
         return SimpleNamespace(equity=self._equity, balance=self._equity, currency="ZAR", leverage=2000)
@@ -211,6 +224,67 @@ class TestOrphanAge:
         assert lt is not None
         assert lt.direction == -1
         assert lt.lots == 0.02
+
+
+# --------------------------------------------------------------------------- #
+# Realized P&L from broker deal history (was last-poll estimate -> 4x understated)
+# --------------------------------------------------------------------------- #
+
+class TestDealProfit:
+    def test_returns_realized_from_history(self, trader: LiveTrader):
+        mt5 = _FakeMT5(
+            history_deals=[
+                {"position": 3148230553, "profit": -37.75, "commission": -0.0, "swap": 0.0},
+            ]
+        )
+        trader.mt5 = mt5
+        # The 16:14 live SL in v0.9.13.1: bot recorded -9.60ZAR (last-poll
+        # unrealized) but the broker really lost -37.75ZAR.
+        assert trader._deal_profit(3148230553) == pytest.approx(-37.75)
+
+    def test_returns_none_when_no_deals(self, trader: LiveTrader):
+        assert trader._deal_profit(999) is None
+
+    def test_exit_prefers_deal_history_over_last_poll_estimate(self, trader: LiveTrader):
+        """Regression: a stop filled between polls must book the REALIZED
+        broker loss, not the stale unrealized profit from the previous poll."""
+        ticket = 3148230553
+        trader.live = True
+        mt5 = _FakeMT5(
+            positions=[],  # position already closed broker-side
+            history_deals=[
+                {"position": ticket, "profit": -37.75, "commission": 0.0, "swap": 0.0},
+            ],
+        )
+        trader.mt5 = mt5
+        lt = LiveTrade(
+            ticket=ticket, direction=1, entry=4606.919, sl=4604.424, tp=4609.040,
+            lots=0.01, open_time=datetime.now(UTC), grade="A", risk_pct=0.0131,
+        )
+        trader._trades[ticket] = lt
+        # Previous poll saw the position still open at an unrealized -9.60.
+        trader._last_broker_pos = {ticket: {"profit": -9.60, "magic": MAGIC,
+                                            "symbol": "XAUUSDm", "ticket": ticket}}
+
+        trader._monitor_positions(None)
+
+        assert lt.closed is True
+        assert lt.close_reason == "BROKER"
+        assert lt.pnl == pytest.approx(-37.75)  # ground truth, NOT -9.60
+
+    def test_exit_falls_back_to_last_poll_when_no_history(self, trader: LiveTrader):
+        ticket = 7
+        trader.live = True
+        trader.mt5 = _FakeMT5(positions=[])  # no history deals
+        lt = LiveTrade(
+            ticket=ticket, direction=-1, entry=4600.0, sl=4605.0, tp=4595.0,
+            lots=0.01, open_time=datetime.now(UTC), grade="C", risk_pct=0.005,
+        )
+        trader._trades[ticket] = lt
+        trader._last_broker_pos = {ticket: {"profit": -3.0, "magic": MAGIC,
+                                            "symbol": "XAUUSDm", "ticket": ticket}}
+        trader._monitor_positions(None)
+        assert lt.pnl == pytest.approx(-3.0)
 
 
 # --------------------------------------------------------------------------- #

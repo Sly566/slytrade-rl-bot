@@ -1,4 +1,4 @@
-# SlyTrade v0.9.13.1 SCALPER LIVE — Quick Start
+# SlyTrade v0.9.13.2 SCALPER LIVE — Quick Start
 
 v0.9.13 ships **4 setup kinds** so the bot is IN the move printing money, not
 sitting on hands waiting for a retest that may never come:
@@ -27,7 +27,7 @@ fires ALL 4 setups long+short so we gauge what needs fixing before Layer 6 RL.
   `bars_held` is seeded from wall-clock age (a 3h-old orphan still times out
   after ~1 more hour, not a fresh 4h clock).
 
-### v0.9.13.1 sleep-crash fix (current)
+### v0.9.13.1 sleep-crash fix
 
 - **`_clamp_sleep` guard**: every `time.sleep` in the run loop now routes
   through `LiveTrader._clamp_sleep(...)`, which clamps to `>= 0` before
@@ -36,6 +36,23 @@ fires ALL 4 setups long+short so we gauge what needs fixing before Layer 6 RL.
   `time.sleep(negative)` raised `ValueError: sleep length must be
   non-negative`, killing the trader (the 13:14 crash). NaN/±inf/garbage also
   collapse to 0.0 so no input can take the loop down.
+
+### v0.9.13.2 loss accounting + BOS_CONT anchor fix (current)
+
+- **Realized P&L from broker deal history**: when a position closes between
+  polls, the bot now pulls the actual fill P&L from MT5 deal history
+  (`_deal_profit`) instead of the last-poll unrealized estimate. The 16:14 SL
+  in v0.9.13.1 was recorded as `-9.60ZAR` while the broker really lost
+  `-37.75ZAR` — the estimate understated stopped-out losses (and would have
+  poisoned RL rewards). Falls back to the old estimate only if history is
+  unavailable.
+- **BOS_CONT uses the nearest opposing minor swing** (trigger-TF vs M1) as its
+  SL anchor. The M5 ATR-ZigZag level is forward-filled and only refreshes when
+  a new pivot confirms `1.5×ATR` away, so in a trend it can sit 35+ pts behind
+  price (16:16 live: `risk=39.38 atr=2.06` ≈ 19×ATR) — the old code anchored
+  every BOS_CONT stop to that stale level and the 0.5–7 ATR band rejected it,
+  so BOS_CONT could never fire in trending/choppy markets. Now the fresh M1
+  level (the one the bar actually broke FROM) is used when it's nearer.
 
 ## 1. Start the MT5 bridge (terminal 1)
 
@@ -109,6 +126,8 @@ All positions carry magic number **260810** so the bot only manages its own trad
 - **M15 CHoCH emergency** — closes immediately if M15 CHoCH prints against (including adopted orphans)
 - **Time-stop** — closes after 240 M1 bars (4h) regardless of P&L; orphan age seeds `bars_held`
 - **Clamped sleeps** (v0.9.13.1) — every `time.sleep` goes through `_clamp_sleep` so a negative remaining duration (wall-clock crossing `end_wait` mid-iteration) can never raise `ValueError` and kill the loop
+- **Ground-truth trade P&L** (v0.9.13.2) — broker-side closes are reconciled from MT5 deal history, not the last-poll unrealized estimate, so wins/losses and realized stats match the account
+- **BOS_CONT fresh anchor** (v0.9.13.2) — SL uses the nearest opposing M1/TF minor swing, so a stale M5 pivot can't inflate a scalp stop to 19×ATR and get it auto-rejected
 - **Champion persona filters** (longs-only, ≥2 ATR stops, A+/A/B, M5+M15 OBs, London+NY only, Asian off) are ON by default
 - **500-point deviation** budget on market orders; IOC fill with RETURN fallback
 - **Graceful Ctrl+C** — finishes current cycle, disconnects cleanly

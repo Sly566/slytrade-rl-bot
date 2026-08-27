@@ -785,17 +785,28 @@ def _evaluate_row(i: int,
                 _reject(f"BOS_CONT {side}: no fresh BOS/CHoCH this bar (stale trigger)")
             continue
 
-        # SL anchor: last opposing minor swing (the level just broken FROM)
+        # SL anchor: last opposing minor swing (the level just broken FROM).
+        # v0.9.13.2: the trigger-TF (M5) ATR-ZigZag level is forward-filled and
+        # can be hours old — it only refreshes when a NEW pivot confirms 1.5×
+        # ATR away, so after a wide trend the "last opposing M5 swing" can sit
+        # 35+ pts back while the M1 level the bar actually broke FROM is 2 pts
+        # away. The old code anchored to that stale M5 level (16:16 live:
+        # risk=39.38 vs atr=2.06 ≈ 19×ATR), which the 0.5–7 ATR band below
+        # always rejected — BOS_CONT could never fire while M5 pivots lagged.
+        # Use the NEAREST valid opposing swing across trigger-TF + M1: the
+        # fresh M1 level when present, the trigger-TF level otherwise.
         if direction == 1:
-            sl_anchor = row.get(f'{trigger_tf}_minor_swing_low', np.nan)
-            if pd.isna(sl_anchor): sl_anchor = row.get('minor_swing_low', np.nan)
+            anchors = [row.get(f'{trigger_tf}_minor_swing_low', np.nan),
+                       row.get('minor_swing_low', np.nan)]
         else:
-            sl_anchor = row.get(f'{trigger_tf}_minor_swing_high', np.nan)
-            if pd.isna(sl_anchor): sl_anchor = row.get('minor_swing_high', np.nan)
-        if pd.isna(sl_anchor):
+            anchors = [row.get(f'{trigger_tf}_minor_swing_high', np.nan),
+                       row.get('minor_swing_high', np.nan)]
+        anchors = [float(a) for a in anchors if not (a is None or pd.isna(a))]
+        if not anchors:
             if fail_trace is not None:
                 _reject(f"BOS_CONT {side}: no minor swing anchor for SL")
             continue
+        sl_anchor = min(anchors, key=lambda a: abs(a - c))
         entry = c
         buffer_amt = cfg.exits.ob_invalidation_buffer * atr
         if direction == 1:

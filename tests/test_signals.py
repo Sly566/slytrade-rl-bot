@@ -318,6 +318,84 @@ class TestEvaluateRow:
         assert s.r_multiple_tp2 == pytest.approx(2.0)
 
 
+class TestBOSControlAnchor:
+    """BOS_CONT SL anchor must use the NEAREST opposing minor swing.
+
+    v0.9.13.2 regression: the trigger-TF (M5) ATR-ZigZag level is ffilled and
+    only refreshes when a new pivot confirms 1.5×ATR away. In a trend it can
+    sit hours/35+ pts behind price (16:16 live: risk=39.38 vs atr=2.06 ≈ 19×
+    ATR), so the old M5-first anchor always failed the 0.5–7 ATR band and
+    BOS_CONT never fired.
+    """
+
+    def _cfg(self):
+        return StrategyConfig(
+            exits=ExitPlan(tp1_r=0.85, tp1_pct=0.4, tp2_r=2.0, tp2_pct=0.3,
+                           ob_invalidation_buffer=0.1),
+            sessions=SessionFilter(),  # NY KZ allowed (row is 13:30 NY)
+            confluence=ConfluenceConfig(
+                min_atr_pct=0.0001, min_risk_atr=0.0, max_risk_atr=100.0,
+                accept_ob_tfs=("H1", "M15", "M5"),
+                accept_zone_kinds=("OB", "FVG"),
+                accept_grades=("A+", "A", "B", "C"),
+                accept_longs=True, accept_shorts=True,
+                persona_gating=False,
+            ),
+        )
+
+    def test_uses_fresh_m1_anchor_when_m5_is_stale(self):
+        cfg = self._cfg()
+        row = _row(
+            close=3000.0, atr_14=2.0,
+            M5_minor_bos_up=True,
+            M5_minor_swing_low=2985.0,   # hours old, 15 pts away (7.5× ATR)
+            minor_swing_low=2998.0,      # the M1 level the bar broke FROM
+        )
+        sig = _evaluate_row(0, row, cfg, _empty_state())
+        assert sig is not None, "stale M5 anchor must not kill BOS_CONT"
+        assert sig.setup_kind == "BOS_CONT"
+        assert sig.direction == 1
+        # SL = fresh M1 swing - 0.1×ATR buffer; risk ≈ 2.2 (within 0.5-7 ATR)
+        assert sig.stop == pytest.approx(2998.0 - 0.1 * 2.0)
+        assert sig.risk_per_unit == pytest.approx(2.0 + 0.2)
+
+    def test_keeps_trigger_tf_anchor_when_it_is_nearest(self):
+        cfg = self._cfg()
+        row = _row(
+            close=3000.0, atr_14=2.0,
+            M5_minor_bos_up=True,
+            M5_minor_swing_low=2998.0,   # fresh M5 anchor, 2 pts away
+            minor_swing_low=2997.0,      # M1 anchor is farther
+        )
+        sig = _evaluate_row(0, row, cfg, _empty_state())
+        assert sig is not None
+        assert sig.setup_kind == "BOS_CONT"
+        assert sig.stop == pytest.approx(2998.0 - 0.1 * 2.0)
+
+    def test_still_rejects_when_both_anchors_stale(self):
+        cfg = self._cfg()
+        row = _row(
+            close=3000.0, atr_14=2.0,
+            M5_minor_bos_up=True,
+            M5_minor_swing_low=2985.0,   # 7.5× ATR away
+            minor_swing_low=2986.0,      # also far
+        )
+        sig = _evaluate_row(0, row, cfg, _empty_state())
+        assert sig is None  # both anchors break the 0.5-7 ATR band -> reject
+
+    def test_falls_back_to_m5_when_m1_anchor_missing(self):
+        cfg = self._cfg()
+        row = _row(
+            close=3000.0, atr_14=2.0,
+            M5_minor_bos_up=True,
+            M5_minor_swing_low=2998.0,   # only M5 anchor exists
+        )
+        sig = _evaluate_row(0, row, cfg, _empty_state())
+        assert sig is not None
+        assert sig.setup_kind == "BOS_CONT"
+        assert sig.stop == pytest.approx(2998.0 - 0.1 * 2.0)
+
+
 class TestRunnerTarget:
     def test_picks_nearest_reasonable_swing(self):
         cfg = _permissive_cfg()
