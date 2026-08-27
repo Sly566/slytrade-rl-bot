@@ -398,8 +398,22 @@ def _evaluate_row(i: int,
                        bool(row.get('major_bos_dn', False)) or
                        bool(row.get('minor_choch_dn', False)) or
                        bool(row.get('major_choch_dn', False)))
+    # Detect opposite-CHoCH transitions BEFORE updating triggers so we can
+    # use them to reset the BOS_CONT one-shot flag below.
+    bull_choch_now = (bool(row.get(f'{trigger_tf}_minor_choch_up', False)) or
+                      bool(row.get(f'{trigger_tf}_major_choch_up', False)) or
+                      bool(row.get('minor_choch_up', False)) or
+                      bool(row.get('major_choch_up', False)))
+    bear_choch_now = (bool(row.get(f'{trigger_tf}_minor_choch_dn', False)) or
+                      bool(row.get(f'{trigger_tf}_major_choch_dn', False)) or
+                      bool(row.get('minor_choch_dn', False)) or
+                      bool(row.get('major_choch_dn', False)))
+
+    bull_trigger_this_bar = False
+    bear_trigger_this_bar = False
     if bull_trig_fresh:
         state['_last_bull_trigger'] = t_now
+        bull_trigger_this_bar = True
         # m5_bull = any bullish structural impulse on the trigger TF (M5).
         # v0.9.5 omitted minor_choch_up / major_choch_up here, which meant
         # a bullish M5 CHoCH (which IS a valid fresh M5 trigger for retest
@@ -414,6 +428,7 @@ def _evaluate_row(i: int,
             state['_last_bull_trigger_m5'] = t_now
     if bear_trig_fresh:
         state['_last_bear_trigger'] = t_now
+        bear_trigger_this_bar = True
         m5_bear = bool(row.get(f'{trigger_tf}_bear_disp', False)) or \
                  bool(row.get(f'{trigger_tf}_minor_bos_dn', False)) or \
                  bool(row.get(f'{trigger_tf}_major_bos_dn', False)) or \
@@ -421,6 +436,16 @@ def _evaluate_row(i: int,
                  bool(row.get(f'{trigger_tf}_major_choch_dn', False))
         if m5_bear:
             state['_last_bear_trigger_m5'] = t_now
+
+    # BOS_CONT one-shot: reset "entered" flag when an opposite CHoCH fires
+    # (structure flip = new leg, so the next same-direction BOS break is a
+    # fresh setup). Without this, one bear BOS entry blocks the next bear
+    # BOS for the rest of the trend even after a CHoCH-up pullback and a
+    # fresh BOS-down continuation.
+    if bull_choch_now:
+        state['_bos_entered_-1'] = False   # bear BOS arm re-armed by bull CHoCH
+    if bear_choch_now:
+        state['_bos_entered_+1'] = False   # bull BOS arm re-armed by bear CHoCH
 
     # --- 1c. Liquidity sweep tracking ---
     # Track sweep events AND invalidate them if price penetrates beyond the
@@ -699,11 +724,36 @@ def _evaluate_row(i: int,
                 if fail_trace is not None:
                     _reject(f"BOS_CONT {side}: persona requires disp+vol_surge")
                 continue
-        # Dedupe per BOS bar
-        bos_key = f"_bos_{direction}_{t_now.isoformat()}"
-        if state.get(bos_key):
+
+        # ONE-SHOT PER STRUCTURAL LEG (v0.9.8 fix): the ATR-ZigZag edge-flag
+        # (sh_broken/sl_broken) resets every time a new swing pivot forms, so
+        # during a strong impulse (e.g. the 08:34 London bear leg that dropped
+        # from 4603→4595 in 5 minutes) a fresh minor_bos_dn fires on MULTIPLE
+        # consecutive bars as each successive lower swing-low gets broken.
+        # Without this guard we entered 5 SHORT BOS_CONT positions (tickets
+        # 3145423145..3145441280) on the same bear leg — piling in to what
+        # should have been ONE scalp. We now allow AT MOST one BOS_CONT entry
+        # per direction per leg, reset only by an opposite CHoCH (detected
+        # above in Phase 1b).
+        bos_arm_key = f'_bos_entered_{direction:+d}'
+        if state.get(bos_arm_key, False):
+            if fail_trace is not None:
+                _reject(f"BOS_CONT {side}: already entered this leg (one-shot until opposite CHoCH)")
             continue
-        state[bos_key] = True
+
+        # BOS_CONT fires ONLY on a bar where the trigger timestamp was JUST
+        # refreshed (i.e. a fresh structural impulse occurred THIS bar). The
+        # previous behaviour allowed re-entry on bars where bear_window was
+        # open and minor_bos_dn was "still hot" from a prior bar — which
+        # combined with the ATR-ZigZag edge-reset bug to pyramid entries.
+        # This strict "trigger fired this bar" check is the belt; the
+        # one-shot arm key above is the suspenders.
+        trigger_fresh_this_bar = (bull_trigger_this_bar if direction == 1 else bear_trigger_this_bar)
+        structure_now = tf_structure or m1_structure
+        if not (trigger_fresh_this_bar and structure_now):
+            if fail_trace is not None:
+                _reject(f"BOS_CONT {side}: no fresh BOS/CHoCH this bar (stale trigger)")
+            continue
 
         # SL anchor: last opposing minor swing (the level just broken FROM)
         if direction == 1:
@@ -780,6 +830,9 @@ def _evaluate_row(i: int,
             atr_at_entry=atr, htf_bias_summary=bias_summary,
             session=str(row.get('session','')), killzone=kz_tag,
         )
+        # Arm the one-shot so we don't re-enter same leg (reset by opposite
+        # CHoCH in Phase 1b above).
+        state[bos_arm_key] = True
         return sig
 
     if not candidates:

@@ -1,4 +1,4 @@
-"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.7 scalper persona.
+"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.8 scalper persona.
 
 Connects to MT5 via the mt5linux RPyC bridge (run `bash start_mt5_bridge.sh`
 in another terminal first), pulls multi-timeframe bars, computes Layer 2
@@ -18,7 +18,7 @@ Run:
     python -m slytrade.live.trader --symbol XAUUSDm --all --verbose  # see ALL signals
     python -m slytrade.live.trader --symbol XAUUSDm --live     # real trading (champion)
 
-Default persona: v0.9.7 champion (longs-only, 0.85R one-shot, >=2 ATR stops,
+Default persona: v0.9.8 champion (longs-only, 0.85R one-shot, >=2 ATR stops,
 grades A+/A/B, M5+M15 OBs, London/NY). Use --all to switch to the unrestricted
 scalper persona (long+short, all grades, H1+M15+M5 OBs+FVGs, LIQ_SWEEP + BOS_CONT
 quick scalps, Asian+off-hours unlocked, persona_gating=False) so you see
@@ -322,30 +322,49 @@ class LiveTrader:
         bid, ask = self.quote()
         price = ask if direction == 1 else bid
         digits = self.spec.digits
-        req = {
-            "action": self.mt5.TRADE_ACTION_DEAL,
-            "symbol": self.symbol,
-            "volume": round(float(lots), 2),
-            "type": self.mt5.ORDER_TYPE_BUY if direction == 1 else self.mt5.ORDER_TYPE_SELL,
-            "price": price,
-            "sl": round(float(sl), digits),
-            "tp": round(float(tp), digits),
-            "deviation": 30,
-            "magic": MAGIC,
-            "comment": comment[:31],
-            "type_time": self.mt5.ORDER_TIME_GTC,
-            "type_filling": self.mt5.ORDER_FILLING_IOC,
-        }
+        # Deviation: v0.9.7 used 30 points (= $0.03 on XAUUSDm) which is too
+        # tight for London/NY volatility — a 50-cent spike during a sweep/BOS
+        # is normal and produces retcode=-1 / "old price" rejects. Bump to
+        # 500 points ($0.50 on XAU, ~5 pips on FX) which is tolerable slippage
+        # on our 0.01-lot scalps (max 0.50 * 100 * 0.01 = $0.50 ≈ R9 extra).
+        deviation = 500
+        # Try ORDER_FILLING_IOC first (Exness ECN accounts accept it); on
+        # rejection (retcode 10030 / "Unsupported filling mode"), fall back to
+        # ORDER_FILLING_RETURN which market-makers accept. v0.9.7 hard-coded
+        # IOC with no fallback, producing silent retcode=-1 failures.
+        filling_modes = [self.mt5.ORDER_FILLING_IOC, self.mt5.ORDER_FILLING_RETURN]
+        DONE = {int(getattr(self.mt5, "TRADE_RETCODE_DONE", 10009)),
+                int(getattr(self.mt5, "TRADE_RETCODE_DONE_PARTIAL", 10010))}
         if not self.live:
             print(f"    [DRY-RUN] {'BUY' if direction==1 else 'SELL'} {lots} {self.symbol} @ {price:.{digits}f}  SL={sl:.{digits}f}  TP={tp:.{digits}f}  ({comment})")
             return -int(time.time() * 1000)   # fake ticket
-        res = _to_dict(self.mt5.order_send(req))
-        retcode = int(res.get("retcode", -1))
-        DONE = {int(getattr(self.mt5, "TRADE_RETCODE_DONE", 10009)),
-                int(getattr(self.mt5, "TRADE_RETCODE_DONE_PARTIAL", 10010))}
-        if retcode in DONE:
-            return int(res.get("order", 0)) or int(res.get("deal", 0))
-        print(f"    [REJECT] {retcode} {res.get('comment','')} req={req}")
+        for fill_mode in filling_modes:
+            req = {
+                "action": self.mt5.TRADE_ACTION_DEAL,
+                "symbol": self.symbol,
+                "volume": round(float(lots), 2),
+                "type": self.mt5.ORDER_TYPE_BUY if direction == 1 else self.mt5.ORDER_TYPE_SELL,
+                "price": price,
+                "sl": round(float(sl), digits),
+                "tp": round(float(tp), digits),
+                "deviation": deviation,
+                "magic": MAGIC,
+                "comment": comment[:31],
+                "type_time": self.mt5.ORDER_TIME_GTC,
+                "type_filling": fill_mode,
+            }
+            res = _to_dict(self.mt5.order_send(req))
+            retcode = int(res.get("retcode", -1))
+            if retcode in DONE:
+                if fill_mode == self.mt5.ORDER_FILLING_RETURN:
+                    print("    [INFO] order used ORDER_FILLING_RETURN (IOC unsupported)")
+                return int(res.get("order", 0)) or int(res.get("deal", 0))
+            # Retcode 10030 = "Unsupported filling mode" → fall through to next.
+            if retcode in (10030,):
+                continue
+            print(f"    [REJECT] {retcode} {res.get('comment','')} req_fill={fill_mode} req={req}")
+            return None
+        print(f"    [REJECT] all filling modes rejected for {comment}")
         return None
 
     def _close_position(self, ticket: int, reason: str) -> bool:
@@ -359,30 +378,38 @@ class LiveTrader:
         bid, ask = self.quote()
         price = bid if ptype == 0 else ask
         digits = self.spec.digits
-        req = {
-            "action": self.mt5.TRADE_ACTION_DEAL,
-            "symbol": self.symbol,
-            "volume": round(vol, 2),
-            "type": close_type,
-            "position": int(ticket),
-            "price": price,
-            "deviation": 30,
-            "magic": MAGIC,
-            "comment": reason[:31],
-            "type_time": self.mt5.ORDER_TIME_GTC,
-            "type_filling": self.mt5.ORDER_FILLING_IOC,
-        }
+        deviation = 500  # match _place_market
+        DONE = {int(getattr(self.mt5, "TRADE_RETCODE_DONE", 10009)),
+                int(getattr(self.mt5, "TRADE_RETCODE_DONE_PARTIAL", 10010))}
         if not self.live:
             lt = self._trades.get(int(ticket))
             if lt:
                 lt.closed = True; lt.close_reason = reason; lt.close_price = price
             print(f"    [DRY-RUN] CLOSE ticket={ticket} @ {price:.{digits}f} ({reason})")
             return True
-        res = _to_dict(self.mt5.order_send(req))
-        retcode = int(res.get("retcode", -1))
-        DONE = {int(getattr(self.mt5, "TRADE_RETCODE_DONE", 10009)),
-                int(getattr(self.mt5, "TRADE_RETCODE_DONE_PARTIAL", 10010))}
-        return retcode in DONE
+        for fill_mode in (self.mt5.ORDER_FILLING_IOC, self.mt5.ORDER_FILLING_RETURN):
+            req = {
+                "action": self.mt5.TRADE_ACTION_DEAL,
+                "symbol": self.symbol,
+                "volume": round(vol, 2),
+                "type": close_type,
+                "position": int(ticket),
+                "price": price,
+                "deviation": deviation,
+                "magic": MAGIC,
+                "comment": reason[:31],
+                "type_time": self.mt5.ORDER_TIME_GTC,
+                "type_filling": fill_mode,
+            }
+            res = _to_dict(self.mt5.order_send(req))
+            retcode = int(res.get("retcode", -1))
+            if retcode in DONE:
+                return True
+            if retcode in (10030,):
+                continue
+            print(f"    [CLOSE-REJECT] ticket={ticket} retcode={retcode} {res.get('comment','')} fill={fill_mode}")
+            return False
+        return False
 
     def _get_position(self, ticket: int) -> dict | None:
         positions = self.mt5.positions_get(ticket=int(ticket)) or []
@@ -421,7 +448,14 @@ class LiveTrader:
             self._vlog(f"{side} {setup} blocked by accept_shorts=False"); self._signals_fired.add(key); return
         if sig.direction == 1 and not self.cfg.confluence.accept_longs:
             self._vlog(f"{side} {setup} blocked by accept_longs=False"); self._signals_fired.add(key); return
-        open_n = len(self._our_open_positions()) + sum(1 for t in self._trades.values() if not t.closed)
+        # Single source of truth for open count: _our_open_positions() queries
+        # MT5 directly for all positions with our magic number. v0.9.7 double-
+        # counted by adding len(_trades) on top — _trades tracks LiveTrade
+        # metadata for positions we opened THIS run, all of which are already
+        # in the MT5 query. Orphan positions from prior bot runs that are not
+        # in _trades ARE still in the MT5 query, so this correctly caps total
+        # exposure (orphans count against max_open until they close broker-side).
+        open_n = len(self._our_open_positions())
         if open_n >= self.max_open:
             self._vlog(f"{side} {setup}/{sig.grade} rejected: max_open={self.max_open} reached (open={open_n})")
             return
@@ -794,8 +828,8 @@ class LiveTrader:
 
     # ------------------------------------------------------------------ #
     def run(self) -> None:
-        persona_label = "v0.9.7 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.7 champion (long-only A+/A/B RETEST_OB)"
-        print(f"SlyTrade LIVE v0.9.7  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  max_open={self.max_open}")
+        persona_label = "v0.9.8 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.8 champion (long-only A+/A/B RETEST_OB)"
+        print(f"SlyTrade LIVE v0.9.8  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  max_open={self.max_open}")
         print(f"persona: {persona_label}")
         print("setups : RETEST_OB RETEST_FVG LIQ_SWEEP BOS_CONT  (champion gates apply unless --all)")
         print(f"Magic={MAGIC}")
@@ -839,7 +873,7 @@ class LiveTrader:
 # --------------------------------------------------------------------------- #
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="SlyTrade v0.9.7 SCALPER LIVE trader (OB/FVG retests + liq sweeps + BOS continuation)")
+    ap = argparse.ArgumentParser(description="SlyTrade v0.9.8 SCALPER LIVE trader (OB/FVG retests + liq sweeps + BOS continuation)")
     ap.add_argument("--symbol", default="XAUUSDm")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=18812)
