@@ -1,4 +1,4 @@
-"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.6 scalper persona.
+"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.7 scalper persona.
 
 Connects to MT5 via the mt5linux RPyC bridge (run `bash start_mt5_bridge.sh`
 in another terminal first), pulls multi-timeframe bars, computes Layer 2
@@ -18,7 +18,7 @@ Run:
     python -m slytrade.live.trader --symbol XAUUSDm --all --verbose  # see ALL signals
     python -m slytrade.live.trader --symbol XAUUSDm --live     # real trading (champion)
 
-Default persona: v0.9.6 champion (longs-only, 0.85R one-shot, >=2 ATR stops,
+Default persona: v0.9.7 champion (longs-only, 0.85R one-shot, >=2 ATR stops,
 grades A+/A/B, M5+M15 OBs, London/NY). Use --all to switch to the unrestricted
 scalper persona (long+short, all grades, H1+M15+M5 OBs+FVGs, LIQ_SWEEP + BOS_CONT
 quick scalps, Asian+off-hours unlocked, persona_gating=False) so you see
@@ -152,13 +152,13 @@ def fetch_bars(mt5: Any, symbol: str, timeframe: str, count: int) -> pd.DataFram
     CRITICAL CAUSALITY RULE: MT5's copy_rates_from_pos(symbol, tf, 0, N) ALWAYS
     returns the CURRENTLY-FORMING bar as the LAST row -- its OHLC is mutating
     in real time and must NEVER be fed into the feature pipeline or signal
-    engine. v0.9.6 guard:
+    engine. v0.9.7 guard:
 
       1. Wall-clock filter: keep bars whose close time has already passed
          on host clock (`time+dur <= now`). Same parity as v0.9.5 wall
          filter -- this tolerates arbitrary Wine/RPyC/NTP clock drift
          between host and MT5 server without filtering out legitimately
-         closed bars (the first v0.9.6 build used `<= now - 2s` which
+         closed bars (the first v0.9.7 build used `<= now - 2s` which
          filtered every bar on Sly's Pop-OS host when host clock lagged
          MT5 server time by ~3s under Wine, producing 0 bars / 'not
          enough M1 data yet' on every cycle). The forming bar's close is
@@ -171,7 +171,7 @@ def fetch_bars(mt5: Any, symbol: str, timeframe: str, count: int) -> pd.DataFram
          safely; an extra unconditional tail drop there (v0.9.5 bug)
          cut off the most recently CLOSED HTF bar, leaving structural
          flags (bull_disp, minor_choch_up, etc.) always one HTF period
-         stale. v0.9.6 fixes that so HTF structure updates the moment
+         stale. v0.9.7 fixes that so HTF structure updates the moment
          the HTF bar closes.
     """
     tf_const = getattr(mt5, TIMEFRAME_ATTRS[timeframe])
@@ -201,7 +201,7 @@ def fetch_bars(mt5: Any, symbol: str, timeframe: str, count: int) -> pd.DataFram
     # minutes in the future, so the wall filter ALONE excludes it safely
     # even with many seconds of clock skew; an extra tail drop there
     # (v0.9.5 bug) cut off the most recently CLOSED HTF bar, leaving
-    # structural flags one HTF period stale. v0.9.6 fixes that.
+    # structural flags one HTF period stale. v0.9.7 fixes that.
     if timeframe == "M1" and len(df) > 1:
         df = df.iloc[:-1].copy()
     # Keep only the last `count` completed bars
@@ -794,8 +794,8 @@ class LiveTrader:
 
     # ------------------------------------------------------------------ #
     def run(self) -> None:
-        persona_label = "v0.9.6 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.6 champion (long-only A+/A/B RETEST_OB)"
-        print(f"SlyTrade LIVE v0.9.6  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  max_open={self.max_open}")
+        persona_label = "v0.9.7 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.7 champion (long-only A+/A/B RETEST_OB)"
+        print(f"SlyTrade LIVE v0.9.7  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  max_open={self.max_open}")
         print(f"persona: {persona_label}")
         print("setups : RETEST_OB RETEST_FVG LIQ_SWEEP BOS_CONT  (champion gates apply unless --all)")
         print(f"Magic={MAGIC}")
@@ -839,7 +839,7 @@ class LiveTrader:
 # --------------------------------------------------------------------------- #
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="SlyTrade v0.9.6 SCALPER LIVE trader (OB/FVG retests + liq sweeps + BOS continuation)")
+    ap = argparse.ArgumentParser(description="SlyTrade v0.9.7 SCALPER LIVE trader (OB/FVG retests + liq sweeps + BOS continuation)")
     ap.add_argument("--symbol", default="XAUUSDm")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=18812)

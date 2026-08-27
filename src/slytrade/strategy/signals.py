@@ -423,10 +423,21 @@ def _evaluate_row(i: int,
             state['_last_bear_trigger_m5'] = t_now
 
     # --- 1c. Liquidity sweep tracking ---
+    # Track sweep events AND invalidate them if price penetrates beyond the
+    # wick extreme (i.e. the "stop-run" didn't reverse — it turned into a
+    # continuation). v0.9.6 only checked current bar close vs sweep_px, which
+    # let a bull sweep at 4597 get smashed through to 4594 then fire a bad long
+    # when price rallied back to 4600 — the reversal thesis was already dead
+    # the moment price closed 3+ points below the sweep wick.
+    low = float(row.get('low', c))
+    high = float(row.get('high', c))
     for direction in (1, -1):
         side = 'bull' if direction == 1 else 'bear'
         m1_sweep_now = bool(row.get('bull_liq_sweep' if direction==1 else 'bear_liq_sweep', False))
         tf_sweep_now = bool(row.get(f'{trigger_tf}_{"bull" if direction==1 else "bear"}_liq_sweep', False))
+        sweep_key_ts = f'_last_{side}_sweep_ts'
+        sweep_key_px = f'_last_{side}_sweep_px'
+        sweep_key_inv = f'_last_{side}_sweep_invaded'
         if m1_sweep_now or tf_sweep_now:
             sweep_px = np.nan
             if m1_sweep_now:
@@ -434,8 +445,22 @@ def _evaluate_row(i: int,
             if pd.isna(sweep_px) and tf_sweep_now:
                 sweep_px = row.get(f'{trigger_tf}_{"bull" if direction==1 else "bear"}_sweep_px', np.nan)
             if pd.notna(sweep_px):
-                state[f'_last_{side}_sweep_ts'] = t_now
-                state[f'_last_{side}_sweep_px'] = float(sweep_px)
+                state[sweep_key_ts] = t_now
+                state[sweep_key_px] = float(sweep_px)
+                # New sweep resets invalidation
+                state[sweep_key_inv] = False
+        # Check if price has violated the sweep extreme since the sweep was set.
+        # A bull sweep is a wick below a low — if price subsequently makes a
+        # lower LOW more than 0.5 ATR below the sweep wick, the stop-run failed
+        # (turning into continuation) and the reversal setup is dead until a
+        # fresh sweep fires. Bear sweep symmetric.
+        sweep_px_cur = state.get(sweep_key_px)
+        if sweep_px_cur is not None and not state.get(sweep_key_inv, False):
+            inv_buffer = 0.5 * atr if atr > 0 else 0.5
+            if direction == 1 and low < float(sweep_px_cur) - inv_buffer:
+                state[sweep_key_inv] = True
+            elif direction == -1 and high > float(sweep_px_cur) + inv_buffer:
+                state[sweep_key_inv] = True
 
     # ================================================================== #
     # PHASE 2: ENTRY GATES -- applied to decide whether to emit a Signal
@@ -509,8 +534,18 @@ def _evaluate_row(i: int,
         sweep_extreme = state.get(f'_last_{side}_sweep_px')
         if sweep_extreme is None:
             continue
-        # Invalidate if price has already pushed back through the sweep
-        # extreme (sweep failed -> continuation, not reversal)
+        # Per-bar invalidation flag: if price penetrated more than 0.5 ATR
+        # through the sweep wick after the sweep fired, the reversal is dead
+        # (the stop-run turned into continuation) and we do NOT enter even
+        # if close is back above the wick on a later rally. This is the bug
+        # that cost ~53 ZAR on the 07:29 long (price crashed to 4594 -- 3
+        # points below the 4597 sweep -- then rallied to 4600 and fired long
+        # into the bear continuation).
+        if state.get(f'_last_{side}_sweep_invaded', False):
+            if fail_trace is not None:
+                _reject(f"LIQ_SWEEP {side}: sweep penetrated post-sweep (failed reversal, now continuation)")
+            continue
+        # Current bar close must still be on the reversal side of the wick.
         if direction == 1 and c < float(sweep_extreme):
             if fail_trace is not None:
                 _reject(f"LIQ_SWEEP {side}: c={c:.2f} < sweep_px={float(sweep_extreme):.2f} (failed reversal)")
@@ -568,6 +603,19 @@ def _evaluate_row(i: int,
             conf_tags = ['scalp_fallback_c']
         elif cfg.confluence.persona_gating and grade not in cfg.confluence.accept_grades:
             continue
+        # Scalp grades cap: LIQ_SWEEP is a quick reversal scalp against a
+        # fresh wick -- HTF bias can be laggy right after a sweep (the D1/H4/
+        # H1 bias was still bull on the 07:29 bar even though price had been
+        # selling off for 25 minutes straight, leading to an A+ grade on a
+        # losing scalp). Cap LIQ_SWEEP at B in champion mode, at C in
+        # unrestricted mode. Retain A+/A for retest setups only.
+        if not cfg.confluence.persona_gating:
+            if grade in ('A+', 'A', 'B'):
+                conf_tags.append(f'downgraded_from_{grade}')
+                grade = 'C'
+        elif grade == 'A+':
+            conf_tags.append('downgraded_from_A+')
+            grade = 'B'
 
         if direction == 1:
             tp1 = entry + cfg.exits.tp1_r * risk
@@ -691,6 +739,16 @@ def _evaluate_row(i: int,
         elif cfg.confluence.persona_gating and grade not in cfg.confluence.accept_grades:
             # Champion persona only: only BOS_CONT with A+/A/B grade
             continue
+        # Scalp grade cap for BOS_CONT (same reasoning as LIQ_SWEEP: M1 impulse
+        # scalps against laggy HTF bias must never size as A+/A in unrestricted
+        # mode, and cap at B in champion mode).
+        if not cfg.confluence.persona_gating:
+            if grade in ('A+', 'A', 'B'):
+                conf_tags.append(f'downgraded_from_{grade}')
+                grade = 'C'
+        elif grade == 'A+':
+            conf_tags.append('downgraded_from_A+')
+            grade = 'B'
 
         if direction == 1:
             tp1 = entry + cfg.exits.tp1_r * risk
@@ -701,13 +759,14 @@ def _evaluate_row(i: int,
         if tgt_px is None:
             tgt_px = entry + direction * 2.0 * risk
             tgt_tf = '2R_scalp'
-        # BOS continuation scalps are half-size by default (quick in-out)
+        # BOS continuation scalps are 60% size (quick in-out momentum ride).
         risk_pct = cfg.grades.risk_fraction(grade) * 0.6
 
         tags = [f'trigger_{trigger_tf}', 'setup_BOS_CONT'] + conf_tags
         tags.append(f'grade_{grade}')
         tags.append(f'kz_{kz_tag}')
-        tags.append('vol_spike')
+        if has_vol:
+            tags.append('vol_spike')
         bias_summary = {}
         for tf in ('W1','D1','H4','H1','M30','M15','M5'):
             b = row.get(f'{tf}_major_bias', 0)
