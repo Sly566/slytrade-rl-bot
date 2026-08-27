@@ -752,6 +752,14 @@ def _evaluate_row(i: int,
         # should have been ONE scalp. We now allow AT MOST one BOS_CONT entry
         # per direction per leg, reset only by an opposite CHoCH (detected
         # above in Phase 1b).
+        #
+        # CALLER RESPONSIBILITY: the one-shot arm key (`_bos_entered_{dir}`)
+        # is SET BY THE CALLER (live trader / backtest engine) AFTER a fill
+        # is confirmed. We only CHECK it here — _evaluate_row never sets it,
+        # so state-priming warmups walking historical bars don't prematurely
+        # arm the key. Without this, a bot restart mid-leg would see the
+        # historical BOS bar during _prime_state, set the key as a side
+        # effect, and block the next legitimate entry after restart.
         bos_arm_key = f'_bos_entered_{direction:+d}'
         if state.get(bos_arm_key, False):
             if fail_trace is not None:
@@ -759,12 +767,11 @@ def _evaluate_row(i: int,
             continue
 
         # BOS_CONT fires ONLY on a bar where the trigger timestamp was JUST
-        # refreshed (i.e. a fresh structural impulse occurred THIS bar). The
-        # previous behaviour allowed re-entry on bars where bear_window was
-        # open and minor_bos_dn was "still hot" from a prior bar — which
-        # combined with the ATR-ZigZag edge-reset bug to pyramid entries.
-        # This strict "trigger fired this bar" check is the belt; the
-        # one-shot arm key above is the suspenders.
+        # refreshed (i.e. a fresh structural impulse occurred THIS bar) AND
+        # a BOS/CHoCH structural break is present THIS BAR. The previous
+        # behaviour allowed re-entry on bars where bear_window was open and
+        # minor_bos_dn was "still hot" from a prior bar — which combined
+        # with the ATR-ZigZag edge-reset bug to pyramid entries.
         trigger_fresh_this_bar = (bull_trigger_this_bar if direction == 1 else bear_trigger_this_bar)
         structure_now = tf_structure or m1_structure
         if not (trigger_fresh_this_bar and structure_now):
@@ -847,9 +854,8 @@ def _evaluate_row(i: int,
             atr_at_entry=atr, htf_bias_summary=bias_summary,
             session=str(row.get('session','')), killzone=kz_tag,
         )
-        # Arm the one-shot so we don't re-enter same leg (reset by opposite
-        # CHoCH in Phase 1b above).
-        state[bos_arm_key] = True
+        # NOTE: caller (live trader / backtest) is responsible for setting
+        # state[bos_arm_key] = True AFTER a successful fill — not here.
         return sig
 
     if not candidates:

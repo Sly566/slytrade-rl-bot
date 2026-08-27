@@ -1,4 +1,4 @@
-"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.8 scalper persona.
+"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.9 scalper persona.
 
 Connects to MT5 via the mt5linux RPyC bridge (run `bash start_mt5_bridge.sh`
 in another terminal first), pulls multi-timeframe bars, computes Layer 2
@@ -18,7 +18,7 @@ Run:
     python -m slytrade.live.trader --symbol XAUUSDm --all --verbose  # see ALL signals
     python -m slytrade.live.trader --symbol XAUUSDm --live     # real trading (champion)
 
-Default persona: v0.9.8 champion (longs-only, 0.85R one-shot, >=2 ATR stops,
+Default persona: v0.9.9 champion (longs-only, 0.85R one-shot, >=2 ATR stops,
 grades A+/A/B, M5+M15 OBs, London/NY). Use --all to switch to the unrestricted
 scalper persona (long+short, all grades, H1+M15+M5 OBs+FVGs, LIQ_SWEEP + BOS_CONT
 quick scalps, Asian+off-hours unlocked, persona_gating=False) so you see
@@ -496,6 +496,14 @@ class LiveTrader:
             ticket=ticket, direction=sig.direction, entry=fill, sl=sl, tp=tp,
             lots=lots, open_time=datetime.now(UTC), grade=sig.grade, risk_pct=risk_pct,
         )
+        # One-shot arm for BOS_CONT: after a successful fill, mark this leg
+        # as "entered" so subsequent consecutive BOS bars in the same leg
+        # don't pyramid additional positions. Reset by opposite CHoCH in
+        # Phase 1b of _evaluate_row (signals.py). This is set HERE in the
+        # live trader (and in the backtest engine), NOT inside _evaluate_row,
+        # so state-priming warmups don't prematurely arm the key.
+        if setup == "BOS_CONT":
+            self._state[f"_bos_entered_{sig.direction:+d}"] = True
         print(f"    [ENTRY] ticket={ticket} {side} {setup} {lots} lots @ {fill:.{self.spec.digits}f} "
               f"grade={sig.grade} {zone_label} kz={sig.killzone} SL={sl:.{self.spec.digits}f} TP={tp:.{self.spec.digits}f}")
 
@@ -828,8 +836,8 @@ class LiveTrader:
 
     # ------------------------------------------------------------------ #
     def run(self) -> None:
-        persona_label = "v0.9.8 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.8 champion (long-only A+/A/B RETEST_OB)"
-        print(f"SlyTrade LIVE v0.9.8  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  max_open={self.max_open}")
+        persona_label = "v0.9.9 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.9 champion (long-only A+/A/B RETEST_OB)"
+        print(f"SlyTrade LIVE v0.9.9  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  max_open={self.max_open}")
         print(f"persona: {persona_label}")
         print("setups : RETEST_OB RETEST_FVG LIQ_SWEEP BOS_CONT  (champion gates apply unless --all)")
         print(f"Magic={MAGIC}")
@@ -873,7 +881,7 @@ class LiveTrader:
 # --------------------------------------------------------------------------- #
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="SlyTrade v0.9.8 SCALPER LIVE trader (OB/FVG retests + liq sweeps + BOS continuation)")
+    ap = argparse.ArgumentParser(description="SlyTrade v0.9.9 SCALPER LIVE trader (OB/FVG retests + liq sweeps + BOS continuation)")
     ap.add_argument("--symbol", default="XAUUSDm")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=18812)
