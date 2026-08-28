@@ -1,10 +1,10 @@
-"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.13.4 scalper persona.
+"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.14 scalper persona.
 
 Connects to MT5 via the mt5linux RPyC bridge (run `bash start_mt5_bridge.sh`
 in another terminal first), pulls multi-timeframe bars, computes Layer 2
 features, performs causal MTF alignment, runs the Layer 4/5 signal scanner
 statefully, and when a signal fires sends a market order with SL/TP sized
-per our grade-tiered risk rules.
+per our grade-tiered risk rules and dynamic working-lot sizing.
 
 Open positions are monitored every 5 seconds for:
   - SL hit (broker-side, redundant check via equity diff)
@@ -18,7 +18,7 @@ Run:
     python -m slytrade.live.trader --symbol XAUUSDm --all --verbose  # see ALL signals
     python -m slytrade.live.trader --symbol XAUUSDm --live     # real trading (champion)
 
-Default persona: v0.9.13.4 champion (longs-only, 0.85R one-shot, >=2 ATR stops,
+Default persona: v0.9.14 champion (longs-only, 0.85R one-shot, >=2 ATR stops,
 grades A+/A/B, M5+M15 OBs, London/NY). Use --all to switch to the unrestricted
 scalper persona (long+short, all grades, H1+M15+M5 OBs+FVGs, LIQ_SWEEP + BOS_CONT
 quick scalps, Asian+off-hours unlocked, persona_gating=False) so you see
@@ -269,6 +269,7 @@ class LiveTrader:
         *,
         live: bool = False,
         risk_cap: float = 0.02,
+        working_lot: float = 0.04,
         max_open: int = 3,
         poll_interval: float = 5.0,
         verbose: bool = False,
@@ -280,6 +281,7 @@ class LiveTrader:
         self.acct = acct
         self.live = live
         self.risk_cap = risk_cap
+        self.working_lot = working_lot
         self.max_open = max_open
         self.poll_interval = poll_interval
         self.verbose = verbose
@@ -482,26 +484,15 @@ class LiveTrader:
         *,
         silent: bool = False,
     ) -> bool:
-        """Return True if vol_min-floored size is within safe risk bounds.
+        """Return True if floored size is within safe risk bounds (risk_cap only).
 
-        Hard-REJECT when actual risk exceeds max(risk_cap, 1.5%) OR 3× the
-        grade's target risk. Mild 1.25–3× oversize is still allowed (caller
-        may SIZE-WARN). Extracted so unit tests can pin the thresholds without
-        needing a live MT5 bridge.
+        v0.9.14 drops the 3×-target REJECT; hard rail is risk_cap only.
         """
-        max_risk_cap = max(self.risk_cap, 0.015)
+        max_risk_cap = self.risk_cap
         cap_hit = actual_risk_pct > max_risk_cap
-        triple_hit = actual_risk_pct > target_risk_pct * 3.0
-        if cap_hit or triple_hit:
+        if cap_hit:
             if not silent:
-                if cap_hit and triple_hit:
-                    why = (f"risk={actual_risk_pct*100:.2f}% > cap={max_risk_cap*100:.2f}% "
-                           f"and > 3× target {target_risk_pct*100:.2f}%")
-                elif cap_hit:
-                    why = f"risk={actual_risk_pct*100:.2f}% > cap={max_risk_cap*100:.2f}%"
-                else:
-                    why = (f"risk={actual_risk_pct*100:.2f}% > 3× target {target_risk_pct*100:.2f}% "
-                           f"(cap={max_risk_cap*100:.2f}%)")
+                why = f"risk={actual_risk_pct*100:.2f}% > cap={max_risk_cap*100:.2f}%"
                 print(
                     f"    [REJECT] {side} {setup}/{grade} vol_min={self.spec.volume_min} forces "
                     f"{why} — SKIPPING "
@@ -626,7 +617,18 @@ class LiveTrader:
         risk_pct = min(float(sig.risk_pct), self.risk_cap)
         risk_acct = risk_pct * equity
         risk_quote = risk_acct / self.acct.fx_to_account.get(self.spec.currency_profit, 1.0)
-        lots = self.spec.lots_for_risk(risk_per_unit, risk_quote)
+        risk_lots = self.spec.lots_for_risk(risk_per_unit, risk_quote)
+
+        # Dynamic working-lot sizing: scale working_lot dynamically by risk_pct / risk_cap
+        base_risk = self.risk_cap if self.risk_cap > 0 else 0.01
+        scale = risk_pct / base_risk
+        dynamic_target = self.working_lot * scale
+        dynamic_target = np.floor(dynamic_target / self.spec.volume_step) * self.spec.volume_step
+        dynamic_target = float(np.clip(dynamic_target, self.spec.volume_min, self.spec.volume_max))
+
+        lots = max(risk_lots, dynamic_target) if risk_lots >= self.spec.volume_min else dynamic_target
+        lots = np.floor(lots / self.spec.volume_step) * self.spec.volume_step
+        lots = float(np.clip(lots, self.spec.volume_min, self.spec.volume_max))
         # Compute the *actual* risk the broker will enforce for the chosen lots
         # (vol_min floors lots, which can oversize risk on tiny accounts/grades).
         actual_risk_quote = self.spec.profit_per_lot(risk_per_unit) * lots
@@ -1095,8 +1097,8 @@ class LiveTrader:
 
     # ------------------------------------------------------------------ #
     def run(self) -> None:
-        persona_label = "v0.9.13.4 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.13.4 champion (long-only A+/A/B RETEST_OB)"
-        print(f"SlyTrade LIVE v0.9.13.4  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  max_open={self.max_open}")
+        persona_label = "v0.9.14 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.14 champion (long-only A+/A/B RETEST_OB)"
+        print(f"SlyTrade LIVE v0.9.14  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  working_lot={self.working_lot}  max_open={self.max_open}")
         print(f"persona: {persona_label}")
         print("setups : RETEST_OB RETEST_FVG LIQ_SWEEP BOS_CONT  (champion gates apply unless --all)")
         print(f"Magic={MAGIC}")
@@ -1143,12 +1145,13 @@ class LiveTrader:
 # --------------------------------------------------------------------------- #
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="SlyTrade v0.9.13.4 SCALPER LIVE trader (OB/FVG retests + liq sweeps + BOS continuation)")
+    ap = argparse.ArgumentParser(description="SlyTrade v0.9.14 SCALPER LIVE trader (OB/FVG retests + liq sweeps + BOS continuation)")
     ap.add_argument("--symbol", default="XAUUSDm")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=18812)
     ap.add_argument("--live", action="store_true", help="Actually send orders (default: dry-run)")
     ap.add_argument("--risk-cap", type=float, default=0.01, help="Max risk per trade as fraction of equity (default 1%%)")
+    ap.add_argument("--working-lot", type=float, default=0.04, help="Working lot size for dynamic sizing (default 0.04)")
     ap.add_argument("--max-open", type=int, default=3)
     ap.add_argument("--usd-zar", type=float, default=18.5)
     ap.add_argument("--leverage", type=int, default=2000)
@@ -1180,10 +1183,11 @@ def main() -> None:
     max_open_eff = args.max_open if not args.unrestricted else max(args.max_open, 10)
     print(f"  verbose       : {args.verbose}")
     print(f"  risk_cap      : {args.risk_cap*100:.1f}% per trade")
+    print(f"  working_lot   : {args.working_lot}")
     print(f"  max_open      : {max_open_eff}")
     trader = LiveTrader(
         mt5=mt5, symbol=resolved, spec=spec, cfg=cfg, acct=acct_spec,
-        live=args.live, risk_cap=args.risk_cap, max_open=max_open_eff,
+        live=args.live, risk_cap=args.risk_cap, working_lot=args.working_lot, max_open=max_open_eff,
         verbose=args.verbose,
     )
     try:

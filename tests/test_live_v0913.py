@@ -114,68 +114,37 @@ def trader() -> LiveTrader:
 
 
 # --------------------------------------------------------------------------- #
-# vol_min hard-REJECT thresholds
+# vol_min hard-REJECT thresholds (v0.9.14: risk_cap only, no 3x target reject)
 # --------------------------------------------------------------------------- #
 
 class TestVolMinRiskOk:
-    def test_rejects_when_actual_above_1_5pct_cap(self, trader: LiveTrader):
-        # 3% actual vs 0.15% target → must REJECT (the 12:28 short case)
-        assert trader._vol_min_risk_ok(0.03, 0.0015, silent=True) is False
-
-    def test_rejects_when_actual_above_3x_target_even_if_under_cap(self, trader: LiveTrader):
-        # risk_cap=1%, actual=1.2% is under the 1.5% floor-cap BUT 1.2/0.3%=4× target
-        # → still REJECT via the 3× rule
+    def test_rejects_when_actual_above_risk_cap(self, trader: LiveTrader):
+        trader.risk_cap = 0.01
         assert trader._vol_min_risk_ok(0.012, 0.003, silent=True) is False
 
-    def test_allows_mild_1_25x_oversize(self, trader: LiveTrader):
-        # 0.4% actual vs 0.3% target = 1.33× — under 1.5% cap and under 3× → OK (SIZE-WARN path)
-        assert trader._vol_min_risk_ok(0.004, 0.003, silent=True) is True
+    def test_allows_when_under_risk_cap_even_if_above_3x_target(self, trader: LiveTrader):
+        # 1.2% actual vs 0.3% target (>3x target) but under 2% risk_cap -> allowed in v0.9.14
+        trader.risk_cap = 0.02
+        assert trader._vol_min_risk_ok(0.012, 0.003, silent=True) is True
 
     def test_allows_exact_target(self, trader: LiveTrader):
         assert trader._vol_min_risk_ok(0.005, 0.005, silent=True) is True
 
-    def test_rejects_at_exactly_3x_plus_epsilon(self, trader: LiveTrader):
-        assert trader._vol_min_risk_ok(0.0091, 0.003, silent=True) is False  # 3.03×
+    def test_respects_risk_cap_hard_rail(self, trader: LiveTrader):
+        trader.risk_cap = 0.01
+        assert trader._vol_min_risk_ok(0.009, 0.01, silent=True) is True
+        assert trader._vol_min_risk_ok(0.011, 0.01, silent=True) is False
 
-    def test_allows_just_under_3x_and_under_cap(self, trader: LiveTrader):
-        # 0.0089 / 0.003 ≈ 2.97× and < 1.5% → OK
-        assert trader._vol_min_risk_ok(0.0089, 0.003, silent=True) is True
-
-    def test_respects_higher_risk_cap(self, trader: LiveTrader):
-        # With risk_cap raised to 2%, max_risk_cap = 2%; 1.8% actual vs 1% target
-        # is under 2% and under 3× → OK
-        trader.risk_cap = 0.02
-        assert trader._vol_min_risk_ok(0.018, 0.01, silent=True) is True
-        # 2.1% still REJECTS against the 2% cap
-        assert trader._vol_min_risk_ok(0.021, 0.01, silent=True) is False
-
-    def test_reject_log_names_3x_rule_when_under_cap(self, trader: LiveTrader, capsys):
-        """The 17:00 live BOS_CONT/C: actual 3.32% < 5% cap but > 3× 0.15%
-        target — the log must name the 3× rule, not claim '> cap=5.00%'."""
-        trader.risk_cap = 0.05
-        assert trader._vol_min_risk_ok(
-            0.0332, 0.0015, side="LONG", setup="BOS_CONT", grade="C",
-            risk_per_unit=6.25, equity=3484.46,
-        ) is False
+    def test_reject_log_names_risk_cap(self, trader: LiveTrader, capsys):
+        trader.risk_cap = 0.01
+        assert trader._vol_min_risk_ok(0.015, 0.01, side="SHORT", setup="LIQ_SWEEP") is False
         out = capsys.readouterr().out
-        assert "3× target 0.15%" in out
-        assert "cap=5.00%" in out
-        assert "> cap=5.00%" not in out  # old misleading wording
+        assert "risk=1.50% > cap=1.00%" in out
 
-    def test_reject_log_names_cap_when_cap_is_binder(self, trader: LiveTrader, capsys):
-        trader.risk_cap = 0.02
-        # 2.1% > 2% cap but < 3× 1% target → the cap is the binder
-        assert trader._vol_min_risk_ok(0.021, 0.01, side="SHORT", setup="LIQ_SWEEP") is False
-        out = capsys.readouterr().out
-        assert "risk=2.10% > cap=2.00%" in out
-        assert "3× target" not in out
 
-    def test_reject_log_names_both_when_both_hit(self, trader: LiveTrader, capsys):
-        trader.risk_cap = 0.01  # effective floor cap = 1.5%
-        # 3.5% > 1.5% cap AND > 3× 1% target → both named
-        assert trader._vol_min_risk_ok(0.035, 0.01) is False
-        out = capsys.readouterr().out
-        assert "> cap=1.50% and > 3× target 1.00%" in out
+class TestWorkingLotSizing:
+    def test_default_working_lot_is_0_04(self, trader: LiveTrader):
+        assert trader.working_lot == 0.04
 
 
 # --------------------------------------------------------------------------- #
