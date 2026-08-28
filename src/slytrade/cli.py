@@ -1,4 +1,4 @@
-"""SlyTrade v0.9.13.4 CLI — ICT/SMC scalping bot (Layers 0-5 + live scalper)."""
+"""SlyTrade v0.9.14 CLI — ICT/SMC scalping bot (Layers 0-5 + live scalper)."""
 from __future__ import annotations
 
 import importlib.util
@@ -10,7 +10,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-app = typer.Typer(help="SlyTrade ICT/SMC scalper v0.9.13.4")
+app = typer.Typer(help="SlyTrade ICT/SMC scalper v0.9.14")
 console = Console()
 
 
@@ -242,6 +242,7 @@ def live_cmd(
     port: int = typer.Option(18812, "--port"),
     live: bool = typer.Option(False, "--live", help="Actually send orders (default: dry-run)."),
     risk_cap: float = typer.Option(0.01, "--risk-cap", help="Max risk per trade as fraction of equity."),
+    working_lot: float = typer.Option(0.04, "--working-lot", help="Working lot size for dynamic sizing."),
     max_open: int = typer.Option(3, "--max-open"),
     usd_zar: float = typer.Option(18.5, "--usd-zar"),
     leverage: int = typer.Option(2000, "--leverage"),
@@ -251,7 +252,7 @@ def live_cmd(
                                       help="Disable persona gating: emit ALL signals (long+short, all grades, "
                                            "H1+M15+M5 OBs+FVGs, C-grades, Asian+off-hours) for pre-RL diagnostics."),
 ):
-    """Run the live trading loop. Default: v0.9.13.4 champion persona (long-only A+/A/B RETEST_OB).
+    """Run the live trading loop. Default: v0.9.14 champion persona (long-only A+/A/B RETEST_OB).
 
     Use --all to fire EVERY setup the engine sees — longs AND shorts, all
     grades, all sessions, ALL 4 setup kinds (RETEST_OB, RETEST_FVG, LIQ_SWEEP,
@@ -266,9 +267,9 @@ def live_cmd(
         resolve_symbol_spec,
         rl_training_persona,
     )
-    persona_label = "SCALPER-UNRESTRICTED (long+short, all 4 setups)" if unrestricted else "v0.9.13.4 champion (long-only A+/A/B RETEST_OB)"
-    console.print(f"[bold]SlyTrade LIVE v0.9.13.4[/bold] symbol={raw_symbol} live={live} "
-                  f"risk_cap={risk_cap*100:.1f}% persona={persona_label} verbose={verbose}")
+    persona_label = "SCALPER-UNRESTRICTED (long+short, all 4 setups)" if unrestricted else "v0.9.14 champion (long-only A+/A/B RETEST_OB)"
+    console.print(f"[bold]SlyTrade LIVE v0.9.14[/bold] symbol={raw_symbol} live={live} "
+                  f"risk_cap={risk_cap*100:.1f}% working_lot={working_lot} persona={persona_label} verbose={verbose}")
     mt5 = connect_mt5(host, port)
 
     def _to_dict(o):
@@ -297,7 +298,7 @@ def live_cmd(
     max_open_eff = max_open if not unrestricted else max(max_open, 10)
     trader = LiveTrader(
         mt5=mt5, symbol=resolved, spec=spec, cfg=cfg, acct=acct_spec,
-        live=live, risk_cap=risk_cap, max_open=max_open_eff, verbose=verbose,
+        live=live, risk_cap=risk_cap, working_lot=working_lot, max_open=max_open_eff, verbose=verbose,
     )
     try:
         trader.run()
