@@ -1,14 +1,22 @@
-"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.14 scalper persona.
+"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.15 hybrid-ladder persona.
 
 Connects to MT5 via the mt5linux RPyC bridge (run `bash start_mt5_bridge.sh`
 in another terminal first), pulls multi-timeframe bars, computes Layer 2
 features, performs causal MTF alignment, runs the Layer 4/5 signal scanner
-statefully, and when a signal fires sends a market order with SL/TP sized
-per our grade-tiered risk rules and dynamic working-lot sizing.
+statefully, and when a signal fires sends a market or limit order with SL/TP
+sized per our grade-tiered risk rules and dynamic working-lot sizing.
+
+v0.9.15 changes:
+  - Hybrid ladder exits: TP1 1.0R @ 50% → BE; TP2 2.5R @ 25%; runner 25% ATR trail + M5 CHoCH kill
+  - working_lot default 0.04; risk_cap is only hard size rail (no 3× grade REJECT)
+  - Limit-at-zone for RETEST/BREAKER with market fallback; market for DISP_TRAP/LIQ/BOS
+  - One-shot re-arm when flat after TP
+  - New setups: DISP_TRAP, BREAKER
 
 Open positions are monitored every 5 seconds for:
   - SL hit (broker-side, redundant check via equity diff)
-  - TP hit (broker-side)
+  - TP1/TP2 hit (partial close + BE/trail adjustment)
+  - M5 CHoCH runner kill
   - M15 CHoCH emergency exit (closes at market if detected)
   - Time-stop (4 hours / 240 M1 bars flat regardless of P&L)
 
@@ -18,10 +26,10 @@ Run:
     python -m slytrade.live.trader --symbol XAUUSDm --all --verbose  # see ALL signals
     python -m slytrade.live.trader --symbol XAUUSDm --live     # real trading (champion)
 
-Default persona: v0.9.14 champion (longs-only, 0.85R one-shot, >=2 ATR stops,
+Default persona: v0.9.15 champion (longs-only, hybrid ladder, >=2 ATR stops,
 grades A+/A/B, M5+M15 OBs, London/NY). Use --all to switch to the unrestricted
-scalper persona (long+short, all grades, H1+M15+M5 OBs+FVGs, LIQ_SWEEP + BOS_CONT
-quick scalps, Asian+off-hours unlocked, persona_gating=False) so you see
+scalper persona (long+short, all grades, H1+M15+M5 OBs+FVGs, DISP_TRAP + BREAKER +
+LIQ_SWEEP + BOS_CONT, Asian+off-hours unlocked, persona_gating=False) so you see
 EVERYTHING the engine fires -- including the money-printing liquidity grabs
 and momentum bursts the champion filters out.
 """
@@ -246,7 +254,7 @@ class LiveTrade:
     direction: int           # +1 long, -1 short
     entry: float
     sl: float
-    tp: float
+    tp: float                # TP1 price
     lots: float
     open_time: datetime
     grade: str
@@ -256,6 +264,13 @@ class LiveTrade:
     close_price: float | None = None
     close_reason: str | None = None
     closed: bool = False
+    # v0.9.15 hybrid ladder state
+    tp1_hit: bool = False    # TP1 reached, partial closed, SL moved to BE
+    tp2_hit: bool = False    # TP2 reached, second partial closed
+    tp2_price: float = 0.0   # TP2 target price
+    runner_trail_px: float = 0.0  # current trailing stop for runner
+    remaining_lots: float = 0.0  # lots remaining after partial closes
+    original_lots: float = 0.0   # original lots at entry
 
 
 class LiveTrader:
@@ -667,9 +682,12 @@ class LiveTrader:
             self._vlog(f"{side} {setup}/{sig.grade} ORDER REJECTED by broker")
             return
         self._signals_fired.add(key)
+        # v0.9.15: compute TP2 price for hybrid ladder
+        tp2_price = fill + sig.direction * self.cfg.exits.tp2_r * risk_per_unit
         self._trades[ticket] = LiveTrade(
             ticket=ticket, direction=sig.direction, entry=fill, sl=sl, tp=tp,
             lots=lots, open_time=datetime.now(UTC), grade=sig.grade, risk_pct=risk_pct,
+            tp2_price=tp2_price, remaining_lots=lots, original_lots=lots,
         )
         # One-shot arm for BOS_CONT: after a successful fill, mark this leg
         # as "entered" so subsequent consecutive BOS bars in the same leg
@@ -688,23 +706,75 @@ class LiveTrader:
     def _monitor_positions(self, latest_m1_row: pd.Series | None, *, new_bar: bool = False) -> None:
         """Check SL/TP/emergency/time-stop for open positions.
 
+        v0.9.15 hybrid ladder: TP1 1.0R @ 50% → BE; TP2 2.5R @ 25%;
+        runner 25% with ATR trail + M5 CHoCH kill.
+
         new_bar=True means this call corresponds to a fresh closed M1 bar —
         that's where bars_held increments and CHoCH/time-stop checks run.
         Intra-bar poll calls (new_bar=False) only check broker-side SL/TP.
         """
         bid, ask = self.quote()
+        atr = 0.0
+        if latest_m1_row is not None:
+            atr = float(latest_m1_row.get('atr_14', 0.0)) if pd.notna(latest_m1_row.get('atr_14')) else 0.0
 
-        # ---------- SL / TP ---------- #
+        # ---------- SL / TP (hybrid ladder) ---------- #
         if not self.live:
             to_close: list[tuple[int, str]] = []
             for ticket, lt in list(self._trades.items()):
                 if lt.closed:
                     continue
                 price = bid if lt.direction == 1 else ask
+                # Check SL hit
                 hit_sl = (lt.direction == 1 and price <= lt.sl) or (lt.direction == -1 and price >= lt.sl)
-                hit_tp = (lt.direction == 1 and price >= lt.tp) or (lt.direction == -1 and price <= lt.tp)
-                if hit_sl:   to_close.append((ticket, "SL"))
-                elif hit_tp: to_close.append((ticket, "TP1"))
+                if hit_sl:
+                    to_close.append((ticket, "SL"))
+                    continue
+                # Hybrid ladder: TP1 → partial close + BE
+                if not lt.tp1_hit:
+                    hit_tp1 = (lt.direction == 1 and price >= lt.tp) or (lt.direction == -1 and price <= lt.tp)
+                    if hit_tp1:
+                        lt.tp1_hit = True
+                        # Close 50% at TP1
+                        close_lots = lt.original_lots * self.cfg.exits.tp1_pct
+                        close_lots = max(round(close_lots, 2), self.spec.volume_min)
+                        lt.remaining_lots = max(round(lt.original_lots - close_lots, 2), self.spec.volume_min)
+                        # Move SL to breakeven
+                        lt.sl = lt.entry
+                        print(f"    [TP1] ticket={ticket} closed {close_lots} lots @ {price:.{self.spec.digits}f} "
+                              f"→ BE SL={lt.sl:.{self.spec.digits}f} remaining={lt.remaining_lots}")
+                # TP2 → partial close + trail
+                elif not lt.tp2_hit:
+                    hit_tp2 = (lt.direction == 1 and price >= lt.tp2_price) or (lt.direction == -1 and price <= lt.tp2_price)
+                    if hit_tp2:
+                        lt.tp2_hit = True
+                        close_lots = lt.original_lots * self.cfg.exits.tp2_pct
+                        close_lots = max(round(close_lots, 2), self.spec.volume_min)
+                        lt.remaining_lots = max(round(lt.remaining_lots - close_lots, 2), self.spec.volume_min)
+                        print(f"    [TP2] ticket={ticket} closed {close_lots} lots @ {price:.{self.spec.digits}f} "
+                              f"remaining={lt.remaining_lots}")
+                # Runner: ATR trail + M5 CHoCH kill
+                else:
+                    # M5 CHoCH kill for runner
+                    if latest_m1_row is not None:
+                        m5_choch_against = (
+                            (lt.direction == 1 and bool(latest_m1_row.get("M5_minor_choch_dn", False))) or
+                            (lt.direction == -1 and bool(latest_m1_row.get("M5_minor_choch_up", False)))
+                        )
+                        if m5_choch_against:
+                            to_close.append((ticket, "M5_CHOCH_RUNNER"))
+                            continue
+                    # ATR trailing stop for runner
+                    if atr > 0:
+                        trail_dist = self.cfg.exits.runner_trail_atr_mult * atr
+                        if lt.direction == 1:
+                            new_trail = price - trail_dist
+                            if new_trail > lt.sl:
+                                lt.sl = new_trail
+                        else:
+                            new_trail = price + trail_dist
+                            if new_trail < lt.sl:
+                                lt.sl = new_trail
                 # rough running P&L for status line
                 r_mult = (price - lt.entry) / max(abs(lt.tp - lt.entry), 1e-9)
                 if lt.direction == -1:
@@ -716,19 +786,14 @@ class LiveTrader:
                 lt.close_price = price; lt.closed = True; lt.close_reason = reason
                 if self._close_position(ticket, reason):
                     print(f"    [EXIT] ticket={ticket} reason={reason}")
+                # v0.9.15: one-shot re-arm when flat after TP
+                if reason in ("TP1", "M5_CHOCH_RUNNER"):
+                    # Re-arm BOS_CONT one-shot so next leg can fire
+                    self._state[f"_bos_entered_{lt.direction:+d}"] = False
             broker_pos: dict[int, dict] = {}
         else:
             broker_pos = self._our_open_positions()
             broker_tickets = set(broker_pos.keys())
-            # Detect positions that closed between polls by comparing snapshot
-            # to previous open positions. Prefer ground-truth realized P&L from
-            # the broker's deal history (the close deal carries the ACTUAL fill
-            # P&L incl. commission/swap). The old fallback — last-known
-            # unrealized profit from the previous poll — is only an estimate
-            # and dramatically understates losses when a stop fills between
-            # polls: the 16:14 SL in v0.9.13.1 was recorded as -9.60ZAR while
-            # the broker really lost -37.75ZAR, corrupting win/loss stats and
-            # any RL reward derived from them (13:14-style accounting bug).
             prev = getattr(self, "_last_broker_pos", {}) or {}
             for ticket, lt in list(self._trades.items()):
                 if ticket not in broker_tickets and not lt.closed:
@@ -745,6 +810,8 @@ class LiveTrader:
                     if last_profit > 0:
                         self._wins_count += 1
                     print(f"    [EXIT] ticket={ticket} reason=BROKER (SL/TP hit) pnl={last_profit:+.2f}{self.acct.currency}")
+                    # v0.9.15: one-shot re-arm when flat after TP
+                    self._state[f"_bos_entered_{lt.direction:+d}"] = False
             self._last_broker_pos = dict(broker_pos)
 
         # ---------- Per-bar checks (CHoCH emergency + time stop) ---------- #
@@ -1097,10 +1164,10 @@ class LiveTrader:
 
     # ------------------------------------------------------------------ #
     def run(self) -> None:
-        persona_label = "v0.9.14 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.14 champion (long-only A+/A/B RETEST_OB)"
-        print(f"SlyTrade LIVE v0.9.14  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  working_lot={self.working_lot}  max_open={self.max_open}")
+        persona_label = "v0.9.15 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.15 champion (long-only A+/A/B hybrid ladder)"
+        print(f"SlyTrade LIVE v0.9.15  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  working_lot={self.working_lot}  max_open={self.max_open}")
         print(f"persona: {persona_label}")
-        print("setups : RETEST_OB RETEST_FVG LIQ_SWEEP BOS_CONT  (champion gates apply unless --all)")
+        print("setups : RETEST_OB RETEST_FVG LIQ_SWEEP BOS_CONT DISP_TRAP BREAKER  (champion gates apply unless --all)")
         print(f"Magic={MAGIC}")
         print("-"*80)
         running = {"v": True}
@@ -1145,7 +1212,7 @@ class LiveTrader:
 # --------------------------------------------------------------------------- #
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="SlyTrade v0.9.14 SCALPER LIVE trader (OB/FVG retests + liq sweeps + BOS continuation)")
+    ap = argparse.ArgumentParser(description="SlyTrade v0.9.15 SCALPER LIVE trader (hybrid ladder + DISP_TRAP/BREAKER + SL clamp + limit retests)")
     ap.add_argument("--symbol", default="XAUUSDm")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=18812)

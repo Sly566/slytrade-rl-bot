@@ -1,4 +1,4 @@
-"""Layer 4 — ICT/SMC scalper signal engine.
+"""Layer 4 — ICT/SMC scalper signal engine (v0.9.15).
 
 Produces strictly-causal entry signals from the M1-aligned frame. Each signal
 carries: direction, entry price, stop loss, take-profit ladder, setup grade,
@@ -12,6 +12,14 @@ Hard-gated checklist philosophy (per Sly's spec):
   * Each gate is PASS/FAIL — no weighted scoring turns a FAIL into a PASS.
   * Confluence depth decides SIZE/GRADE (A+/A/B/C) but never bypasses a gate.
   * Ranging markets: displacement-only, no mean-reversion; wait for a break.
+
+v0.9.15 additions:
+  * DISP_TRAP setup: displacement trap (fake breakout reversal), preferred A/B
+  * BREAKER setup: breaker block (failed OB becomes S/R)
+  * BOS_CONT forced to weak C grade (quick momentum scalp)
+  * SL clamp: [0.5·ATR, min(3·ATR, 12pt)]
+  * Limit-at-zone for RETEST/BREAKER; market for DISP_TRAP/LIQ/BOS
+  * One-shot re-arm when flat after TP
 """
 from __future__ import annotations
 
@@ -44,7 +52,8 @@ class Signal:
     risk_per_unit: float                 # |entry - stop| (USD per unit for XAUUSD)
     grade: str                           # "A+", "A", "B", "C"
     risk_pct: float                      # fraction of equity (from SetupGrades)
-    setup_kind: str = "RETEST_OB"        # RETEST_OB | RETEST_FVG | LIQ_SWEEP | BOS_CONT
+    setup_kind: str = "RETEST_OB"        # RETEST_OB | RETEST_FVG | LIQ_SWEEP | BOS_CONT | DISP_TRAP | BREAKER
+    use_limit_order: bool = False        # v0.9.15: True for RETEST/BREAKER (limit-at-zone), False for market
     confluence: list[str] = field(default_factory=list)
     fails: list[str] = field(default_factory=list)
     # Debug
@@ -286,6 +295,30 @@ def _runner_target(direction: int, row, cfg: ConfluenceConfig,
 
 
 # --------------------------------------------------------------------------- #
+# SL clamp (v0.9.15)
+# --------------------------------------------------------------------------- #
+
+def _clamp_sl(entry: float, stop: float, direction: int, atr: float,
+              cfg_exits) -> float:
+    """Clamp stop-loss distance to [0.5·ATR, min(3·ATR, 12pt)].
+
+    Prevents ultra-tight stops that get hunted by M1 noise and ultra-wide
+    stops that blow the risk budget.  The absolute cap (12pt for XAUUSD)
+    is asset-class specific and comes from cfg_exits.sl_clamp_max_pts.
+    """
+    risk = abs(entry - stop)
+    if risk <= 0:
+        return stop
+    min_dist = cfg_exits.sl_clamp_min_atr * atr
+    max_dist = min(cfg_exits.sl_clamp_max_atr * atr, cfg_exits.sl_clamp_max_pts)
+    clamped = max(min_dist, min(risk, max_dist))
+    if direction == 1:
+        return entry - clamped
+    else:
+        return entry + clamped
+
+
+# --------------------------------------------------------------------------- #
 # Single-bar signal evaluation
 # --------------------------------------------------------------------------- #
 
@@ -487,6 +520,49 @@ def _evaluate_row(i: int,
             elif direction == -1 and high > float(sweep_px_cur) + inv_buffer:
                 state[sweep_key_inv] = True
 
+    # --- 1d. DISP_TRAP tracking (v0.9.15) ---
+    # Track the most recent displacement candle on M1 and trigger TF so we
+    # can detect "displacement traps" — fake breakouts that immediately
+    # reverse.  A bull disp trap: strong bull displacement candle, then
+    # within 3-5 bars price closes below the displacement candle's open.
+    # Bear symmetric.
+    if bool(row.get('bull_disp', False)) or bool(row.get(f'{trigger_tf}_bull_disp', False)):
+        state['_last_bull_disp_bar'] = {
+            'high': float(row.get('high', c)),
+            'low': float(row.get('low', c)),
+            'open': float(row.get('open', c)),
+            'close': c,
+            'time': t_now,
+        }
+    if bool(row.get('bear_disp', False)) or bool(row.get(f'{trigger_tf}_bear_disp', False)):
+        state['_last_bear_disp_bar'] = {
+            'high': float(row.get('high', c)),
+            'low': float(row.get('low', c)),
+            'open': float(row.get('open', c)),
+            'close': c,
+            'time': t_now,
+        }
+
+    # --- 1e. BREAKER tracking (v0.9.15) ---
+    # A breaker block forms when an OB gets mitigated (price trades through
+    # it) and then a BOS/CHoCH fires in the opposite direction.  The
+    # mitigated OB zone becomes support/resistance.  We track recently
+    # mitigated OBs and pair them with subsequent structure breaks.
+    # When a BOS/CHoCH fires, we check if there's a recently mitigated OB
+    # on the same TF that could become a breaker zone.
+    for tf in track_tfs if atr > 0 else []:
+        for side in ('bull', 'bear'):
+            key = f"{tf}_{side}_ob"
+            z = state.get(key)
+            if z is not None and z.get('mitigated'):
+                # This OB was just mitigated — record it as a potential breaker
+                brk_key = f"_breaker_candidate_{tf}_{side}"
+                if brk_key not in state or state[brk_key].get('top') != z.get('top'):
+                    state[brk_key] = {
+                        'top': z['top'], 'bot': z['bot'],
+                        'mitigated_at': t_now, 'tf': tf, 'side': side,
+                    }
+
     # ================================================================== #
     # PHASE 2: ENTRY GATES -- applied to decide whether to emit a Signal
     # this bar. If we bail here, state has already been updated above.
@@ -536,10 +612,7 @@ def _evaluate_row(i: int,
 
     # ================================================================== #
     # SETUP A: LIQUIDITY SWEEP SCALP (stop-run reversal)
-    # Wick takes out a recent minor swing (sellside/buyside liquidity),
-    # closes back inside, then displacement fires in the reversal
-    # direction within `sweep_window` M1 bars. Enter at displacement
-    # close, SL just beyond the sweep wick extreme, quick 0.85R TP.
+    # (unchanged from v0.9.13 — see original comments)
     # ================================================================== #
     # sweep_window is already set above (Phase 1); reuse it.
     for direction in (1, -1):
@@ -635,6 +708,8 @@ def _evaluate_row(i: int,
             stop = float(sweep_extreme) - sweep_sl_buffer
         else:
             stop = float(sweep_extreme) + sweep_sl_buffer
+        # v0.9.15: apply SL clamp
+        stop = _clamp_sl(entry, stop, direction, atr, cfg.exits)
         risk = abs(entry - stop)
         if risk <= 0 or risk < 0.5 * atr or risk > 7.0 * atr or risk > 40.0:
             continue
@@ -813,6 +888,8 @@ def _evaluate_row(i: int,
             stop = float(sl_anchor) - buffer_amt
         else:
             stop = float(sl_anchor) + buffer_amt
+        # v0.9.15: apply SL clamp
+        stop = _clamp_sl(entry, stop, direction, atr, cfg.exits)
         risk = abs(entry - stop)
         if risk <= 0 or risk < 0.5 * atr or risk > 7.0 * atr or risk > 40.0:
             if fail_trace is not None:
@@ -830,16 +907,13 @@ def _evaluate_row(i: int,
         elif cfg.confluence.persona_gating and grade not in cfg.confluence.accept_grades:
             # Champion persona only: only BOS_CONT with A+/A/B grade
             continue
-        # Scalp grade cap for BOS_CONT (same reasoning as LIQ_SWEEP: M1 impulse
-        # scalps against laggy HTF bias must never size as A+/A in unrestricted
-        # mode, and cap at B in champion mode).
-        if not cfg.confluence.persona_gating:
-            if grade in ('A+', 'A', 'B'):
-                conf_tags.append(f'downgraded_from_{grade}')
-                grade = 'C'
-        elif grade == 'A+':
-            conf_tags.append('downgraded_from_A+')
-            grade = 'B'
+        # v0.9.15: BOS_CONT is ALWAYS forced to weak C grade — it's a quick
+        # momentum scalp riding the impulse, not a high-conviction structural
+        # trade.  This prevents oversizing on what is inherently a lower-
+        # probability continuation play.
+        if grade != 'C':
+            conf_tags.append(f'downgraded_from_{grade}_bos_cont')
+        grade = 'C'
 
         if direction == 1:
             tp1 = entry + cfg.exits.tp1_r * risk
@@ -873,6 +947,215 @@ def _evaluate_row(i: int,
         )
         # NOTE: caller (live trader / backtest) is responsible for setting
         # state[bos_arm_key] = True AFTER a successful fill — not here.
+        return sig
+
+    # ================================================================== #
+    # SETUP C: DISPLACEMENT TRAP (v0.9.15)
+    # A strong displacement candle fires, but within 3-5 bars price
+    # reverses back through the displacement's open — a fake breakout.
+    # Enter in the reversal direction.  Preferred grade A/B (not A+
+    # which reserved for structural retests, not C which is too weak).
+    # ================================================================== #
+    disp_trap_window = 5  # bars
+    for direction in (1, -1):
+        if direction not in candidates:
+            continue
+        side = 'bull' if direction == 1 else 'bear'
+        # For a SHORT trap (direction=-1): we need a recent BULL displacement
+        # that got trapped — price closed back below the disp open.
+        # For a LONG trap (direction=+1): we need a recent BEAR displacement
+        # that got trapped — price closed back above the disp open.
+        trap_side = 'bear' if direction == 1 else 'bull'
+        last_disp = state.get(f'_last_{trap_side}_disp_bar')
+        if last_disp is None:
+            continue
+        age = (t_now - last_disp['time']).total_seconds() / 60.0
+        if age > disp_trap_window:
+            continue
+        disp_open = last_disp['open']
+        disp_close = last_disp['close']
+        # Trap condition: current close is on the opposite side of the
+        # displacement candle's open.
+        if direction == 1 and c <= disp_open:
+            continue  # not trapped yet for long
+        if direction == -1 and c >= disp_open:
+            continue  # not trapped yet for short
+        # Require opposing BOS/CHoCH or displacement on M1 or trigger TF
+        # to confirm the trap is real (not just a pullback).
+        if direction == 1:
+            has_confirm = (bool(row.get('bull_disp', False)) or
+                          bool(row.get(f'{trigger_tf}_bull_disp', False)) or
+                          bool(row.get('minor_choch_up', False)) or
+                          bool(row.get('major_choch_up', False)) or
+                          bool(row.get(f'{trigger_tf}_minor_choch_up', False)) or
+                          bool(row.get(f'{trigger_tf}_major_choch_up', False)))
+        else:
+            has_confirm = (bool(row.get('bear_disp', False)) or
+                          bool(row.get(f'{trigger_tf}_bear_disp', False)) or
+                          bool(row.get('minor_choch_dn', False)) or
+                          bool(row.get('major_choch_dn', False)) or
+                          bool(row.get(f'{trigger_tf}_minor_choch_dn', False)) or
+                          bool(row.get(f'{trigger_tf}_major_choch_dn', False)))
+        if not has_confirm:
+            continue
+        # One entry per trap event
+        trap_key = f"_disp_trapped_{direction}_{last_disp['time'].isoformat()}"
+        if state.get(trap_key):
+            continue
+        state[trap_key] = True
+
+        entry = c
+        # SL beyond the displacement candle extreme
+        if direction == 1:
+            stop = last_disp['low'] - cfg.exits.ob_invalidation_buffer * atr
+        else:
+            stop = last_disp['high'] + cfg.exits.ob_invalidation_buffer * atr
+        stop = _clamp_sl(entry, stop, direction, atr, cfg.exits)
+        risk = abs(entry - stop)
+        if risk <= 0 or risk < 0.5 * atr or risk > 7.0 * atr or risk > 40.0:
+            continue
+        risk_atr = risk / atr if atr > 0 else 0
+        if cfg.confluence.persona_gating and risk_atr < cfg.confluence.min_risk_atr:
+            continue
+
+        grade, conf_tags = _grade(direction, row, cfg.confluence,
+                                  bonus_killzone=('+' in kz_tag or 'open30' in kz_tag))
+        if grade == 'fail':
+            if cfg.confluence.persona_gating:
+                continue
+            grade = 'C'
+            conf_tags = ['scalp_fallback_c']
+        elif cfg.confluence.persona_gating and grade not in cfg.confluence.accept_grades:
+            continue
+        # DISP_TRAP preferred A/B: cap at B, floor at B if higher
+        if grade == 'A+':
+            conf_tags.append('downgraded_from_A+_disp_trap')
+            grade = 'B'
+        elif grade == 'C':
+            if cfg.confluence.persona_gating:
+                continue  # champion rejects C-grade traps
+            conf_tags.append('disp_trap_c_grade')
+
+        tp1 = entry + direction * cfg.exits.tp1_r * risk
+        tp2 = entry + direction * cfg.exits.tp2_r * risk
+        tgt_tf, tgt_px = _runner_target(direction, row, cfg.confluence, entry, risk)
+        if tgt_px is None:
+            tgt_px = entry + direction * 3.0 * risk
+            tgt_tf = '3R_fallback'
+        risk_pct = cfg.grades.risk_fraction(grade) * 0.75  # 75% of tier size
+
+        tags = [f'trigger_{trigger_tf}', 'setup_DISP_TRAP'] + conf_tags
+        tags.append(f'grade_{grade}')
+        tags.append(f'kz_{kz_tag}')
+        bias_summary = {}
+        for tf in ('W1','D1','H4','H1','M30','M15','M5'):
+            b = row.get(f'{tf}_major_bias', 0)
+            if pd.notna(b): bias_summary[tf] = int(b)
+
+        sig = Signal(
+            time=t_now, direction=direction, entry=entry, stop=stop,
+            tp1=tp1, tp2=tp2, tp_runner=float(tgt_px), risk_per_unit=risk,
+            grade=grade, risk_pct=risk_pct, setup_kind="DISP_TRAP",
+            confluence=tags, swing_target_tf=tgt_tf, swing_target_price=float(tgt_px),
+            atr_at_entry=atr, htf_bias_summary=bias_summary,
+            session=str(row.get('session','')), killzone=kz_tag,
+        )
+        return sig
+
+    # ================================================================== #
+    # SETUP D: BREAKER BLOCK (v0.9.15)
+    # A previously mitigated OB becomes support/resistance after a
+    # structure break (BOS/CHoCH) in the opposite direction.  Enter on
+    # retest of the breaker zone.  Uses limit-at-zone order.
+    # ================================================================== #
+    for direction in candidates:
+        side = 'bull' if direction == 1 else 'bear'
+        # For a LONG breaker: we need a recently mitigated BULL OB
+        # (price traded below it) and then a bull BOS/CHoCH fired.
+        # For a SHORT breaker: mitigated BEAR OB + bear BOS/CHoCH.
+        breaker_zone = None
+        for tf in cfg.confluence.ob_tfs:
+            brk_key = f"_breaker_candidate_{tf}_{side}"
+            bc = state.get(brk_key)
+            if bc is None:
+                continue
+            # Breaker zone: the mitigated OB zone
+            brk_top = bc['top']
+            brk_bot = bc['bot']
+            # Price must be retesting the breaker zone
+            if brk_bot <= c <= brk_top:
+                # Check that a BOS/CHoCH fired AFTER the OB was mitigated
+                # (the structure break confirms the breaker).
+                mitigated_at = bc.get('mitigated_at')
+                if mitigated_at is None:
+                    continue
+                # We need a trigger in the breaker direction AFTER mitigation
+                trig_key = f'_last_{side}_trigger'
+                last_trig = state.get(trig_key)
+                if last_trig is None or last_trig <= mitigated_at:
+                    continue
+                breaker_zone = (tf, brk_top, brk_bot)
+                break
+        if breaker_zone is None:
+            continue
+
+        ztf, ztop, zbot = breaker_zone
+        # One entry per breaker zone
+        brk_entered_key = f"_breaker_entered_{ztf}_{side}"
+        if state.get(brk_entered_key):
+            continue
+
+        entry = c
+        buffer_amt = cfg.exits.ob_invalidation_buffer * atr
+        if direction == 1:
+            stop = zbot - buffer_amt
+        else:
+            stop = ztop + buffer_amt
+        stop = _clamp_sl(entry, stop, direction, atr, cfg.exits)
+        risk = abs(entry - stop)
+        if risk <= 0 or risk < 0.5 * atr or risk > 7.0 * atr or risk > 40.0:
+            continue
+        risk_atr = risk / atr if atr > 0 else 0
+        if cfg.confluence.persona_gating and risk_atr < cfg.confluence.min_risk_atr:
+            continue
+
+        grade, conf_tags = _grade(direction, row, cfg.confluence,
+                                  bonus_killzone=('+' in kz_tag or 'open30' in kz_tag))
+        if grade == 'fail':
+            if cfg.confluence.persona_gating:
+                continue
+            grade = 'C'
+            conf_tags = ['scalp_fallback_c']
+        elif cfg.confluence.persona_gating and grade not in cfg.confluence.accept_grades:
+            continue
+
+        tp1 = entry + direction * cfg.exits.tp1_r * risk
+        tp2 = entry + direction * cfg.exits.tp2_r * risk
+        tgt_tf, tgt_px = _runner_target(direction, row, cfg.confluence, entry, risk)
+        if tgt_px is None:
+            tgt_px = entry + direction * 3.0 * risk
+            tgt_tf = '3R_fallback'
+        risk_pct = cfg.grades.risk_fraction(grade)
+
+        tags = [f'trigger_{trigger_tf}', f'breaker_on_{ztf}'] + conf_tags
+        tags.append(f'grade_{grade}')
+        tags.append(f'kz_{kz_tag}')
+        bias_summary = {}
+        for tf in ('W1','D1','H4','H1','M30','M15','M5'):
+            b = row.get(f'{tf}_major_bias', 0)
+            if pd.notna(b): bias_summary[tf] = int(b)
+
+        sig = Signal(
+            time=t_now, direction=direction, entry=entry, stop=stop,
+            tp1=tp1, tp2=tp2, tp_runner=float(tgt_px), risk_per_unit=risk,
+            grade=grade, risk_pct=risk_pct, setup_kind="BREAKER",
+            use_limit_order=True,  # v0.9.15: limit-at-zone
+            confluence=tags, ob_tf=ztf, ob_top=ztop, ob_bottom=zbot,
+            swing_target_tf=tgt_tf, swing_target_price=float(tgt_px),
+            atr_at_entry=atr, htf_bias_summary=bias_summary,
+            session=str(row.get('session','')), killzone=kz_tag,
+        )
+        state[brk_entered_key] = True
         return sig
 
     if not candidates:
@@ -1028,6 +1311,7 @@ def _evaluate_row(i: int,
             grade=grade,
             risk_pct=risk_pct,
             setup_kind=setup_kind_label,
+            use_limit_order=True,  # v0.9.15: limit-at-zone for retests
             confluence=tags,
             ob_tf=ztf if kind == 'OB' else None,
             ob_top=ztop if kind == 'OB' else None,

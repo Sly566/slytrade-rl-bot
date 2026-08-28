@@ -1,8 +1,16 @@
-"""Layer 4 strategy config — ICT/SMC scalper.
+"""Layer 4 strategy config — ICT/SMC scalper (v0.9.15).
 
 All tunables here; the signal/backtest engines consume them. Defaults are
 calibrated for XAUUSD M1 but the code is asset-class agnostic (dynamic sizing
 per `symbol_info` lives in the backtest/OMS layer).
+
+v0.9.15 changes:
+  - Hybrid ladder exits: TP1 1.0R @ 50% → BE; TP2 2.5R @ 25%; runner 25% ATR trail + M5 CHoCH kill
+  - working_lot default 0.04; risk_cap is only hard size rail (no 3× grade REJECT)
+  - SL clamp: [0.5·ATR, min(3·ATR, 12pt)]
+  - New setups: DISP_TRAP, BREAKER
+  - Limit-at-zone for RETEST/BREAKER; market for DISP_TRAP/LIQ/BOS
+  - One-shot re-arm when flat after TP
 """
 from __future__ import annotations
 
@@ -25,23 +33,20 @@ class SetupGrades:
 
 
 # --------------------------------------------------------------------------- #
-# Exit plan (laddered, applied the same way for long and short)
+# Exit plan (hybrid ladder, v0.9.15)
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class ExitPlan:
     # TP1: take first profit, close `tp1_pct` of size, move SL to breakeven.
-    # 0.85R is the Layer-5 scalp sweet-spot on XAUUSD M1 (25-month sweep, n=129, PF=2.00):
-    # far enough that M5 displacement legs tend to extend, close enough that
-    # win-rate stays ~65% with costs.  One-shot (tp1_pct=1.0) beats laddered
-    # exits on PF after 25 months of data.
-    tp1_r:       float = 0.85
-    tp1_pct:     float = 1.00   # 100% off at TP1 for the scalp profile (partial exits + trailing optional)
+    # v0.9.15: 1.0R at 50% partial, then BE for remainder.
+    tp1_r:       float = 1.0
+    tp1_pct:     float = 0.50   # 50% off at TP1
     # TP2: take second profit, close `tp2_pct`, trail SL to TP1.
-    # Set tp2_pct=0 to disable (pure one-shot scalp).
-    tp2_r:       float = 1.5    # secondary target if tp1_pct < 1
-    tp2_pct:     float = 0.00   # 0% off by default — one-shot scalp
-    # Runner (remaining after TP2): trail stop by trail_atr_mult × ATR OR exit on M5 CHoCH against
-    runner_trail_atr_mult: float = 0.5
+    # v0.9.15: 2.5R at 25% partial.
+    tp2_r:       float = 2.5
+    tp2_pct:     float = 0.25   # 25% off at TP2
+    # Runner (remaining 25% after TP2): trail stop by trail_atr_mult × ATR OR exit on M5 CHoCH against
+    runner_trail_atr_mult: float = 0.25
     runner_stop_tf: str = "M5"          # CHoCH on this TF exits the runner
     # Emergency / time stops
     emergency_choch_tf: str = "M15"     # CHoCH on this TF => emergency exit full
@@ -51,6 +56,13 @@ class ExitPlan:
                                          # (tightened from 0.1 to 0.05 ATR after
                                          # battle-testing — 0.1 inflated risk ~10%
                                          # which was eating the scalp edge)
+    # SL clamp (v0.9.15): hard bounds on stop distance in ATR multiples.
+    # Prevents ultra-tight stops that get hunted and ultra-wide stops that
+    # blow the risk budget.  Absolute cap `sl_clamp_max_pts` is asset-class
+    # specific (12 points for XAUUSD ≈ $12).
+    sl_clamp_min_atr: float = 0.5       # SL must be at least 0.5 ATR from entry
+    sl_clamp_max_atr: float = 3.0       # SL must be at most 3 ATR from entry
+    sl_clamp_max_pts: float = 12.0      # absolute cap in price points (XAUUSD)
 
 
 # --------------------------------------------------------------------------- #
@@ -115,6 +127,14 @@ class ConfluenceConfig:
     # FVGs are also disabled at default (only OBs passed the OOS test).
     accept_ob_tfs: tuple[str, ...] = ("M15", "M5")
     accept_zone_kinds: tuple[str, ...] = ("OB",)  # "OB","FVG"
+    # v0.9.15: setup kinds accepted by the engine.
+    # DISP_TRAP = displacement trap (fake breakout reversal)
+    # BREAKER   = breaker block (failed OB that becomes support/resistance)
+    # RETEST_OB, RETEST_FVG, LIQ_SWEEP, BOS_CONT carry over from v0.9.13.
+    accept_setup_kinds: tuple[str, ...] = (
+        "RETEST_OB", "RETEST_FVG", "LIQ_SWEEP", "BOS_CONT",
+        "DISP_TRAP", "BREAKER",
+    )
     # Only accept these grades (C-grade is net negative; blocked by default).
     accept_grades: tuple[str, ...] = ("A+", "A", "B")
     # Directional toggle — Layer 5 battle-tested: LONGS carry ~94% of the edge
@@ -142,6 +162,9 @@ class StrategyConfig:
     execution_tf: str = "M1"
     trigger_tf:   str = "M5"   # displacement/BOS trigger TF
     entry_tf:     str = "M1"   # precision entry (FVG/OB retest)
+    # v0.9.15: working_lot is the default lot size when risk-based sizing
+    # would produce a smaller value.  risk_cap remains the ONLY hard size rail.
+    working_lot: float = 0.04
 
 
 # --------------------------------------------------------------------------- #
