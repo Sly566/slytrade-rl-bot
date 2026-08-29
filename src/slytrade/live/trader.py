@@ -356,9 +356,9 @@ class LiveTrader:
         modes: list[int] = []
         # Try IOC first (Exness ECN), then FOK (standard), then RETURN (market-maker)
         candidates = [
-            (self.mt5.ORDER_FILLING_IOC, 2),
-            (self.mt5.ORDER_FILLING_FOK, 1),
-            (self.mt5.ORDER_FILLING_RETURN, 4),
+            ("ORDER_FILLING_IOC", 2),
+            ("ORDER_FILLING_FOK", 1),
+            ("ORDER_FILLING_RETURN", 4),
         ]
         for attr, bit in candidates:
             val = int(getattr(self.mt5, attr, None) or 0)
