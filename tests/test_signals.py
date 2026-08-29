@@ -373,7 +373,7 @@ class TestBOSControlAnchor:
         assert sig.stop == pytest.approx(2998.0 - 0.1 * 2.0)
 
     def test_sl_clamp_rescues_stale_anchors(self):
-        """v0.9.15: SL clamp [0.5 ATR, min(3 ATR, 12pt)] brings far anchors within bounds."""
+        """v0.9.15: SL clamp [0.5 ATR, 3 ATR] brings far anchors within bounds."""
         cfg = self._cfg()
         row = _row(
             close=3000.0, atr_14=2.0,
@@ -382,7 +382,7 @@ class TestBOSControlAnchor:
             minor_swing_low=2986.0,      # also far
         )
         sig = _evaluate_row(0, row, cfg, _empty_state())
-        # v0.9.15: SL clamp brings the stop to min(3*2, 12) = 6 pts from entry
+        # v0.9.15: SL clamp brings the stop to 3*2 = 6 pts from entry
         # so risk = 6 pts = 3 ATR, which is within the 0.5-7 ATR band
         assert sig is not None
         assert sig.setup_kind == "BOS_CONT"

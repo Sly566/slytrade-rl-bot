@@ -151,7 +151,11 @@ def resolve_symbol_spec(mt5: Any, symbol: str, account_ccy: str, usd_zar: float)
         "currency_profit": str(info.get("currency_profit", "USD")),
     }
     spec = spec_for_symbol(resolved, overrides=overrides)
-    return resolved, spec
+    # Capture the broker's minimum stop distance (in points) so the live
+    # trader can enforce it after SL clamping.  trade_stops_level is the
+    # minimum distance from current price that SL/TP must be.
+    stop_level_pts = int(info.get("trade_stops_level", 0))
+    return resolved, spec, stop_level_pts
 
 
 def fetch_bars(mt5: Any, symbol: str, timeframe: str, count: int) -> pd.DataFrame:
@@ -288,6 +292,7 @@ class LiveTrader:
         max_open: int = 3,
         poll_interval: float = 5.0,
         verbose: bool = False,
+        stop_level_pts: int = 0,
     ):
         self.mt5 = mt5
         self.symbol = symbol
@@ -300,6 +305,7 @@ class LiveTrader:
         self.max_open = max_open
         self.poll_interval = poll_interval
         self.verbose = verbose
+        self._stop_level_pts = stop_level_pts
 
         self._state: dict = {}
         self._trades: dict[int, LiveTrade] = {}
@@ -516,6 +522,40 @@ class LiveTrader:
             return False
         return True
 
+    def _enforce_min_sl(self, entry: float, sl: float, direction: int,
+                       atr: float, bid: float, ask: float) -> float:
+        """Ensure SL is at least broker stop_level + safety margin from market.
+
+        MT5 rejects orders with retcode 10016 ("Invalid stops") when SL/TP
+        is closer than trade_stops_level points to the current price.  This
+        method bumps the SL outward if needed, logging a warning.
+
+        The minimum distance is: max(stop_level_pts * point, point * 50).
+        The point*50 fallback handles brokers that report stop_level=0 but
+        still reject tight stops (common on Exness).
+        """
+        point = self.spec.point
+        broker_min = self._stop_level_pts * point
+        fallback_min = point * 50
+        min_dist = max(broker_min, fallback_min)
+        if atr > 0:
+            min_dist = max(min_dist, 0.3 * atr)
+        market = ask if direction == 1 else bid
+        if direction == 1:
+            dist = market - sl
+        else:
+            dist = sl - market
+        if dist < min_dist:
+            if direction == 1:
+                new_sl = market - min_dist
+            else:
+                new_sl = market + min_dist
+            print(f"    [SL-BUMP] SL moved from {sl:.{self.spec.digits}f} to "
+                  f"{new_sl:.{self.spec.digits}f} (min_dist={min_dist:.{self.spec.digits}f} "
+                  f"broker_stop_level={self._stop_level_pts}pts)")
+            return new_sl
+        return sl
+
     @staticmethod
     def _parse_broker_time(raw: Any, fallback: datetime | None = None) -> datetime:
         """Coerce MT5 position.time (unix int / datetime / str) to aware UTC.
@@ -668,6 +708,13 @@ class LiveTrader:
             risk_pct = actual_risk_pct
         tp = fill + sig.direction * self.cfg.exits.tp1_r * risk_per_unit
         sl = float(sig.stop)
+        # v0.9.15.1: enforce broker minimum stop distance (prevents 10016 rejects)
+        sl = self._enforce_min_sl(fill, sl, sig.direction, sig.atr_at_entry, bid, ask)
+        risk_per_unit = abs(fill - sl)
+        if risk_per_unit <= 0:
+            self._vlog(f"{side} {setup}/{sig.grade} rejected: invalid risk_per_unit after SL bump")
+            return
+        tp = fill + sig.direction * self.cfg.exits.tp1_r * risk_per_unit
         margin_quote = (lots * self.spec.contract_size * fill) / max(self.acct.leverage, 1)
         margin_acct = self.acct.to_account_ccy(margin_quote, self.spec.currency_profit)
         if margin_acct > equity * 0.95:
@@ -1236,9 +1283,10 @@ def main() -> None:
     print(f"  login={acc.get('login')} server={acc.get('server')} balance={acc.get('balance')} "
           f"equity={acc.get('equity')} {acc.get('currency')} leverage={acc.get('leverage',args.leverage)}")
 
-    resolved, spec = resolve_symbol_spec(mt5, args.symbol, str(acc.get("currency","ZAR")), args.usd_zar)
+    resolved, spec, stop_level_pts = resolve_symbol_spec(mt5, args.symbol, str(acc.get("currency","ZAR")), args.usd_zar)
     print(f"  symbol resolved: {resolved} (point={spec.point} digits={spec.digits} "
-          f"contract={spec.contract_size} vol_min={spec.volume_min} vol_step={spec.volume_step})")
+          f"contract={spec.contract_size} vol_min={spec.volume_min} vol_step={spec.volume_step} "
+          f"stop_level={stop_level_pts}pts)")
 
     acct_spec = AccountSpec(
         starting_equity=float(acc.get("equity", 1000)),
@@ -1255,7 +1303,7 @@ def main() -> None:
     trader = LiveTrader(
         mt5=mt5, symbol=resolved, spec=spec, cfg=cfg, acct=acct_spec,
         live=args.live, risk_cap=args.risk_cap, working_lot=args.working_lot, max_open=max_open_eff,
-        verbose=args.verbose,
+        verbose=args.verbose, stop_level_pts=stop_level_pts,
     )
     try:
         trader.run()

@@ -300,17 +300,17 @@ def _runner_target(direction: int, row, cfg: ConfluenceConfig,
 
 def _clamp_sl(entry: float, stop: float, direction: int, atr: float,
               cfg_exits) -> float:
-    """Clamp stop-loss distance to [0.5·ATR, min(3·ATR, 12pt)].
+    """Clamp stop-loss distance to [0.5·ATR, 3·ATR].
 
     Prevents ultra-tight stops that get hunted by M1 noise and ultra-wide
-    stops that blow the risk budget.  The absolute cap (12pt for XAUUSD)
-    is asset-class specific and comes from cfg_exits.sl_clamp_max_pts.
+    stops that blow the risk budget.  Purely ATR-based so it scales to any
+    asset (XAU, BTC, forex) without hard-coded point values.
     """
     risk = abs(entry - stop)
     if risk <= 0:
         return stop
     min_dist = cfg_exits.sl_clamp_min_atr * atr
-    max_dist = min(cfg_exits.sl_clamp_max_atr * atr, cfg_exits.sl_clamp_max_pts)
+    max_dist = cfg_exits.sl_clamp_max_atr * atr
     clamped = max(min_dist, min(risk, max_dist))
     if direction == 1:
         return entry - clamped

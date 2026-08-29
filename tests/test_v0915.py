@@ -68,7 +68,6 @@ class TestExitPlan:
         ep = ExitPlan()
         assert ep.sl_clamp_min_atr == 0.5
         assert ep.sl_clamp_max_atr == 3.0
-        assert ep.sl_clamp_max_pts == 12.0
 
 
 # --------------------------------------------------------------------------- #
@@ -83,10 +82,10 @@ class TestSlClamp:
         assert abs(3000.0 - result) == pytest.approx(1.0)  # 0.5 * 2.0
 
     def test_clamps_too_wide(self):
-        """Stop 5 ATR away → clamped to min(3 ATR, 12pt) = 6 pts."""
+        """Stop 5 ATR away → clamped to 3 ATR = 6 pts."""
         ep = ExitPlan()
         result = _clamp_sl(3000.0, 2990.0, 1, 2.0, ep)  # 10 pts = 5 ATR
-        assert abs(3000.0 - result) == pytest.approx(6.0)  # min(3*2, 12)
+        assert abs(3000.0 - result) == pytest.approx(6.0)  # 3*2
 
     def test_no_clamp_within_bounds(self):
         """Stop 2 ATR away → no clamping."""
@@ -100,12 +99,12 @@ class TestSlClamp:
         result = _clamp_sl(3000.0, 3010.0, -1, 2.0, ep)  # 10 pts = 5 ATR
         assert abs(result - 3000.0) == pytest.approx(6.0)
 
-    def test_absolute_cap_12pts(self):
-        """Even with high ATR, absolute cap is 12 pts."""
+    def test_no_absolute_cap_pts(self):
+        """v0.9.15.1: removed absolute pts cap — purely ATR-based."""
         ep = ExitPlan()
-        # ATR=10, 3*ATR=30, but cap is 12
-        result = _clamp_sl(3000.0, 2970.0, 1, 10.0, ep)  # 30 pts
-        assert abs(3000.0 - result) == pytest.approx(12.0)
+        # ATR=100 (BTC-like), 3*ATR=300 — no artificial 12pt cap
+        result = _clamp_sl(77000.0, 76700.0, 1, 100.0, ep)  # 300 pts = 3 ATR
+        assert abs(77000.0 - result) == pytest.approx(300.0)
 
 
 # --------------------------------------------------------------------------- #

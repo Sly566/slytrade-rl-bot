@@ -58,11 +58,10 @@ class ExitPlan:
                                          # which was eating the scalp edge)
     # SL clamp (v0.9.15): hard bounds on stop distance in ATR multiples.
     # Prevents ultra-tight stops that get hunted and ultra-wide stops that
-    # blow the risk budget.  Absolute cap `sl_clamp_max_pts` is asset-class
-    # specific (12 points for XAUUSD ≈ $12).
+    # blow the risk budget.  Purely ATR-based so it scales to any asset
+    # (XAU, BTC, forex) without hard-coded point values.
     sl_clamp_min_atr: float = 0.5       # SL must be at least 0.5 ATR from entry
     sl_clamp_max_atr: float = 3.0       # SL must be at most 3 ATR from entry
-    sl_clamp_max_pts: float = 12.0      # absolute cap in price points (XAUUSD)
 
 
 # --------------------------------------------------------------------------- #
