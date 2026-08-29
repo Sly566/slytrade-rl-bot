@@ -570,16 +570,18 @@ class LiveTrader:
         is closer than trade_stops_level points to the current price.  This
         method bumps the SL outward if needed, logging a warning.
 
-        The minimum distance is: max(stop_level_pts * point, point * 50).
-        The point*50 fallback handles brokers that report stop_level=0 but
-        still reject tight stops (common on Exness).
+        The minimum distance is: max(stop_level_pts * point, point * 500, 0.75 * ATR).
+        The point*500 fallback handles brokers that report stop_level=0 but
+        still reject tight stops (common on Exness).  0.75*ATR scales to
+        any asset's volatility — BTC ATR≈19 → 14pt min; XAU ATR≈2 → 1.5pt min.
+        v0.9.15.1: also enforces minimum TP distance (prevents 10016 on TP side).
         """
         point = self.spec.point
         broker_min = self._stop_level_pts * point
-        fallback_min = point * 50
+        fallback_min = point * 500
         min_dist = max(broker_min, fallback_min)
         if atr > 0:
-            min_dist = max(min_dist, 0.3 * atr)
+            min_dist = max(min_dist, 0.75 * atr)
         market = ask if direction == 1 else bid
         if direction == 1:
             dist = market - sl
@@ -759,6 +761,13 @@ class LiveTrader:
             self._vlog(f"{side} {setup}/{sig.grade} rejected: invalid risk_per_unit after SL bump")
             return
         tp = fill + sig.direction * self.cfg.exits.tp1_r * risk_per_unit
+        # v0.9.15.1: enforce minimum TP distance too — broker rejects TP too close
+        point = self.spec.point
+        tp_market_dist = abs(tp - (ask if sig.direction == 1 else bid))
+        tp_min = max(point * 500, 0.75 * sig.atr_at_entry) if sig.atr_at_entry > 0 else point * 500
+        if tp_market_dist < tp_min:
+            tp = (ask if sig.direction == 1 else bid) + sig.direction * tp_min
+            print(f"    [TP-BUMP] TP moved to {tp:.{self.spec.digits}f} (min_dist={tp_min:.{self.spec.digits}f})")
         margin_quote = (lots * self.spec.contract_size * fill) / max(self.acct.leverage, 1)
         margin_acct = self.acct.to_account_ccy(margin_quote, self.spec.currency_profit)
         if margin_acct > equity * 0.95:
