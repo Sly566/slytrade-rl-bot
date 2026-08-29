@@ -6,6 +6,11 @@ features, performs causal MTF alignment, runs the Layer 4/5 signal scanner
 statefully, and when a signal fires sends a market or limit order with SL/TP
 sized per our grade-tiered risk rules and dynamic working-lot sizing.
 
+v0.9.15.3 changes:
+  - ALWAYS try all 3 filling modes (IOC, FOK, RETURN) regardless of bitmask.
+    The bitmask was unreliable — Exness BTC reported IOC+FOK but needed RETURN.
+  - Log each filling mode retry with retcode for debugging
+
 v0.9.15.2 changes:
   - LIVE hybrid ladder exits: TP is NOT set on broker (tp=0). TP1/TP2 partial
     closes + BE + ATR trailing stop + M5 CHoCH kill are managed in code via
@@ -357,24 +362,24 @@ class LiveTrader:
           bit 1 (2) = ORDER_FILLING_IOC
           bit 2 (4) = ORDER_FILLING_RETURN
         We try the most common ECN mode (IOC) first, then FOK, then RETURN.
+
+        v0.9.15.3: ALWAYS try all three modes regardless of bitmask. The
+        bitmask is unreliable across brokers — Exness BTC reports IOC+FOK
+        but actually needs RETURN. Silently skipping RETURN when the bitmask
+        says it's unsupported caused every order to fail with 10030.
         """
-        info = _to_dict(self.mt5.symbol_info(self.symbol))
-        mode_mask = int(info.get("filling_mode", 0))
-        modes: list[int] = []
-        # Try IOC first (Exness ECN), then FOK (standard), then RETURN (market-maker)
-        candidates = [
-            ("ORDER_FILLING_IOC", 2),
-            ("ORDER_FILLING_FOK", 1),
-            ("ORDER_FILLING_RETURN", 4),
+        all_modes = [
+            int(getattr(self.mt5, "ORDER_FILLING_IOC", 0)),
+            int(getattr(self.mt5, "ORDER_FILLING_FOK", 0)),
+            int(getattr(self.mt5, "ORDER_FILLING_RETURN", 0)),
         ]
-        for attr, bit in candidates:
-            val = int(getattr(self.mt5, attr, None) or 0)
-            if mode_mask & bit:
-                modes.append(val)
-        # Fallback: if bitmask is 0 or we found nothing, try all three
-        if not modes:
-            modes = [int(getattr(self.mt5, a, 0)) for a in
-                     ("ORDER_FILLING_IOC", "ORDER_FILLING_FOK", "ORDER_FILLING_RETURN")]
+        # Dedupe (some brokers alias values) while preserving order
+        seen: set[int] = set()
+        modes: list[int] = []
+        for m in all_modes:
+            if m and m not in seen:
+                modes.append(m)
+                seen.add(m)
         return modes
 
     def _place_market(self, direction: int, lots: float, sl: float, tp: float,
@@ -433,6 +438,8 @@ class LiveTrader:
                 return int(res.get("order", 0)) or int(res.get("deal", 0))
             if retcode in RETRY_RETCODES:
                 # Brief pause before retry — bridge hiccups need a moment
+                fill_name = {1: "IOC", 2: "RETURN", 0: "FOK"}.get(fill_mode, str(fill_mode))
+                print(f"    [FILL-RETRY] retcode={retcode} mode={fill_name} — trying next")
                 if retcode == -1:
                     time.sleep(0.2)
                 continue
@@ -1445,8 +1452,8 @@ class LiveTrader:
 
     # ------------------------------------------------------------------ #
     def run(self) -> None:
-        persona_label = "v0.9.15.2 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.15.2 champion (long-only A+/A/B hybrid ladder)"
-        print(f"SlyTrade LIVE v0.9.15.2  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  working_lot={self.working_lot}  max_open={self.max_open}")
+        persona_label = "v0.9.15.3 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.15.3 champion (long-only A+/A/B hybrid ladder)"
+        print(f"SlyTrade LIVE v0.9.15.3  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  working_lot={self.working_lot}  max_open={self.max_open}")
         print(f"persona: {persona_label}")
         print("setups : RETEST_OB RETEST_FVG LIQ_SWEEP BOS_CONT DISP_TRAP BREAKER  (champion gates apply unless --all)")
         print(f"Magic={MAGIC}")
@@ -1496,7 +1503,7 @@ class LiveTrader:
 # --------------------------------------------------------------------------- #
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="SlyTrade v0.9.15.2 SCALPER LIVE trader (live hybrid ladder + DISP_TRAP/BREAKER + SL clamp + limit retests)")
+    ap = argparse.ArgumentParser(description="SlyTrade v0.9.15.3 SCALPER LIVE trader (live hybrid ladder + all filling modes + DISP_TRAP/BREAKER + SL clamp + limit retests)")
     ap.add_argument("--symbol", default="XAUUSDm")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=18812)
