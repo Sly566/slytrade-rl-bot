@@ -342,6 +342,34 @@ class LiveTrader:
     # ------------------------------------------------------------------ #
     # Order entry
     # ------------------------------------------------------------------ #
+    def _get_filling_modes(self) -> list[int]:
+        """Determine supported filling modes for our symbol from broker info.
+
+        symbol_info().filling_mode is a bitmask:
+          bit 0 (1) = ORDER_FILLING_FOK
+          bit 1 (2) = ORDER_FILLING_IOC
+          bit 2 (4) = ORDER_FILLING_RETURN
+        We try the most common ECN mode (IOC) first, then FOK, then RETURN.
+        """
+        info = _to_dict(self.mt5.symbol_info(self.symbol))
+        mode_mask = int(info.get("filling_mode", 0))
+        modes: list[int] = []
+        # Try IOC first (Exness ECN), then FOK (standard), then RETURN (market-maker)
+        candidates = [
+            (self.mt5.ORDER_FILLING_IOC, 2),
+            (self.mt5.ORDER_FILLING_FOK, 1),
+            (self.mt5.ORDER_FILLING_RETURN, 4),
+        ]
+        for attr, bit in candidates:
+            val = int(getattr(self.mt5, attr, None) or 0)
+            if mode_mask & bit:
+                modes.append(val)
+        # Fallback: if bitmask is 0 or we found nothing, try all three
+        if not modes:
+            modes = [int(getattr(self.mt5, a, 0)) for a in
+                     ("ORDER_FILLING_IOC", "ORDER_FILLING_FOK", "ORDER_FILLING_RETURN")]
+        return modes
+
     def _place_market(self, direction: int, lots: float, sl: float, tp: float,
                       comment: str) -> int | None:
         """Place a market order. Returns ticket or None."""
@@ -354,17 +382,20 @@ class LiveTrader:
         # 500 points ($0.50 on XAU, ~5 pips on FX) which is tolerable slippage
         # on our 0.01-lot scalps (max 0.50 * 100 * 0.01 = $0.50 ≈ R9 extra).
         deviation = 500
-        # Try ORDER_FILLING_IOC first (Exness ECN accounts accept it); on
-        # rejection (retcode 10030 / "Unsupported filling mode"), fall back to
-        # ORDER_FILLING_RETURN which market-makers accept. v0.9.7 hard-coded
-        # IOC with no fallback, producing silent retcode=-1 failures.
-        filling_modes = [self.mt5.ORDER_FILLING_IOC, self.mt5.ORDER_FILLING_RETURN]
+        # v0.9.15.1: query broker's filling_mode bitmask and try supported modes
+        # in order. Retries on retcode=-1 (RPyC bridge None) instead of giving
+        # up on the first mode.
+        filling_modes = self._get_filling_modes()
         DONE = {int(getattr(self.mt5, "TRADE_RETCODE_DONE", 10009)),
                 int(getattr(self.mt5, "TRADE_RETCODE_DONE_PARTIAL", 10010))}
+        RETRY_RETCODES = {10030, -1}  # unsupported fill / bridge None → try next mode
         if not self.live:
             print(f"    [DRY-RUN] {'BUY' if direction==1 else 'SELL'} {lots} {self.symbol} @ {price:.{digits}f}  SL={sl:.{digits}f}  TP={tp:.{digits}f}  ({comment})")
             return -int(time.time() * 1000)   # fake ticket
         for fill_mode in filling_modes:
+            # Refresh price each attempt (stale price causes retcode=-1)
+            bid, ask = self.quote()
+            price = ask if direction == 1 else bid
             req = {
                 "action": self.mt5.TRADE_ACTION_DEAL,
                 "symbol": self.symbol,
@@ -382,15 +413,19 @@ class LiveTrader:
             res = _to_dict(self.mt5.order_send(req))
             retcode = int(res.get("retcode", -1))
             if retcode in DONE:
-                if fill_mode == self.mt5.ORDER_FILLING_RETURN:
-                    print("    [INFO] order used ORDER_FILLING_RETURN (IOC unsupported)")
+                if fill_mode != filling_modes[0]:
+                    fill_name = {1: "IOC", 2: "RETURN", 0: "FOK"}.get(fill_mode, str(fill_mode))
+                    print(f"    [INFO] order filled with {fill_name} (previous modes failed)")
                 return int(res.get("order", 0)) or int(res.get("deal", 0))
-            # Retcode 10030 = "Unsupported filling mode" → fall through to next.
-            if retcode in (10030,):
+            if retcode in RETRY_RETCODES:
+                # Brief pause before retry — bridge hiccups need a moment
+                if retcode == -1:
+                    time.sleep(0.2)
                 continue
-            print(f"    [REJECT] {retcode} {res.get('comment','')} req_fill={fill_mode} req={req}")
+            # Definitive broker rejection (10016 invalid stops, etc.) — don't retry
+            print(f"    [REJECT] {retcode} {res.get('comment','')} fill={fill_mode} req={req}")
             return None
-        print(f"    [REJECT] all filling modes rejected for {comment}")
+        print(f"    [REJECT] all filling modes failed for {comment} (tried {len(filling_modes)} modes)")
         return None
 
     def _close_position(self, ticket: int, reason: str) -> bool:
@@ -407,13 +442,16 @@ class LiveTrader:
         deviation = 500  # match _place_market
         DONE = {int(getattr(self.mt5, "TRADE_RETCODE_DONE", 10009)),
                 int(getattr(self.mt5, "TRADE_RETCODE_DONE_PARTIAL", 10010))}
+        RETRY_RETCODES = {10030, -1}
         if not self.live:
             lt = self._trades.get(int(ticket))
             if lt:
                 lt.closed = True; lt.close_reason = reason; lt.close_price = price
             print(f"    [DRY-RUN] CLOSE ticket={ticket} @ {price:.{digits}f} ({reason})")
             return True
-        for fill_mode in (self.mt5.ORDER_FILLING_IOC, self.mt5.ORDER_FILLING_RETURN):
+        for fill_mode in self._get_filling_modes():
+            bid, ask = self.quote()
+            price = bid if ptype == 0 else ask
             req = {
                 "action": self.mt5.TRADE_ACTION_DEAL,
                 "symbol": self.symbol,
@@ -431,7 +469,9 @@ class LiveTrader:
             retcode = int(res.get("retcode", -1))
             if retcode in DONE:
                 return True
-            if retcode in (10030,):
+            if retcode in RETRY_RETCODES:
+                if retcode == -1:
+                    time.sleep(0.2)
                 continue
             print(f"    [CLOSE-REJECT] ticket={ticket} retcode={retcode} {res.get('comment','')} fill={fill_mode}")
             return False
