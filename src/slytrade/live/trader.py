@@ -714,12 +714,16 @@ class LiveTrader:
         risk_quote = risk_acct / self.acct.fx_to_account.get(self.spec.currency_profit, 1.0)
         risk_lots = self.spec.lots_for_risk(risk_per_unit, risk_quote)
 
-        # Dynamic working-lot sizing: scale working_lot dynamically by risk_pct / risk_cap
-        base_risk = self.risk_cap if self.risk_cap > 0 else 0.01
-        scale = risk_pct / base_risk
-        dynamic_target = self.working_lot * scale
+        # Dynamic working-lot sizing:
+        # working_lot is the USER's intended base trade size — treat it as
+        # the absolute MINIMUM lot floor.  Don't scale it down by risk_pct
+        # (that was the v0.9.15 bug: C-grade signals with 0.12% risk_pct
+        # scaled 0.04 working_lot → 0.001, floored to vol_min 0.01, making
+        # every trade a meaningless dust position).  risk_cap remains the
+        # hard UPPER ceiling that prevents oversizing on wide stops.
+        dynamic_target = float(np.clip(self.working_lot, self.spec.volume_min, self.spec.volume_max))
         dynamic_target = np.floor(dynamic_target / self.spec.volume_step) * self.spec.volume_step
-        dynamic_target = float(np.clip(dynamic_target, self.spec.volume_min, self.spec.volume_max))
+        dynamic_target = float(dynamic_target)
 
         lots = max(risk_lots, dynamic_target) if risk_lots >= self.spec.volume_min else dynamic_target
         lots = np.floor(lots / self.spec.volume_step) * self.spec.volume_step
