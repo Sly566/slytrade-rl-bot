@@ -1,10 +1,16 @@
-"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.15 hybrid-ladder persona.
+"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.15.2 hybrid-ladder persona.
 
 Connects to MT5 via the mt5linux RPyC bridge (run `bash start_mt5_bridge.sh`
 in another terminal first), pulls multi-timeframe bars, computes Layer 2
 features, performs causal MTF alignment, runs the Layer 4/5 signal scanner
 statefully, and when a signal fires sends a market or limit order with SL/TP
 sized per our grade-tiered risk rules and dynamic working-lot sizing.
+
+v0.9.15.2 changes:
+  - LIVE hybrid ladder exits: TP is NOT set on broker (tp=0). TP1/TP2 partial
+    closes + BE + ATR trailing stop + M5 CHoCH kill are managed in code via
+    _partial_close() and _modify_sl(). Broker SL is the safety net only.
+  - Intra-bar position monitoring every 5s in live mode (was every 30s)
 
 v0.9.15 changes:
   - Hybrid ladder exits: TP1 1.0R @ 50% → BE; TP2 2.5R @ 25%; runner 25% ATR trail + M5 CHoCH kill
@@ -316,6 +322,7 @@ class LiveTrader:
         self._starting_balance: float | None = None  # set after warmup
         self._last_broker_pos: dict[int, dict] = {}  # snapshot for P&L diffing
         self._wins_count: int = 0
+        self._last_atr: float = 0.0  # cached ATR for intra-bar trailing stop
 
     # ------------------------------------------------------------------ #
     # Account info
@@ -372,7 +379,14 @@ class LiveTrader:
 
     def _place_market(self, direction: int, lots: float, sl: float, tp: float,
                       comment: str) -> int | None:
-        """Place a market order. Returns ticket or None."""
+        """Place a market order. Returns ticket or None.
+
+        v0.9.15.2: DON'T set TP on the broker order. The hybrid ladder
+        (TP1 partial close → BE → TP2 → runner) is managed in code via
+        _partial_close() and _modify_sl(). Setting TP on the broker causes
+        the entire position to close at TP1 — the runner never fires.
+        We set tp=0 on the order and store TP targets in LiveTrade.
+        """
         bid, ask = self.quote()
         price = ask if direction == 1 else bid
         digits = self.spec.digits
@@ -403,7 +417,7 @@ class LiveTrader:
                 "type": self.mt5.ORDER_TYPE_BUY if direction == 1 else self.mt5.ORDER_TYPE_SELL,
                 "price": price,
                 "sl": round(float(sl), digits),
-                "tp": round(float(tp), digits),
+                "tp": 0,  # v0.9.15.2: no TP on broker — hybrid ladder manages exits
                 "deviation": deviation,
                 "magic": MAGIC,
                 "comment": comment[:31],
@@ -475,6 +489,77 @@ class LiveTrader:
                 continue
             print(f"    [CLOSE-REJECT] ticket={ticket} retcode={retcode} {res.get('comment','')} fill={fill_mode}")
             return False
+        return False
+
+    def _partial_close(self, ticket: int, lots_to_close: float, reason: str) -> bool:
+        """Close a partial volume of an open position. Returns True on success."""
+        pos = self._get_position(ticket)
+        if pos is None:
+            return False
+        vol = min(lots_to_close, float(pos.get("volume", 0.0)))
+        if vol < self.spec.volume_min:
+            return False
+        vol = round(vol, 2)
+        ptype = int(pos.get("type", 0))
+        close_type = self.mt5.ORDER_TYPE_SELL if ptype == 0 else self.mt5.ORDER_TYPE_BUY
+        DONE = {int(getattr(self.mt5, "TRADE_RETCODE_DONE", 10009)),
+                int(getattr(self.mt5, "TRADE_RETCODE_DONE_PARTIAL", 10010))}
+        if not self.live:
+            bid, ask = self.quote()
+            price = bid if ptype == 0 else ask
+            print(f"    [DRY-RUN] PARTIAL CLOSE ticket={ticket} {vol} lots @ {price:.{self.spec.digits}f} ({reason})")
+            return True
+        for fill_mode in self._get_filling_modes():
+            bid, ask = self.quote()
+            price = bid if ptype == 0 else ask
+            req = {
+                "action": self.mt5.TRADE_ACTION_DEAL,
+                "symbol": self.symbol,
+                "volume": vol,
+                "type": close_type,
+                "position": int(ticket),
+                "price": price,
+                "deviation": 500,
+                "magic": MAGIC,
+                "comment": reason[:31],
+                "type_time": self.mt5.ORDER_TIME_GTC,
+                "type_filling": fill_mode,
+            }
+            res = _to_dict(self.mt5.order_send(req))
+            retcode = int(res.get("retcode", -1))
+            if retcode in DONE:
+                print(f"    [PARTIAL] ticket={ticket} closed {vol} lots ({reason})")
+                return True
+            if retcode in {10030, -1}:
+                if retcode == -1:
+                    time.sleep(0.2)
+                continue
+            print(f"    [PARTIAL-REJECT] ticket={ticket} retcode={retcode} fill={fill_mode}")
+            return False
+        return False
+
+    def _modify_sl(self, ticket: int, new_sl: float) -> bool:
+        """Modify the SL on an open position (keep TP=0). Returns True on success."""
+        pos = self._get_position(ticket)
+        if pos is None:
+            return False
+        DONE = {int(getattr(self.mt5, "TRADE_RETCODE_DONE", 10009)),
+                int(getattr(self.mt5, "TRADE_RETCODE_DONE_PARTIAL", 10010))}
+        if not self.live:
+            print(f"    [DRY-RUN] MODIFY SL ticket={ticket} → {new_sl:.{self.spec.digits}f}")
+            return True
+        req = {
+            "action": self.mt5.TRADE_ACTION_SLTP,
+            "symbol": self.symbol,
+            "position": int(ticket),
+            "sl": round(float(new_sl), self.spec.digits),
+            "tp": 0,
+        }
+        res = _to_dict(self.mt5.order_send(req))
+        retcode = int(res.get("retcode", -1))
+        if retcode in DONE:
+            return True
+        print(f"    [MODIFY-REJECT] ticket={ticket} sl={new_sl:.{self.spec.digits}f} retcode={retcode}")
         return False
 
     def _get_position(self, ticket: int) -> dict | None:
@@ -817,6 +902,10 @@ class LiveTrader:
         atr = 0.0
         if latest_m1_row is not None:
             atr = float(latest_m1_row.get('atr_14', 0.0)) if pd.notna(latest_m1_row.get('atr_14')) else 0.0
+            if atr > 0:
+                self._last_atr = atr
+        else:
+            atr = self._last_atr  # use cached ATR for intra-bar polls
 
         # ---------- SL / TP (hybrid ladder) ---------- #
         if not self.live:
@@ -892,11 +981,19 @@ class LiveTrader:
                     self._state[f"_bos_entered_{lt.direction:+d}"] = False
             broker_pos: dict[int, dict] = {}
         else:
+            # v0.9.15.2: Hybrid ladder in LIVE mode.
+            # TP is NOT set on the broker (tp=0), so the broker never
+            # auto-closes. We detect TP1/TP2/runner/SL in code, send
+            # partial close orders and SL modifications via MT5.
             broker_pos = self._our_open_positions()
             broker_tickets = set(broker_pos.keys())
             prev = getattr(self, "_last_broker_pos", {}) or {}
+            to_close: list[tuple[int, str]] = []
             for ticket, lt in list(self._trades.items()):
-                if ticket not in broker_tickets and not lt.closed:
+                if lt.closed:
+                    continue
+                # Position gone from broker → SL hit or broker-managed close
+                if ticket not in broker_tickets:
                     realized = self._deal_profit(int(ticket))
                     if realized is not None:
                         last_profit = realized
@@ -909,8 +1006,92 @@ class LiveTrader:
                     lt.pnl = last_profit
                     if last_profit > 0:
                         self._wins_count += 1
-                    print(f"    [EXIT] ticket={ticket} reason=BROKER (SL/TP hit) pnl={last_profit:+.2f}{self.acct.currency}")
-                    # v0.9.15: one-shot re-arm when flat after TP
+                    print(f"    [EXIT] ticket={ticket} reason=BROKER pnl={last_profit:+.2f}{self.acct.currency}")
+                    self._state[f"_bos_entered_{lt.direction:+d}"] = False
+                    continue
+
+                # Position still open — check hybrid ladder levels
+                price = bid if lt.direction == 1 else ask
+
+                # Check SL hit (intra-bar, before bar close)
+                hit_sl = (lt.direction == 1 and price <= lt.sl) or (lt.direction == -1 and price >= lt.sl)
+                if hit_sl:
+                    to_close.append((ticket, "SL"))
+                    continue
+
+                # TP1 → partial close 50% + move SL to BE
+                if not lt.tp1_hit:
+                    hit_tp1 = (lt.direction == 1 and price >= lt.tp) or (lt.direction == -1 and price <= lt.tp)
+                    if hit_tp1:
+                        lt.tp1_hit = True
+                        close_lots = lt.original_lots * self.cfg.exits.tp1_pct
+                        close_lots = max(round(close_lots, 2), self.spec.volume_min)
+                        ok = self._partial_close(ticket, close_lots, "TP1")
+                        if ok:
+                            lt.remaining_lots = max(round(lt.original_lots - close_lots, 2), self.spec.volume_min)
+                            lt.sl = lt.entry  # move to breakeven
+                            self._modify_sl(ticket, lt.sl)
+                            print(f"    [TP1] ticket={ticket} closed {close_lots} lots @ {price:.{self.spec.digits}f} "
+                                  f"→ BE SL={lt.sl:.{self.spec.digits}f} remaining={lt.remaining_lots}")
+                        else:
+                            print(f"    [TP1-FAIL] ticket={ticket} partial close failed, will retry next poll")
+                            lt.tp1_hit = False  # retry next cycle
+
+                # TP2 → partial close 25%
+                elif not lt.tp2_hit:
+                    hit_tp2 = (lt.direction == 1 and price >= lt.tp2_price) or (lt.direction == -1 and price <= lt.tp2_price)
+                    if hit_tp2:
+                        lt.tp2_hit = True
+                        close_lots = lt.original_lots * self.cfg.exits.tp2_pct
+                        close_lots = max(round(close_lots, 2), self.spec.volume_min)
+                        ok = self._partial_close(ticket, close_lots, "TP2")
+                        if ok:
+                            lt.remaining_lots = max(round(lt.remaining_lots - close_lots, 2), self.spec.volume_min)
+                            print(f"    [TP2] ticket={ticket} closed {close_lots} lots @ {price:.{self.spec.digits}f} "
+                                  f"remaining={lt.remaining_lots}")
+                        else:
+                            print(f"    [TP2-FAIL] ticket={ticket} partial close failed, will retry next poll")
+                            lt.tp2_hit = False  # retry next cycle
+
+                # Runner: ATR trail + M5 CHoCH kill
+                else:
+                    # M5 CHoCH kill for runner
+                    if latest_m1_row is not None:
+                        m5_choch_against = (
+                            (lt.direction == 1 and bool(latest_m1_row.get("M5_minor_choch_dn", False))) or
+                            (lt.direction == -1 and bool(latest_m1_row.get("M5_minor_choch_up", False)))
+                        )
+                        if m5_choch_against:
+                            to_close.append((ticket, "M5_CHOCH_RUNNER"))
+                            continue
+                    # ATR trailing stop for runner — update SL on broker
+                    if atr > 0:
+                        trail_dist = self.cfg.exits.runner_trail_atr_mult * atr
+                        if lt.direction == 1:
+                            new_trail = price - trail_dist
+                            if new_trail > lt.sl:
+                                lt.sl = new_trail
+                                self._modify_sl(ticket, lt.sl)
+                        else:
+                            new_trail = price + trail_dist
+                            if new_trail < lt.sl:
+                                lt.sl = new_trail
+                                self._modify_sl(ticket, lt.sl)
+
+                # rough running P&L for status line
+                r_mult = (price - lt.entry) / max(abs(lt.tp - lt.entry), 1e-9)
+                if lt.direction == -1:
+                    r_mult = -r_mult
+                lt.pnl = r_mult * lt.risk_pct * self.equity()
+
+            # Execute any market closes (SL, M5 CHoCH kill)
+            for ticket, reason in to_close:
+                lt = self._trades[ticket]
+                if self._close_position(ticket, reason):
+                    price = bid if lt.direction == 1 else ask
+                    lt.close_price = price; lt.closed = True; lt.close_reason = reason
+                    print(f"    [EXIT] ticket={ticket} reason={reason}")
+                if reason in ("TP1", "M5_CHOCH_RUNNER"):
                     self._state[f"_bos_entered_{lt.direction:+d}"] = False
             self._last_broker_pos = dict(broker_pos)
 
@@ -1264,8 +1445,8 @@ class LiveTrader:
 
     # ------------------------------------------------------------------ #
     def run(self) -> None:
-        persona_label = "v0.9.15 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.15 champion (long-only A+/A/B hybrid ladder)"
-        print(f"SlyTrade LIVE v0.9.15  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  working_lot={self.working_lot}  max_open={self.max_open}")
+        persona_label = "v0.9.15.2 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.15.2 champion (long-only A+/A/B hybrid ladder)"
+        print(f"SlyTrade LIVE v0.9.15.2  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  working_lot={self.working_lot}  max_open={self.max_open}")
         print(f"persona: {persona_label}")
         print("setups : RETEST_OB RETEST_FVG LIQ_SWEEP BOS_CONT DISP_TRAP BREAKER  (champion gates apply unless --all)")
         print(f"Magic={MAGIC}")
@@ -1289,7 +1470,10 @@ class LiveTrader:
             if sleep_s < 0: sleep_s = 1.0
             end_wait = time.time() + sleep_s
             while running["v"] and time.time() < end_wait:
-                if self._cycle % 6 == 0:
+                # In live mode, check positions every poll_interval (5s) so
+                # hybrid ladder TP1/TP2/runner detect fast moves. In dry-run
+                # only check every 6th iteration (30s) to reduce noise.
+                if self.live or self._cycle % 6 == 0:
                     try:
                         self._monitor_positions(None)
                     except Exception:
@@ -1312,7 +1496,7 @@ class LiveTrader:
 # --------------------------------------------------------------------------- #
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="SlyTrade v0.9.15 SCALPER LIVE trader (hybrid ladder + DISP_TRAP/BREAKER + SL clamp + limit retests)")
+    ap = argparse.ArgumentParser(description="SlyTrade v0.9.15.2 SCALPER LIVE trader (live hybrid ladder + DISP_TRAP/BREAKER + SL clamp + limit retests)")
     ap.add_argument("--symbol", default="XAUUSDm")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=18812)
