@@ -355,32 +355,55 @@ class LiveTrader:
     # Order entry
     # ------------------------------------------------------------------ #
     def _get_filling_modes(self) -> list[int]:
-        """Determine supported filling modes for our symbol from broker info.
+        """Determine filling modes to try, ordered by likelihood of success.
 
-        symbol_info().filling_mode is a bitmask:
-          bit 0 (1) = ORDER_FILLING_FOK
-          bit 1 (2) = ORDER_FILLING_IOC
-          bit 2 (4) = ORDER_FILLING_RETURN
-        We try the most common ECN mode (IOC) first, then FOK, then RETURN.
+        Strategy (v0.9.15.3):
+          1. If we already found a working mode (cached), try it FIRST.
+          2. Then try modes the broker's bitmask says are supported.
+          3. Finally try all remaining modes as fallback.
+          4. Dedupe so each mode is tried at most once.
 
-        v0.9.15.3: ALWAYS try all three modes regardless of bitmask. The
-        bitmask is unreliable across brokers — Exness BTC reports IOC+FOK
-        but actually needs RETURN. Silently skipping RETURN when the bitmask
-        says it's unsupported caused every order to fail with 10030.
+        The bitmask is a PREFERENCE hint, not a hard filter — Exness BTC
+        reports IOC+FOK but actually needs RETURN.  We always try everything.
         """
-        all_modes = [
-            int(getattr(self.mt5, "ORDER_FILLING_IOC", 0)),
-            int(getattr(self.mt5, "ORDER_FILLING_FOK", 0)),
-            int(getattr(self.mt5, "ORDER_FILLING_RETURN", 0)),
-        ]
-        # Dedupe (some brokers alias values) while preserving order
+        # Cached winner from a previous successful order this session
+        cached = getattr(self, "_best_fill_mode", None)
+
+        # All known MT5 filling modes (the complete set — MT5 defines exactly 3)
+        ALL_KNOWN = {
+            "ORDER_FILLING_FOK": 1,
+            "ORDER_FILLING_IOC": 2,
+            "ORDER_FILLING_RETURN": 4,
+        }
+
+        # Read the broker's bitmask to know which modes it RECOMMENDS
+        info = _to_dict(self.mt5.symbol_info(self.symbol))
+        mode_mask = int(info.get("filling_mode", 0))
+
+        # Partition into broker-recommended vs fallback
+        recommended: list[int] = []
+        fallback: list[int] = []
+        for attr, bit in ALL_KNOWN.items():
+            val = int(getattr(self.mt5, attr, 0))
+            if not val:
+                continue
+            if mode_mask & bit:
+                recommended.append(val)
+            else:
+                fallback.append(val)
+
+        # Build final ordered list: cached winner → recommended → fallback
+        ordered: list[int] = []
         seen: set[int] = set()
-        modes: list[int] = []
-        for m in all_modes:
+        for m in ([cached] if cached else []) + recommended + fallback:
             if m and m not in seen:
-                modes.append(m)
+                ordered.append(m)
                 seen.add(m)
-        return modes
+        return ordered
+
+    def _record_fill_success(self, fill_mode: int) -> None:
+        """Cache the filling mode that worked so future orders skip retries."""
+        self._best_fill_mode = fill_mode
 
     def _place_market(self, direction: int, lots: float, sl: float, tp: float,
                       comment: str) -> int | None:
@@ -435,6 +458,7 @@ class LiveTrader:
                 if fill_mode != filling_modes[0]:
                     fill_name = {1: "IOC", 2: "RETURN", 0: "FOK"}.get(fill_mode, str(fill_mode))
                     print(f"    [INFO] order filled with {fill_name} (previous modes failed)")
+                self._record_fill_success(fill_mode)
                 return int(res.get("order", 0)) or int(res.get("deal", 0))
             if retcode in RETRY_RETCODES:
                 # Brief pause before retry — bridge hiccups need a moment
@@ -489,6 +513,7 @@ class LiveTrader:
             res = _to_dict(self.mt5.order_send(req))
             retcode = int(res.get("retcode", -1))
             if retcode in DONE:
+                self._record_fill_success(fill_mode)
                 return True
             if retcode in RETRY_RETCODES:
                 if retcode == -1:
@@ -536,6 +561,7 @@ class LiveTrader:
             retcode = int(res.get("retcode", -1))
             if retcode in DONE:
                 print(f"    [PARTIAL] ticket={ticket} closed {vol} lots ({reason})")
+                self._record_fill_success(fill_mode)
                 return True
             if retcode in {10030, -1}:
                 if retcode == -1:
