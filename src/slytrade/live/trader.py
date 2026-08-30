@@ -1679,7 +1679,7 @@ def main() -> None:
         fx_to_account={"USD": args.usd_zar} if str(acc.get("currency","ZAR")) != "USD" else {"USD": 1.0},
     )
     cfg = rl_training_persona() if args.unrestricted else champion_persona()
-    max_open_eff = args.max_open if not args.unrestricted else max(args.max_open, 10)
+    max_open_eff = args.max_open  # v0.9.15.12: respect user's --max-open even in unrestricted mode
     print(f"  verbose       : {args.verbose}")
     print(f"  risk_cap      : {args.risk_cap*100:.1f}% per trade")
     print(f"  working_lot   : {args.working_lot}")
