@@ -1,4 +1,4 @@
-"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.15.9 hybrid-ladder persona.
+"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.15.11 hybrid-ladder persona.
 
 Connects to MT5 via the mt5linux RPyC bridge (run `bash start_mt5_bridge.sh`
 in another terminal first), pulls multi-timeframe bars, computes Layer 2
@@ -211,27 +211,21 @@ def fetch_bars(mt5: Any, symbol: str, timeframe: str, count: int) -> pd.DataFram
     CRITICAL CAUSALITY RULE: MT5's copy_rates_from_pos(symbol, tf, 0, N) ALWAYS
     returns the CURRENTLY-FORMING bar as the LAST row -- its OHLC is mutating
     in real time and must NEVER be fed into the feature pipeline or signal
-    engine. v0.9.7 guard:
+    engine.
 
-      1. Wall-clock filter: keep bars whose close time has already passed
-         on host clock (`time+dur <= now`). Same parity as v0.9.5 wall
-         filter -- this tolerates arbitrary Wine/RPyC/NTP clock drift
-         between host and MT5 server without filtering out legitimately
-         closed bars (the first v0.9.7 build used `<= now - 2s` which
-         filtered every bar on Sly's Pop-OS host when host clock lagged
-         MT5 server time by ~3s under Wine, producing 0 bars / 'not
-         enough M1 data yet' on every cycle). The forming bar's close is
-         always >= now (it closes dur in the future) so it is excluded.
-      2. For M1 ONLY: unconditionally drop the last row as belt-and-
-         suspenders. M1 forming-bar OHLC poisons feature state
-         (displacements, swings) within seconds, and a ~60s lag is
-         acceptable for scalps. For M5+ the forming bar closes 5-1440
-         minutes in the future, so the wall filter ALONE excludes it
-         safely; an extra unconditional tail drop there (v0.9.5 bug)
-         cut off the most recently CLOSED HTF bar, leaving structural
-         flags (bull_disp, minor_choch_up, etc.) always one HTF period
-         stale. v0.9.7 fixes that so HTF structure updates the moment
-         the HTF bar closes.
+    v0.9.15.11: Replaced the 2-layer lag guard (wall-clock filter + M1 tail
+    drop) with a single grace-period wall filter.  The old approach stacked
+    2 full minutes of lag on M1 scalps — unacceptable for a scalper that
+    needs to see price within seconds of the close.
+
+    New approach: `time + dur <= now + _GRACE` where _GRACE = 5 seconds.
+    This handles BOTH failure modes in one filter:
+      - Host clock ahead of MT5: the forming bar's close is `dur` in the
+        future, so `time+dur` is ~60s ahead of `now`.  Even with 5s grace,
+        `60s > 5s` → forming bar is excluded.
+      - Host clock behind MT5 (Wine/NTP drift): a legitimately closed bar
+        whose close time is a few seconds "in the future" on the host clock
+        still passes because `0s <= 5s` → bar is kept.
     """
     tf_const = getattr(mt5, TIMEFRAME_ATTRS[timeframe])
     dur = timeframe_timedelta(timeframe)
@@ -242,27 +236,13 @@ def fetch_bars(mt5: Any, symbol: str, timeframe: str, count: int) -> pd.DataFram
     df = normalize_bar_frame(raw, symbol, timeframe)
     if df.empty:
         return df
-    # Wall-clock filter: drop bars whose close time has not yet passed on
-    # host clock. This is the primary guard against the forming bar, whose
-    # close time is always `dur` in the future (so it fails `<= now`).
-    # Using `<= now` (v0.9.5 parity) not `< now - grace`: the latter caused
-    # 0 bars on Sly's Pop-OS host when host clock was a few seconds behind
-    # MT5 server time -- every bar's close looked "in the future" by more
-    # than the grace window.
+    # Grace-period wall filter: keep bars whose close time is at most
+    # _GRACE seconds in the future on the host clock.  This replaces both
+    # the old `<= now` filter AND the M1 unconditional tail drop, cutting
+    # lag from 2 bars (~120s) to ~5 seconds.
+    _GRACE = timedelta(seconds=5)
     now = datetime.now(UTC)
-    df = df[df["time"] + dur <= now].copy()
-    # M1 only: unconditional 1-bar tail drop as belt-and-suspenders.
-    # Rationale: M1 forming-bar OHLC poisons displacements/swings within
-    # seconds, and host-clock can be up to several seconds ahead of MT5
-    # server under Wine, which lets the forming M1 bar slip past the wall
-    # filter above. Dropping one more M1 bar costs ~60s latency which is
-    # acceptable for scalps. For M5+ the forming bar's close is 5-1440
-    # minutes in the future, so the wall filter ALONE excludes it safely
-    # even with many seconds of clock skew; an extra tail drop there
-    # (v0.9.5 bug) cut off the most recently CLOSED HTF bar, leaving
-    # structural flags one HTF period stale. v0.9.7 fixes that.
-    if timeframe == "M1" and len(df) > 1:
-        df = df.iloc[:-1].copy()
+    df = df[df["time"] + dur <= now + _GRACE].copy()
     # Keep only the last `count` completed bars
     if len(df) > count:
         df = df.iloc[-count:].copy()
@@ -1565,8 +1545,8 @@ class LiveTrader:
 
     # ------------------------------------------------------------------ #
     def run(self) -> None:
-        persona_label = "v0.9.15.9 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.15.9 champion (long-only A+/A/B hybrid ladder)"
-        print(f"SlyTrade LIVE v0.9.15.9  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  working_lot={self.working_lot}  max_open={self.max_open}")
+        persona_label = "v0.9.15.11 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.15.11 champion (long-only A+/A/B hybrid ladder)"
+        print(f"SlyTrade LIVE v0.9.15.11  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  working_lot={self.working_lot}  max_open={self.max_open}")
         print(f"persona: {persona_label}")
         print("setups : RETEST_OB RETEST_FVG LIQ_SWEEP BOS_CONT DISP_TRAP BREAKER  (champion gates apply unless --all)")
         print(f"Magic={MAGIC}")
@@ -1660,7 +1640,7 @@ class LiveTrader:
 # --------------------------------------------------------------------------- #
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="SlyTrade v0.9.15.9 SCALPER LIVE trader (massive lookback windows + ATR-adaptive proximity gate + ATR-adaptive retest window + bridge diagnostics + smoke test + hardcoded MT5 constants + dynamic BOS_CONT freshness + hybrid ladder + all filling modes)")
+    ap = argparse.ArgumentParser(description="SlyTrade v0.9.15.11 SCALPER LIVE trader (real-time lag fix + massive lookback windows + ATR-adaptive proximity gate + ATR-adaptive retest window + bridge diagnostics + smoke test + hardcoded MT5 constants + dynamic BOS_CONT freshness + hybrid ladder + all filling modes)")
     ap.add_argument("--symbol", default="XAUUSDm")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=18812)
