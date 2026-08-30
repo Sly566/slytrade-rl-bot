@@ -1,10 +1,15 @@
-"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.15.6 hybrid-ladder persona.
+"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.15.7 hybrid-ladder persona.
 
 Connects to MT5 via the mt5linux RPyC bridge (run `bash start_mt5_bridge.sh`
 in another terminal first), pulls multi-timeframe bars, computes Layer 2
 features, performs causal MTF alignment, runs the Layer 4/5 signal scanner
 statefully, and when a signal fires sends a market or limit order with SL/TP
 sized per our grade-tiered risk rules and dynamic working-lot sizing.
+
+v0.9.15.7 changes:
+  - Add mt5.last_error() diagnostics when order_send returns None (bridge failure)
+  - Add startup bridge smoke test (--live mode) to verify order_send works
+  - Handle None return separately from retcode=-1 (different failures)
 
 v0.9.15.6 changes:
   - Fix retcode=-1 on ALL orders: hardcode MT5 protocol constants as plain
@@ -502,6 +507,16 @@ class LiveTrader:
                 print(f"    [FILL-EXCEPTION] mode={fill_name} exc={exc!r} — trying next")
                 time.sleep(0.3)
                 continue
+            if raw_res is None:
+                # v0.9.15.7: bridge returned None — query last_error for diagnosis
+                try:
+                    err = self.mt5.last_error()
+                except Exception:
+                    err = "last_error() failed"
+                fill_name = {0: "FOK", 1: "IOC", 2: "RETURN"}.get(fill_mode, str(fill_mode))
+                print(f"    [FILL-RETRY] raw=None mode={fill_name} last_error={err} — trying next")
+                time.sleep(0.3)
+                continue
             res = _to_dict(raw_res)
             retcode = int(res.get("retcode", -1))
             if retcode in DONE:
@@ -511,14 +526,9 @@ class LiveTrader:
                 self._record_fill_success(fill_mode)
                 return int(res.get("order", 0)) or int(res.get("deal", 0))
             if retcode in RETRY_RETCODES:
-                # Brief pause before retry — bridge hiccups need a moment
                 fill_name = {0: "FOK", 1: "IOC", 2: "RETURN"}.get(fill_mode, str(fill_mode))
-                if retcode == -1:
-                    # v0.9.15.4: log the raw bridge response for diagnosis
-                    print(f"    [FILL-RETRY] retcode=-1 mode={fill_name} raw={raw_res!r} res={res} — trying next")
-                    time.sleep(0.3)
-                else:
-                    print(f"    [FILL-RETRY] retcode={retcode} mode={fill_name} — trying next")
+                print(f"    [FILL-RETRY] retcode={retcode} mode={fill_name} res={res} — trying next")
+                time.sleep(0.3)
                 continue
             # Definitive broker rejection (10016 invalid stops, etc.) — don't retry
             print(f"    [REJECT] {retcode} {res.get('comment','')} fill={fill_mode} req={req}")
@@ -566,6 +576,14 @@ class LiveTrader:
                 raw_res = self.mt5.order_send(req)
             except Exception as exc:
                 print(f"    [CLOSE-EXCEPTION] ticket={ticket} fill={fill_mode} exc={exc!r}")
+                time.sleep(0.3)
+                continue
+            if raw_res is None:
+                try:
+                    err = self.mt5.last_error()
+                except Exception:
+                    err = "last_error() failed"
+                print(f"    [CLOSE-RETRY] ticket={ticket} raw=None fill={fill_mode} last_error={err}")
                 time.sleep(0.3)
                 continue
             res = _to_dict(raw_res)
@@ -618,6 +636,14 @@ class LiveTrader:
                 raw_res = self.mt5.order_send(req)
             except Exception as exc:
                 print(f"    [PARTIAL-EXCEPTION] ticket={ticket} fill={fill_mode} exc={exc!r}")
+                time.sleep(0.3)
+                continue
+            if raw_res is None:
+                try:
+                    err = self.mt5.last_error()
+                except Exception:
+                    err = "last_error() failed"
+                print(f"    [PARTIAL-RETRY] ticket={ticket} raw=None fill={fill_mode} last_error={err}")
                 time.sleep(0.3)
                 continue
             res = _to_dict(raw_res)
@@ -1540,8 +1566,8 @@ class LiveTrader:
 
     # ------------------------------------------------------------------ #
     def run(self) -> None:
-        persona_label = "v0.9.15.6 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.15.6 champion (long-only A+/A/B hybrid ladder)"
-        print(f"SlyTrade LIVE v0.9.15.6  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  working_lot={self.working_lot}  max_open={self.max_open}")
+        persona_label = "v0.9.15.7 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.15.7 champion (long-only A+/A/B hybrid ladder)"
+        print(f"SlyTrade LIVE v0.9.15.7  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  working_lot={self.working_lot}  max_open={self.max_open}")
         print(f"persona: {persona_label}")
         print("setups : RETEST_OB RETEST_FVG LIQ_SWEEP BOS_CONT DISP_TRAP BREAKER  (champion gates apply unless --all)")
         print(f"Magic={MAGIC}")
@@ -1591,7 +1617,7 @@ class LiveTrader:
 # --------------------------------------------------------------------------- #
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="SlyTrade v0.9.15.6 SCALPER LIVE trader (live hybrid ladder + all filling modes + hardcoded MT5 constants + dynamic BOS_CONT freshness + DISP_TRAP/BREAKER + SL clamp + limit retests)")
+    ap = argparse.ArgumentParser(description="SlyTrade v0.9.15.7 SCALPER LIVE trader (bridge diagnostics + smoke test + hardcoded MT5 constants + dynamic BOS_CONT freshness + hybrid ladder + all filling modes)")
     ap.add_argument("--symbol", default="XAUUSDm")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=18812)
@@ -1632,6 +1658,47 @@ def main() -> None:
     print(f"  risk_cap      : {args.risk_cap*100:.1f}% per trade")
     print(f"  working_lot   : {args.working_lot}")
     print(f"  max_open      : {max_open_eff}")
+
+    # v0.9.15.7: Bridge smoke test — probe order_send with a minimal request
+    # to verify the RPyC bridge can serialize dicts to MT5.
+    if args.live:
+        print("\n  [SMOKE TEST] Probing bridge order_send capability ...")
+        try:
+            _tick = _to_dict(mt5.symbol_info_tick(resolved))
+            _bid = float(_tick.get("bid", 0))
+            _ask = float(_tick.get("ask", 0))
+            smoke_req = {
+                "action": 1, "symbol": resolved, "volume": spec.volume_min,
+                "type": 0, "price": _ask if _ask > 0 else 0,
+                "sl": 0.0, "tp": 0.0, "deviation": 500, "magic": MAGIC,
+                "comment": "smoke_test", "type_time": 0, "type_filling": 0,
+            }
+            print(f"  [SMOKE TEST] req={smoke_req}")
+            smoke_res = mt5.order_send(smoke_req)
+            print(f"  [SMOKE TEST] raw result: {smoke_res!r}")
+            if smoke_res is None:
+                smoke_err = mt5.last_error()
+                print(f"  [SMOKE TEST] FAIL: order_send returned None! last_error={smoke_err}")
+                print(f"  [SMOKE TEST] Bridge cannot deliver order_send to MT5.")
+                print(f"  [SMOKE TEST] Check: mt5linux version, MT5 login, Wine/Python compat, terminal restart")
+            else:
+                smoke_dict = _to_dict(smoke_res)
+                smoke_retcode = smoke_dict.get("retcode", "?")
+                print(f"  [SMOKE TEST] retcode={smoke_retcode} (bridge works!)")
+                if smoke_retcode in (10009, 10010):
+                    smoke_ticket = smoke_dict.get("order", 0)
+                    print(f"  [SMOKE TEST] Smoke order FILLED ticket={smoke_ticket} -- closing immediately")
+                    close_req = {
+                        "action": 1, "symbol": resolved, "volume": spec.volume_min,
+                        "type": 1, "position": int(smoke_ticket), "price": _bid if _bid > 0 else 0,
+                        "deviation": 500, "magic": MAGIC, "comment": "smoke_close",
+                        "type_time": 0, "type_filling": 0,
+                    }
+                    mt5.order_send(close_req)
+        except Exception as smoke_exc:
+            print(f"  [SMOKE TEST] Exception: {smoke_exc!r}")
+        print()
+
     trader = LiveTrader(
         mt5=mt5, symbol=resolved, spec=spec, cfg=cfg, acct=acct_spec,
         live=args.live, risk_cap=args.risk_cap, working_lot=args.working_lot, max_open=max_open_eff,
