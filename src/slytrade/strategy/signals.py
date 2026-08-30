@@ -1,4 +1,4 @@
-"""Layer 4 — ICT/SMC scalper signal engine (v0.9.15.9).
+"""Layer 4 — ICT/SMC scalper signal engine (v0.9.15.12).
 
 Produces strictly-causal entry signals from the M1-aligned frame. Each signal
 carries: direction, entry price, stop loss, take-profit ladder, setup grade,
@@ -702,6 +702,14 @@ def _evaluate_row(i: int,
         # v0.9.5 only checked disp and major/minor BOS; CHoCH breaks (which
         # are the primary signal after a liquidity grab) were silently
         # skipped -- added them here so a fresh sweep+CHoCH reversal fires.
+        #
+        # v0.9.15.12: In unrestricted mode, the sweep itself is sufficient
+        # confirmation.  The sweep IS the signal -- sell-side liquidity was
+        # taken, reversal is the thesis.  Requiring displacement on the SAME
+        # bar blocks legitimate sweeps when the next bar has opposing momentum
+        # (e.g. bull sweep at 21:09, bear disp at 21:10 -> bot entered SHORT
+        # instead of LONG on the sweep).  Displacement is now a bonus tag,
+        # not a gate, in unrestricted mode.
         m1_disp = bool(row.get('bull_disp' if direction==1 else 'bear_disp', False))
         tf_disp = bool(row.get(f'{trigger_tf}_{"bull" if direction==1 else "bear"}_disp', False))
         m1_bos = bool(row.get('minor_bos_up' if direction==1 else 'minor_bos_dn', False)) or \
@@ -709,15 +717,15 @@ def _evaluate_row(i: int,
                  bool(row.get('minor_choch_up' if direction==1 else 'minor_choch_dn', False)) or \
                  bool(row.get('major_choch_up' if direction==1 else 'major_choch_dn', False))
         vol_surge = bool(row.get('vol_spike', False)) or bool(row.get(f'{trigger_tf}_vol_spike', False))
+        has_reversal_confirm = m1_disp or tf_disp or m1_bos
         if cfg.confluence.persona_gating:
+            # Champion mode: require displacement + volume surge
             if not (m1_disp or tf_disp or (m1_bos and vol_surge)):
                 if fail_trace is not None:
                     _reject(f"LIQ_SWEEP {side}: no disp/BOS confirmation (champion requires vol_surge)")
                 continue
-        else:
-            if not (m1_disp or tf_disp or m1_bos):
-                if fail_trace is not None:
-                    _reject(f"LIQ_SWEEP {side}: no disp/BOS/CHoCH confirmation yet")
+        # Unrestricted mode: sweep alone is sufficient -- no additional gate.
+        # Displacement/BOS/CHoCH are bonus tags only.
                 continue
         # One entry per sweep event (dedupe by timestamp)
         sweep_key = f"_swept_{direction}_{last_sweep_ts.isoformat()}"
@@ -785,6 +793,10 @@ def _evaluate_row(i: int,
         tags.append(f'kz_{kz_tag}')
         if vol_surge:
             tags.append('vol_surge')
+        if has_reversal_confirm:
+            tags.append('reversal_confirmed')
+        else:
+            tags.append('sweep_only_no_confirm')
         bias_summary = {}
         for tf in ('W1','D1','H4','H1','M30','M15','M5'):
             b = row.get(f'{tf}_major_bias', 0)
