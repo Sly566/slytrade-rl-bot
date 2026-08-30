@@ -1,4 +1,4 @@
-"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.15.11 hybrid-ladder persona.
+"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.15.12 hybrid-ladder persona.
 
 Connects to MT5 via the mt5linux RPyC bridge (run `bash start_mt5_bridge.sh`
 in another terminal first), pulls multi-timeframe bars, computes Layer 2
@@ -1545,8 +1545,8 @@ class LiveTrader:
 
     # ------------------------------------------------------------------ #
     def run(self) -> None:
-        persona_label = "v0.9.15.11 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.15.11 champion (long-only A+/A/B hybrid ladder)"
-        print(f"SlyTrade LIVE v0.9.15.11  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  working_lot={self.working_lot}  max_open={self.max_open}")
+        persona_label = "v0.9.15.12 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.15.12 champion (long-only A+/A/B hybrid ladder)"
+        print(f"SlyTrade LIVE v0.9.15.12  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  working_lot={self.working_lot}  max_open={self.max_open}")
         print(f"persona: {persona_label}")
         print("setups : RETEST_OB RETEST_FVG LIQ_SWEEP BOS_CONT DISP_TRAP BREAKER  (champion gates apply unless --all)")
         print(f"Magic={MAGIC}")
@@ -1608,10 +1608,13 @@ class LiveTrader:
             print(f"[ERROR] initial cycle: {e}")
             traceback.print_exc()
         while running["v"]:
-            now = datetime.now(UTC)
-            next_min = (now + timedelta(minutes=1)).replace(second=5, microsecond=0)
-            sleep_s = (next_min - datetime.now(UTC)).total_seconds()
-            if sleep_s < 0: sleep_s = 1.0
+            # v0.9.15.11: Poll every 10 seconds instead of waiting for the
+            # next minute.  The old code waited until second 5 of the NEXT
+            # minute — adding 65 seconds of dead lag on every M1 bar.  For a
+            # scalper that's fatal.  Now we check every 10s; _cycle_fn only
+            # processes NEW bars (via _last_processed_m1_time), so frequent
+            # polls don't re-process old data.
+            sleep_s = 10.0
             end_wait = time.time() + sleep_s
             while running["v"] and time.time() < end_wait:
                 # In live mode, check positions every poll_interval (5s) so
@@ -1640,7 +1643,7 @@ class LiveTrader:
 # --------------------------------------------------------------------------- #
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="SlyTrade v0.9.15.11 SCALPER LIVE trader (real-time lag fix + massive lookback windows + ATR-adaptive proximity gate + ATR-adaptive retest window + bridge diagnostics + smoke test + hardcoded MT5 constants + dynamic BOS_CONT freshness + hybrid ladder + all filling modes)")
+    ap = argparse.ArgumentParser(description="SlyTrade v0.9.15.12 SCALPER LIVE trader (10s real-time polling + 5s bar lag + massive lookback windows + ATR-adaptive proximity gate + ATR-adaptive retest window + bridge diagnostics + smoke test + hardcoded MT5 constants + dynamic BOS_CONT freshness + hybrid ladder + all filling modes)")
     ap.add_argument("--symbol", default="XAUUSDm")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=18812)
