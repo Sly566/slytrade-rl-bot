@@ -1,4 +1,4 @@
-"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.15.7 hybrid-ladder persona.
+"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.15.8 hybrid-ladder persona.
 
 Connects to MT5 via the mt5linux RPyC bridge (run `bash start_mt5_bridge.sh`
 in another terminal first), pulls multi-timeframe bars, computes Layer 2
@@ -1566,12 +1566,56 @@ class LiveTrader:
 
     # ------------------------------------------------------------------ #
     def run(self) -> None:
-        persona_label = "v0.9.15.7 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.15.7 champion (long-only A+/A/B hybrid ladder)"
-        print(f"SlyTrade LIVE v0.9.15.7  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  working_lot={self.working_lot}  max_open={self.max_open}")
+        persona_label = "v0.9.15.8 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.15.8 champion (long-only A+/A/B hybrid ladder)"
+        print(f"SlyTrade LIVE v0.9.15.8  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  working_lot={self.working_lot}  max_open={self.max_open}")
         print(f"persona: {persona_label}")
         print("setups : RETEST_OB RETEST_FVG LIQ_SWEEP BOS_CONT DISP_TRAP BREAKER  (champion gates apply unless --all)")
         print(f"Magic={MAGIC}")
         print("-"*80)
+
+        # v0.9.15.8: Bridge smoke test in run() so it fires from both
+        # `python -m slytrade.live.trader` AND `slytrade live` (cli.py).
+        if self.live:
+            print("\n  [SMOKE TEST] Probing bridge order_send capability ...")
+            try:
+                _tick = _to_dict(self.mt5.symbol_info_tick(self.symbol))
+                _bid = float(_tick.get("bid", 0))
+                _ask = float(_tick.get("ask", 0))
+                smoke_req = {
+                    "action": MT5_TRADE_ACTION_DEAL, "symbol": self.symbol,
+                    "volume": self.spec.volume_min,
+                    "type": MT5_ORDER_TYPE_BUY, "price": _ask if _ask > 0 else 0,
+                    "sl": 0.0, "tp": 0.0, "deviation": 500, "magic": MAGIC,
+                    "comment": "smoke_test", "type_time": MT5_ORDER_TIME_GTC,
+                    "type_filling": 0,
+                }
+                print(f"  [SMOKE TEST] req={smoke_req}")
+                smoke_res = self.mt5.order_send(smoke_req)
+                print(f"  [SMOKE TEST] raw result: {smoke_res!r}")
+                if smoke_res is None:
+                    smoke_err = self.mt5.last_error()
+                    print(f"  [SMOKE TEST] FAIL: order_send returned None! last_error={smoke_err}")
+                    print(f"  [SMOKE TEST] Bridge cannot deliver order_send to MT5.")
+                    print(f"  [SMOKE TEST] Check: mt5linux version, MT5 login, Wine/Python compat, terminal restart")
+                else:
+                    smoke_dict = _to_dict(smoke_res)
+                    smoke_retcode = smoke_dict.get("retcode", "?")
+                    print(f"  [SMOKE TEST] retcode={smoke_retcode} (bridge works!)")
+                    if smoke_retcode in (MT5_RETCODE_DONE, MT5_RETCODE_DONE_PARTIAL):
+                        smoke_ticket = smoke_dict.get("order", 0)
+                        print(f"  [SMOKE TEST] Smoke order FILLED ticket={smoke_ticket} -- closing immediately")
+                        close_req = {
+                            "action": MT5_TRADE_ACTION_DEAL, "symbol": self.symbol,
+                            "volume": self.spec.volume_min,
+                            "type": MT5_ORDER_TYPE_SELL, "position": int(smoke_ticket),
+                            "price": _bid if _bid > 0 else 0,
+                            "deviation": 500, "magic": MAGIC, "comment": "smoke_close",
+                            "type_time": MT5_ORDER_TIME_GTC, "type_filling": 0,
+                        }
+                        self.mt5.order_send(close_req)
+            except Exception as smoke_exc:
+                print(f"  [SMOKE TEST] Exception: {smoke_exc!r}")
+            print()
         running = {"v": True}
         def _stop(signum, frame):
             running["v"] = False
@@ -1617,7 +1661,7 @@ class LiveTrader:
 # --------------------------------------------------------------------------- #
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="SlyTrade v0.9.15.7 SCALPER LIVE trader (bridge diagnostics + smoke test + hardcoded MT5 constants + dynamic BOS_CONT freshness + hybrid ladder + all filling modes)")
+    ap = argparse.ArgumentParser(description="SlyTrade v0.9.15.8 SCALPER LIVE trader (ATR-adaptive proximity gate + ATR-adaptive retest window + bridge diagnostics + smoke test + hardcoded MT5 constants + dynamic BOS_CONT freshness + hybrid ladder + all filling modes)")
     ap.add_argument("--symbol", default="XAUUSDm")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=18812)

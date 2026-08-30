@@ -1,4 +1,4 @@
-"""Layer 4 — ICT/SMC scalper signal engine (v0.9.15.6).
+"""Layer 4 — ICT/SMC scalper signal engine (v0.9.15.8).
 
 Produces strictly-causal entry signals from the M1-aligned frame. Each signal
 carries: direction, entry price, stop loss, take-profit ladder, setup grade,
@@ -365,8 +365,23 @@ def _evaluate_row(i: int,
     atr = float(row['atr_14']) if pd.notna(row['atr_14']) else 0.0
     t_now = row['time']
     trigger_tf = cfg.trigger_tf
-    retest_window = 60 if cfg.confluence.persona_gating else 120
+    base_retest_window = 60 if cfg.confluence.persona_gating else 120
     sweep_window = 15 if cfg.confluence.persona_gating else 30
+
+    # v0.9.15.8: ATR-adaptive retest window for the trigger TF.
+    # During ranging/low-vol markets, the trigger TF (M5) can go hours
+    # without a structural event (BOS/CHoCH/displacement). The fixed 120-min
+    # window expires and ALL retest setups (RETEST_OB/FVG) are blocked.
+    # Dynamically extend the window when ATR is contracting (ranging) so
+    # the most recent trigger TF event stays valid longer.
+    _atr_ema_now = state.get('_atr_ema', atr)
+    if _atr_ema_now > 0 and atr > 0:
+        _atr_ratio = max(0.5, min(atr / _atr_ema_now, 2.0))
+    else:
+        _atr_ratio = 1.0
+    # multiplier: 1.0 when ATR expanding/normal, up to 2.0 when ATR very contracted
+    _window_mult = max(1.0, 2.0 - _atr_ratio)
+    retest_window = int(base_retest_window * _window_mult)
 
     # ================================================================== #
     # PHASE 1: STRUCTURAL STATE UPDATE -- runs on EVERY bar, no early
@@ -661,21 +676,27 @@ def _evaluate_row(i: int,
                 _reject(f"LIQ_SWEEP {side}: c={c:.2f} > sweep_px={float(sweep_extreme):.2f} (failed reversal)")
             continue
 
-        # v0.9.8 PROXIMITY GATE: close must be within 2.0 ATR of the sweep wick.
-        # A liquidity-sweep scalp fires on the REJECTION immediately after the
-        # wick — not after price has already run 10-18 points in the reversal
-        # direction. The 09:36 bear sweep at wick=4599 entered SHORT at fill
-        # =4580.97 (18 points below the wick, ~7.2 ATR away after ATR expanded
-        # on the crash bar) — pure chase into a waterfall, not a scalp. The
-        # existing risk<7ATR gate failed because ATR itself expanded to ~2.6 on
-        # the crash bar, letting 18 points slip through as "6.9 ATR". Require
-        # close within 2 ATR of the wick so we only take the first bar or two
-        # of rejection, not the whole continuation.
+        # v0.9.8 PROXIMITY GATE: close must be within a dynamic distance of
+        # the sweep wick.  A liquidity-sweep scalp fires on the REJECTION
+        # immediately after the wick — not after price has already run far
+        # in the reversal direction.
+        #
+        # v0.9.15.8: Use max(2×M1_ATR, 2×trigger_TF_ATR) so the gate
+        # scales to the asset's volatility on the timeframe that matters.
+        # BTC M1 ATR≈40 → 2×40=80pt gate was too tight — BTC moves 150+
+        # points in a single candle after a sweep.  M5 ATR≈100-200 →
+        # 2×150=300pt gate captures the first 1-2 M5 candles of rejection
+        # without letting in stale chases.  XAU M1 ATR≈2, M5 ATR≈5 →
+        # max(4, 10)=10pt — still tight enough to prevent chasing.
+        htf_atr = float(row.get(f'{trigger_tf}_atr_14', 0.0))
+        if pd.isna(htf_atr):
+            htf_atr = 0.0
+        proximity = max(2.0 * atr, 2.0 * htf_atr) if htf_atr > 0 else 2.0 * atr
         dist_from_wick = abs(c - float(sweep_extreme))
-        if atr > 0 and dist_from_wick > 2.0 * atr:
+        if atr > 0 and dist_from_wick > proximity:
             if fail_trace is not None:
                 _reject(f"LIQ_SWEEP {side}: c={c:.2f} too far from sweep_px={float(sweep_extreme):.2f} "
-                        f"(dist={dist_from_wick:.2f} > 2ATR={2.0*atr:.2f}) — chasing")
+                        f"(dist={dist_from_wick:.2f} > proximity={proximity:.2f}) — chasing")
             continue
         # Require displacement/BOS/CHoCH in reversal direction (M1 or trigger_tf).
         # v0.9.5 only checked disp and major/minor BOS; CHoCH breaks (which
