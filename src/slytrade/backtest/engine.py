@@ -417,7 +417,7 @@ class BacktestEngine:
         for rec in signals_df.itertuples(index=False):
             sig_by_time.setdefault(rec.time, []).append(rec)
         self.progress(f"Backtesting {len(signals_df):,} signals over {len(m1_files)} partitions...")
-        total_rows = 0; n_signals = 0; warmup = True; warmup_rows = 500
+        total_rows = 0; n_signals = 0; warmup = True; warmup_rows = 1000
         for _f_idx, f in enumerate(m1_files):
             try:
                 need = ["time","open","high","low","close","spread","tick_volume",

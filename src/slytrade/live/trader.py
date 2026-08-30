@@ -1,4 +1,4 @@
-"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.15.8 hybrid-ladder persona.
+"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.15.9 hybrid-ladder persona.
 
 Connects to MT5 via the mt5linux RPyC bridge (run `bash start_mt5_bridge.sh`
 in another terminal first), pulls multi-timeframe bars, computes Layer 2
@@ -103,27 +103,26 @@ TIMEFRAME_ATTRS = {
     "D1":  "TIMEFRAME_D1",
 }
 MAGIC = 260810  # SlyTrade magic number
-# Per-TF history windows — GENEROUS by design so the engine sees EVERYTHING.
+# Per-TF history windows — MASSIVE by design so the engine sees the ENTIRE
+# market structure that matters.  Key swing levels, unmitigated OBs/FVGs,
+# liquidity pools, and structural pivots from months/years ago still drive
+# price reactions today — if they fall out of the buffer, the bot is blind
+# to the levels Sly is trading manually.
 #
-# Rule per TF: 3 × EMA200 lookback for full indicator warmup, plus enough
-# swing history for ATR-ZigZag major pivots (mult=4 ATR) to form cleanly,
-# plus enough historical swing reference levels that liquidity sweeps
-# against weeks-old levels are still detectable.
-#
-# M1 is intentionally the LARGEST window — that's where quick scalps fire,
-# and we do NOT want a swing low from last week to fall out of the buffer
-# right as price comes back to sweep it. Total processing per cycle
-# benchmarks at ~1s on a modern CPU — well within our 60-second poll budget.
+# Rule per TF: enough bars to cover the full relevant history for that
+# timeframe's role in the strategy.  M1 needs weeks of swing refs; H4/D1
+# need years of bias structure.  Processing scales linearly but stays well
+# within the 60-second poll budget (~5-10s on a modern CPU for the full set).
 #
 #                   bars         ~calendar days   why
 WARMUP_BARS = {
-    "M1":  60000,  # ~42d  (6 wks)   swing refs + liq levels weeks back
-    "M5":  15000,  # ~52d  (7.5 wks) trigger TF: full multi-week structure
-    "M15":  6000,  # ~62d  (9 wks)   OB TF + A+ premium/discount zone
-    "M30":  3000,  # ~62d  (9 wks)   mid-TF confluence for grade/runner
-    "H1":   2400,  # ~100d (14 wks)  OB TF + runners; H1 EMA200 needs ~12d
-    "H4":   1200,  # ~200d (28 wks)  HTF bias for A+; H4 EMA200 needs ~50 days
-    "D1":    500,  # ~500d (~1.4y)   D1 EMA200 = 200d; yearly hi/lo runners
+    "M1":  200000, # ~140d (20 wks)  swing refs + liq levels from months back
+    "M5":  80000,  # ~278d (40 wks)  trigger TF: 9 months of structural events
+    "M15": 40000,  # ~417d (60 wks)  OB TF: 14 months of order blocks
+    "M30": 20000,  # ~417d (60 wks)  mid-TF confluence: 14 months
+    "H1":  12000,  # ~500d (71 wks)  OB TF: 16 months of H1 zones + runners
+    "H4":  6000,   # ~1000d (143 wks) HTF bias: 2.7 years of H4 structure
+    "D1":  2500,   # ~2500d (357 wks) D1: 6.8 years — yearly hi/lo + EMA200
 }
 HTFS = ["M5", "M15", "M30", "H1", "H4", "D1"]
 CHOPCH_EMERGENCY_TF = "M15"
@@ -1361,7 +1360,7 @@ class LiveTrader:
                         break
             return n, last_t
 
-        for tf, lookback in [("M1", 30), ("M5", 60), ("M15", 240), ("M30", 480), ("H1", 600)]:
+        for tf, lookback in [("M1", 60), ("M5", 120), ("M15", 480), ("M30", 960), ("H1", 1200)]:
             tail_start = max(0, len(aligned) - lookback)
             tail_idx = np.arange(tail_start, len(aligned))
             counts: dict[str, int] = {}
@@ -1566,8 +1565,8 @@ class LiveTrader:
 
     # ------------------------------------------------------------------ #
     def run(self) -> None:
-        persona_label = "v0.9.15.8 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.15.8 champion (long-only A+/A/B hybrid ladder)"
-        print(f"SlyTrade LIVE v0.9.15.8  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  working_lot={self.working_lot}  max_open={self.max_open}")
+        persona_label = "v0.9.15.9 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.15.9 champion (long-only A+/A/B hybrid ladder)"
+        print(f"SlyTrade LIVE v0.9.15.9  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  working_lot={self.working_lot}  max_open={self.max_open}")
         print(f"persona: {persona_label}")
         print("setups : RETEST_OB RETEST_FVG LIQ_SWEEP BOS_CONT DISP_TRAP BREAKER  (champion gates apply unless --all)")
         print(f"Magic={MAGIC}")
@@ -1661,7 +1660,7 @@ class LiveTrader:
 # --------------------------------------------------------------------------- #
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="SlyTrade v0.9.15.8 SCALPER LIVE trader (ATR-adaptive proximity gate + ATR-adaptive retest window + bridge diagnostics + smoke test + hardcoded MT5 constants + dynamic BOS_CONT freshness + hybrid ladder + all filling modes)")
+    ap = argparse.ArgumentParser(description="SlyTrade v0.9.15.9 SCALPER LIVE trader (massive lookback windows + ATR-adaptive proximity gate + ATR-adaptive retest window + bridge diagnostics + smoke test + hardcoded MT5 constants + dynamic BOS_CONT freshness + hybrid ladder + all filling modes)")
     ap.add_argument("--symbol", default="XAUUSDm")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=18812)

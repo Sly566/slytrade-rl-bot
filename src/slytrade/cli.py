@@ -1,4 +1,4 @@
-"""SlyTrade v0.9.15.8 CLI — ICT/SMC scalping bot (Layers 0-5 + live scalper)."""
+"""SlyTrade v0.9.15.9 CLI — ICT/SMC scalping bot (Layers 0-5 + live scalper)."""
 from __future__ import annotations
 
 import importlib.util
@@ -10,7 +10,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-app = typer.Typer(help="SlyTrade ICT/SMC scalper v0.9.15.8")
+app = typer.Typer(help="SlyTrade ICT/SMC scalper v0.9.15.9")
 console = Console()
 
 
@@ -268,7 +268,7 @@ def live_cmd(
         rl_training_persona,
     )
     persona_label = "SCALPER-UNRESTRICTED (long+short, all 4 setups)" if unrestricted else "v0.9.14 champion (long-only A+/A/B RETEST_OB)"
-    console.print(f"[bold]SlyTrade LIVE v0.9.15.8[/bold] symbol={raw_symbol} live={live} "
+    console.print(f"[bold]SlyTrade LIVE v0.9.15.9[/bold] symbol={raw_symbol} live={live} "
                   f"risk_cap={risk_cap*100:.1f}% working_lot={working_lot} persona={persona_label} verbose={verbose}")
     mt5 = connect_mt5(host, port)
 

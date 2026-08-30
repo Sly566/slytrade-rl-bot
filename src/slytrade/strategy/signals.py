@@ -1,4 +1,4 @@
-"""Layer 4 — ICT/SMC scalper signal engine (v0.9.15.8).
+"""Layer 4 — ICT/SMC scalper signal engine (v0.9.15.9).
 
 Produces strictly-causal entry signals from the M1-aligned frame. Each signal
 carries: direction, entry price, stop loss, take-profit ladder, setup grade,
@@ -1481,10 +1481,10 @@ def scan(df: pd.DataFrame,
 
     signals: list[Signal] = []
     n = len(df)
-    # 3000 M1 bars (~2 trading days) for indicator warmup — long enough for EMA200,
-    # ATR-ZigZag major swings, and zone state to stabilise regardless of how
-    # much history the caller feeds us (live loop feeds 60k M1 bars = 6 weeks).
-    warmup = 3000
+    # 5000 M1 bars (~3.5 trading days) for indicator warmup — long enough for
+    # EMA200, ATR-ZigZag major pivots, and zone state to stabilise regardless
+    # of how much history the caller feeds us (live loop feeds 200k M1 bars).
+    warmup = 5000
     state: dict = {}
 
     progress(f"Scanning {n:,} M1 bars for setups ...")
