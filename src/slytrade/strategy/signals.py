@@ -711,7 +711,7 @@ def _evaluate_row(i: int,
         # v0.9.15: apply SL clamp
         stop = _clamp_sl(entry, stop, direction, atr, cfg.exits)
         risk = abs(entry - stop)
-        if risk <= 0 or risk < 0.5 * atr or risk > 7.0 * atr or risk > 40.0:
+        if risk <= 0 or risk < 0.5 * atr or risk > 7.0 * atr:
             continue
         risk_atr = risk / atr if atr > 0 else 0
         if cfg.confluence.persona_gating and risk_atr < cfg.confluence.min_risk_atr:
@@ -891,9 +891,9 @@ def _evaluate_row(i: int,
         # v0.9.15: apply SL clamp
         stop = _clamp_sl(entry, stop, direction, atr, cfg.exits)
         risk = abs(entry - stop)
-        if risk <= 0 or risk < 0.5 * atr or risk > 7.0 * atr or risk > 40.0:
+        if risk <= 0 or risk < 0.5 * atr or risk > 7.0 * atr:
             if fail_trace is not None:
-                _reject(f"BOS_CONT {side}: risk={risk:.2f} atr={atr:.2f} outside bounds (0.5-7ATR, <=$40)")
+                _reject(f"BOS_CONT {side}: risk={risk:.2f} atr={atr:.2f} outside bounds (0.5-7ATR)")
             continue
         risk_atr = risk / atr if atr > 0 else 0
 
@@ -1012,7 +1012,7 @@ def _evaluate_row(i: int,
             stop = last_disp['high'] + cfg.exits.ob_invalidation_buffer * atr
         stop = _clamp_sl(entry, stop, direction, atr, cfg.exits)
         risk = abs(entry - stop)
-        if risk <= 0 or risk < 0.5 * atr or risk > 7.0 * atr or risk > 40.0:
+        if risk <= 0 or risk < 0.5 * atr or risk > 7.0 * atr:
             continue
         risk_atr = risk / atr if atr > 0 else 0
         if cfg.confluence.persona_gating and risk_atr < cfg.confluence.min_risk_atr:
@@ -1113,7 +1113,7 @@ def _evaluate_row(i: int,
             stop = ztop + buffer_amt
         stop = _clamp_sl(entry, stop, direction, atr, cfg.exits)
         risk = abs(entry - stop)
-        if risk <= 0 or risk < 0.5 * atr or risk > 7.0 * atr or risk > 40.0:
+        if risk <= 0 or risk < 0.5 * atr or risk > 7.0 * atr:
             continue
         risk_atr = risk / atr if atr > 0 else 0
         if cfg.confluence.persona_gating and risk_atr < cfg.confluence.min_risk_atr:
