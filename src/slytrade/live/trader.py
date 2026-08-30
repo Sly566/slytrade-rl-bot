@@ -491,7 +491,7 @@ class LiveTrader:
                 "type": MT5_ORDER_TYPE_BUY if direction == 1 else MT5_ORDER_TYPE_SELL,
                 "price": price,
                 "sl": round(float(sl), digits),
-                "tp": 0,  # v0.9.15.2: no TP on broker — hybrid ladder manages exits
+                "tp": 0.0,  # v0.9.15.2: no TP on broker — hybrid ladder manages exits
                 "deviation": deviation,
                 "magic": MAGIC,
                 "comment": comment[:31],
@@ -673,7 +673,7 @@ class LiveTrader:
             "symbol": self.symbol,
             "position": int(ticket),
             "sl": round(float(new_sl), self.spec.digits),
-            "tp": 0,
+            "tp": 0.0,
         }
         res = _to_dict(self.mt5.order_send(req))
         retcode = int(res.get("retcode", -1))
