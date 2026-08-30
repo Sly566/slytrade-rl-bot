@@ -1,10 +1,16 @@
-"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.15.4 hybrid-ladder persona.
+"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.15.6 hybrid-ladder persona.
 
 Connects to MT5 via the mt5linux RPyC bridge (run `bash start_mt5_bridge.sh`
 in another terminal first), pulls multi-timeframe bars, computes Layer 2
 features, performs causal MTF alignment, runs the Layer 4/5 signal scanner
 statefully, and when a signal fires sends a market or limit order with SL/TP
 sized per our grade-tiered risk rules and dynamic working-lot sizing.
+
+v0.9.15.6 changes:
+  - Fix retcode=-1 on ALL orders: hardcode MT5 protocol constants as plain
+    Python ints (TRADE_ACTION_DEAL=1, ORDER_TYPE_BUY=0, etc.) instead of
+    reading them from self.mt5 which returns RPyC proxy objects that fail
+    to serialize in order_send(). Universal across all MT5 brokers (MQL5 spec).
 
 v0.9.15.4 changes:
   - Fix retcode=-1 on ALL orders: RPyC proxy objects in order_send request
@@ -117,6 +123,21 @@ WARMUP_BARS = {
 HTFS = ["M5", "M15", "M30", "H1", "H4", "D1"]
 CHOPCH_EMERGENCY_TF = "M15"
 TIME_STOP_BARS = 240
+
+
+# --------------------------------------------------------------------------- #
+# MT5 protocol constants — hardcoded to avoid RPyC proxy serialization issues.
+# The mt5linux bridge returns proxy objects for mt5.TRADE_ACTION_DEAL etc.
+# that look like ints but fail to serialize back through RPyC in order_send().
+# These are universal across all MT5 brokers (defined in the MQL5 spec).
+# --------------------------------------------------------------------------- #
+MT5_TRADE_ACTION_DEAL = 1
+MT5_TRADE_ACTION_SLTP = 3
+MT5_ORDER_TYPE_BUY = 0
+MT5_ORDER_TYPE_SELL = 1
+MT5_ORDER_TIME_GTC = 0
+MT5_RETCODE_DONE = 10009
+MT5_RETCODE_DONE_PARTIAL = 10010
 
 
 # --------------------------------------------------------------------------- #
@@ -450,16 +471,8 @@ class LiveTrader:
         # in order. Retries on retcode=-1 (RPyC bridge None) instead of giving
         # up on the first mode.
         filling_modes = self._get_filling_modes()
-        DONE = {int(getattr(self.mt5, "TRADE_RETCODE_DONE", 10009)),
-                int(getattr(self.mt5, "TRADE_RETCODE_DONE_PARTIAL", 10010))}
+        DONE = {MT5_RETCODE_DONE, MT5_RETCODE_DONE_PARTIAL}
         RETRY_RETCODES = {10030, -1}  # unsupported fill / bridge None → try next mode
-        # v0.9.15.4: Resolve MT5 constants to plain ints once (RPyC proxy
-        # objects can cause serialization issues in order_send on some bridge
-        # versions — the root cause of retcode=-1 on ALL filling modes).
-        _action_deal = int(self.mt5.TRADE_ACTION_DEAL)
-        _order_buy = int(self.mt5.ORDER_TYPE_BUY)
-        _order_sell = int(self.mt5.ORDER_TYPE_SELL)
-        _time_gtc = int(self.mt5.ORDER_TIME_GTC)
         if not self.live:
             print(f"    [DRY-RUN] {'BUY' if direction==1 else 'SELL'} {lots} {self.symbol} @ {price:.{digits}f}  SL={sl:.{digits}f}  TP={tp:.{digits}f}  ({comment})")
             return -int(time.time() * 1000)   # fake ticket
@@ -468,17 +481,17 @@ class LiveTrader:
             bid, ask = self.quote()
             price = ask if direction == 1 else bid
             req = {
-                "action": _action_deal,
+                "action": MT5_TRADE_ACTION_DEAL,
                 "symbol": self.symbol,
                 "volume": round(float(lots), 2),
-                "type": _order_buy if direction == 1 else _order_sell,
+                "type": MT5_ORDER_TYPE_BUY if direction == 1 else MT5_ORDER_TYPE_SELL,
                 "price": price,
                 "sl": round(float(sl), digits),
                 "tp": 0,  # v0.9.15.2: no TP on broker — hybrid ladder manages exits
                 "deviation": deviation,
                 "magic": MAGIC,
                 "comment": comment[:31],
-                "type_time": _time_gtc,
+                "type_time": MT5_ORDER_TIME_GTC,
                 "type_filling": fill_mode,
             }
             # v0.9.15.4: wrap in try/except to catch RPyC bridge exceptions
@@ -520,17 +533,13 @@ class LiveTrader:
             return False
         vol = float(pos.get("volume", 0.0))
         ptype = int(pos.get("type", 0))
-        close_type = self.mt5.ORDER_TYPE_SELL if ptype == 0 else self.mt5.ORDER_TYPE_BUY
+        close_type = MT5_ORDER_TYPE_SELL if ptype == 0 else MT5_ORDER_TYPE_BUY
         bid, ask = self.quote()
         price = bid if ptype == 0 else ask
         digits = self.spec.digits
         deviation = 500  # match _place_market
-        DONE = {int(getattr(self.mt5, "TRADE_RETCODE_DONE", 10009)),
-                int(getattr(self.mt5, "TRADE_RETCODE_DONE_PARTIAL", 10010))}
+        DONE = {MT5_RETCODE_DONE, MT5_RETCODE_DONE_PARTIAL}
         RETRY_RETCODES = {10030, -1}
-        # v0.9.15.4: Resolve MT5 constants to plain ints (RPyC proxy safety)
-        _action_deal = int(self.mt5.TRADE_ACTION_DEAL)
-        _time_gtc = int(self.mt5.ORDER_TIME_GTC)
         if not self.live:
             lt = self._trades.get(int(ticket))
             if lt:
@@ -541,7 +550,7 @@ class LiveTrader:
             bid, ask = self.quote()
             price = bid if ptype == 0 else ask
             req = {
-                "action": _action_deal,
+                "action": MT5_TRADE_ACTION_DEAL,
                 "symbol": self.symbol,
                 "volume": round(vol, 2),
                 "type": close_type,
@@ -550,7 +559,7 @@ class LiveTrader:
                 "deviation": deviation,
                 "magic": MAGIC,
                 "comment": reason[:31],
-                "type_time": _time_gtc,
+                "type_time": MT5_ORDER_TIME_GTC,
                 "type_filling": fill_mode,
             }
             try:
@@ -582,12 +591,8 @@ class LiveTrader:
             return False
         vol = round(vol, 2)
         ptype = int(pos.get("type", 0))
-        close_type = self.mt5.ORDER_TYPE_SELL if ptype == 0 else self.mt5.ORDER_TYPE_BUY
-        DONE = {int(getattr(self.mt5, "TRADE_RETCODE_DONE", 10009)),
-                int(getattr(self.mt5, "TRADE_RETCODE_DONE_PARTIAL", 10010))}
-        # v0.9.15.4: Resolve MT5 constants to plain ints (RPyC proxy safety)
-        _action_deal = int(self.mt5.TRADE_ACTION_DEAL)
-        _time_gtc = int(self.mt5.ORDER_TIME_GTC)
+        close_type = MT5_ORDER_TYPE_SELL if ptype == 0 else MT5_ORDER_TYPE_BUY
+        DONE = {MT5_RETCODE_DONE, MT5_RETCODE_DONE_PARTIAL}
         if not self.live:
             bid, ask = self.quote()
             price = bid if ptype == 0 else ask
@@ -597,7 +602,7 @@ class LiveTrader:
             bid, ask = self.quote()
             price = bid if ptype == 0 else ask
             req = {
-                "action": _action_deal,
+                "action": MT5_TRADE_ACTION_DEAL,
                 "symbol": self.symbol,
                 "volume": vol,
                 "type": close_type,
@@ -606,7 +611,7 @@ class LiveTrader:
                 "deviation": 500,
                 "magic": MAGIC,
                 "comment": reason[:31],
-                "type_time": _time_gtc,
+                "type_time": MT5_ORDER_TIME_GTC,
                 "type_filling": fill_mode,
             }
             try:
@@ -634,13 +639,12 @@ class LiveTrader:
         pos = self._get_position(ticket)
         if pos is None:
             return False
-        DONE = {int(getattr(self.mt5, "TRADE_RETCODE_DONE", 10009)),
-                int(getattr(self.mt5, "TRADE_RETCODE_DONE_PARTIAL", 10010))}
+        DONE = {MT5_RETCODE_DONE, MT5_RETCODE_DONE_PARTIAL}
         if not self.live:
             print(f"    [DRY-RUN] MODIFY SL ticket={ticket} → {new_sl:.{self.spec.digits}f}")
             return True
         req = {
-            "action": self.mt5.TRADE_ACTION_SLTP,
+            "action": MT5_TRADE_ACTION_SLTP,
             "symbol": self.symbol,
             "position": int(ticket),
             "sl": round(float(new_sl), self.spec.digits),
@@ -1536,8 +1540,8 @@ class LiveTrader:
 
     # ------------------------------------------------------------------ #
     def run(self) -> None:
-        persona_label = "v0.9.15.4 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.15.4 champion (long-only A+/A/B hybrid ladder)"
-        print(f"SlyTrade LIVE v0.9.15.4  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  working_lot={self.working_lot}  max_open={self.max_open}")
+        persona_label = "v0.9.15.6 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.15.6 champion (long-only A+/A/B hybrid ladder)"
+        print(f"SlyTrade LIVE v0.9.15.6  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  working_lot={self.working_lot}  max_open={self.max_open}")
         print(f"persona: {persona_label}")
         print("setups : RETEST_OB RETEST_FVG LIQ_SWEEP BOS_CONT DISP_TRAP BREAKER  (champion gates apply unless --all)")
         print(f"Magic={MAGIC}")
@@ -1587,7 +1591,7 @@ class LiveTrader:
 # --------------------------------------------------------------------------- #
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="SlyTrade v0.9.15.4 SCALPER LIVE trader (live hybrid ladder + all filling modes + RPyC proxy fix + DISP_TRAP/BREAKER + SL clamp + limit retests)")
+    ap = argparse.ArgumentParser(description="SlyTrade v0.9.15.6 SCALPER LIVE trader (live hybrid ladder + all filling modes + hardcoded MT5 constants + dynamic BOS_CONT freshness + DISP_TRAP/BREAKER + SL clamp + limit retests)")
     ap.add_argument("--symbol", default="XAUUSDm")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=18812)

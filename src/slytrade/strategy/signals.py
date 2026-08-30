@@ -1,4 +1,4 @@
-"""Layer 4 — ICT/SMC scalper signal engine (v0.9.15).
+"""Layer 4 — ICT/SMC scalper signal engine (v0.9.15.6).
 
 Produces strictly-causal entry signals from the M1-aligned frame. Each signal
 carries: direction, entry price, stop loss, take-profit ladder, setup grade,
@@ -470,6 +470,14 @@ def _evaluate_row(i: int,
         if m5_bear:
             state['_last_bear_trigger_m5'] = t_now
 
+    # --- 1b2. Rolling ATR EMA for dynamic BOS_CONT freshness ---
+    # Tracks an exponential moving average of ATR so we can measure whether
+    # the current bar's ATR is expanding (strong momentum) or contracting
+    # (fading). Used by BOS_CONT to dynamically size the freshness window.
+    if atr > 0:
+        prev_ema = state.get('_atr_ema', atr)
+        state['_atr_ema'] = 0.95 * prev_ema + 0.05 * atr
+
     # BOS_CONT one-shot: reset "entered" flag when an opposite CHoCH fires
     # (structure flip = new leg, so the next same-direction BOS break is a
     # fresh setup). Without this, one bear BOS entry blocks the next bear
@@ -847,15 +855,40 @@ def _evaluate_row(i: int,
                 _reject(f"BOS_CONT {side}: already entered this leg (one-shot until opposite CHoCH)")
             continue
 
-        # BOS_CONT fires ONLY on a bar where the trigger timestamp was JUST
-        # refreshed (i.e. a fresh structural impulse occurred THIS bar) AND
-        # a BOS/CHoCH structural break is present THIS BAR. The previous
-        # behaviour allowed re-entry on bars where bear_window was open and
-        # minor_bos_dn was "still hot" from a prior bar — which combined
-        # with the ATR-ZigZag edge-reset bug to pyramid entries.
-        trigger_fresh_this_bar = (bull_trigger_this_bar if direction == 1 else bear_trigger_this_bar)
+        # BOS_CONT fires when a BOS/CHoCH structural break is present on
+        # this bar, OR when the trigger (displacement/BOS/CHoCH) fired
+        # within a dynamic window.  The window adapts to:
+        #   1. The trigger TF's bar duration (config-derived, not hardcoded)
+        #   2. ATR momentum ratio — expanding ATR (strong trend) extends
+        #      the window; contracting ATR (fading momentum) tightens it.
+        # This replaces the strict "exact bar" requirement that missed
+        # momentum continuation in sustained trends where the BOS fires
+        # on bar N but the bot processes bar N+1/N+2 with the impulse
+        # still valid.  The one-shot arm (_bos_entered_{dir}) prevents
+        # pyramiding regardless of window size.
         structure_now = tf_structure or m1_structure
-        if not (trigger_fresh_this_bar and structure_now):
+        trigger_fresh = False
+        if structure_now:
+            # BOS/CHoCH happening on THIS bar — always fresh
+            trigger_fresh = True
+        else:
+            # Dynamic window: derive from trigger TF bar duration
+            from ..data.time import timeframe_timedelta as _tf_td
+            tf_dur = _tf_td(trigger_tf)  # e.g. 5 min for M5
+            last_trig = state.get('_last_bull_trigger' if direction == 1 else '_last_bear_trigger')
+            if last_trig is not None:
+                time_since = t_now - last_trig
+                # ATR momentum scaling: expanding ATR = strong trend =
+                # momentum persists longer.  Ratio > 1 extends window,
+                # ratio < 1 tightens it.  Clamped to [0.5, 2.0] for safety.
+                atr_ema = state.get('_atr_ema', atr)
+                if atr_ema > 0 and atr > 0:
+                    atr_ratio = max(0.5, min(atr / atr_ema, 2.0))
+                else:
+                    atr_ratio = 1.0
+                window = tf_dur * atr_ratio
+                trigger_fresh = time_since <= window
+        if not trigger_fresh:
             if fail_trace is not None:
                 _reject(f"BOS_CONT {side}: no fresh BOS/CHoCH this bar (stale trigger)")
             continue
