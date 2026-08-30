@@ -1,10 +1,21 @@
-"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.15.2 hybrid-ladder persona.
+"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.15.4 hybrid-ladder persona.
 
 Connects to MT5 via the mt5linux RPyC bridge (run `bash start_mt5_bridge.sh`
 in another terminal first), pulls multi-timeframe bars, computes Layer 2
 features, performs causal MTF alignment, runs the Layer 4/5 signal scanner
 statefully, and when a signal fires sends a market or limit order with SL/TP
 sized per our grade-tiered risk rules and dynamic working-lot sizing.
+
+v0.9.15.4 changes:
+  - Fix retcode=-1 on ALL orders: RPyC proxy objects in order_send request
+    dict caused serialization failures. Resolve MT5 constants (TRADE_ACTION_DEAL,
+    ORDER_TYPE_BUY, etc.) to plain ints before building the request dict.
+  - Fix FOK=0 silently dropped: FOK filling mode has value 0 which is falsy,
+    causing it to be filtered out by 'if m'. Use 'is not None' checks.
+  - Hardcode filling mode values (FOK=0, IOC=1, RETURN=2) as fallback when
+    bridge doesn't expose ORDER_FILLING_* constants.
+  - Add try/except around order_send to catch RPyC bridge exceptions.
+  - Log raw bridge response on retcode=-1 for diagnosis.
 
 v0.9.15.3 changes:
   - ALWAYS try all 3 filling modes (IOC, FOK, RETURN) regardless of bitmask.
@@ -357,7 +368,7 @@ class LiveTrader:
     def _get_filling_modes(self) -> list[int]:
         """Determine filling modes to try, ordered by likelihood of success.
 
-        Strategy (v0.9.15.3):
+        Strategy (v0.9.15.4):
           1. If we already found a working mode (cached), try it FIRST.
           2. Then try modes the broker's bitmask says are supported.
           3. Finally try all remaining modes as fallback.
@@ -365,28 +376,38 @@ class LiveTrader:
 
         The bitmask is a PREFERENCE hint, not a hard filter — Exness BTC
         reports IOC+FOK but actually needs RETURN.  We always try everything.
+
+        v0.9.15.4: Hardcode mode integer values as fallback. The RPyC bridge
+        doesn't always expose ORDER_FILLING_* constants (getattr returns 0),
+        which silently dropped FOK from the list.  Also fix: FOK=0 is a valid
+        filling mode but was filtered by 'if m' (0 is falsy).
         """
         # Cached winner from a previous successful order this session
         cached = getattr(self, "_best_fill_mode", None)
 
-        # All known MT5 filling modes (the complete set — MT5 defines exactly 3)
-        ALL_KNOWN = {
-            "ORDER_FILLING_FOK": 1,
-            "ORDER_FILLING_IOC": 2,
-            "ORDER_FILLING_RETURN": 4,
-        }
+        # MT5 Python package filling mode values (0, 1, 2 — NOT the MQL5
+        # bitmask values 1, 2, 4).  The mt5linux bridge uses the Python
+        # convention.  FOK=0 is valid but falsy, so we must use 'is not None'
+        # checks instead of truthiness.
+        FILL_FOK = 0
+        FILL_IOC = 1
+        FILL_RETURN = 2
 
         # Read the broker's bitmask to know which modes it RECOMMENDS
         info = _to_dict(self.mt5.symbol_info(self.symbol))
         mode_mask = int(info.get("filling_mode", 0))
 
-        # Partition into broker-recommended vs fallback
+        # Always try all 3 modes.  The bitmask is a hint for ordering only.
+        # Map: bit 0 = FOK, bit 1 = IOC, bit 2 = RETURN (Python convention)
+        all_modes = [
+            ("FOK", FILL_FOK, 1),
+            ("IOC", FILL_IOC, 2),
+            ("RETURN", FILL_RETURN, 4),
+        ]
+
         recommended: list[int] = []
         fallback: list[int] = []
-        for attr, bit in ALL_KNOWN.items():
-            val = int(getattr(self.mt5, attr, 0))
-            if not val:
-                continue
+        for _name, val, bit in all_modes:
             if mode_mask & bit:
                 recommended.append(val)
             else:
@@ -395,8 +416,9 @@ class LiveTrader:
         # Build final ordered list: cached winner → recommended → fallback
         ordered: list[int] = []
         seen: set[int] = set()
-        for m in ([cached] if cached else []) + recommended + fallback:
-            if m and m not in seen:
+        candidates = ([cached] if cached is not None else []) + recommended + fallback
+        for m in candidates:
+            if m not in seen:
                 ordered.append(m)
                 seen.add(m)
         return ordered
@@ -431,6 +453,13 @@ class LiveTrader:
         DONE = {int(getattr(self.mt5, "TRADE_RETCODE_DONE", 10009)),
                 int(getattr(self.mt5, "TRADE_RETCODE_DONE_PARTIAL", 10010))}
         RETRY_RETCODES = {10030, -1}  # unsupported fill / bridge None → try next mode
+        # v0.9.15.4: Resolve MT5 constants to plain ints once (RPyC proxy
+        # objects can cause serialization issues in order_send on some bridge
+        # versions — the root cause of retcode=-1 on ALL filling modes).
+        _action_deal = int(self.mt5.TRADE_ACTION_DEAL)
+        _order_buy = int(self.mt5.ORDER_TYPE_BUY)
+        _order_sell = int(self.mt5.ORDER_TYPE_SELL)
+        _time_gtc = int(self.mt5.ORDER_TIME_GTC)
         if not self.live:
             print(f"    [DRY-RUN] {'BUY' if direction==1 else 'SELL'} {lots} {self.symbol} @ {price:.{digits}f}  SL={sl:.{digits}f}  TP={tp:.{digits}f}  ({comment})")
             return -int(time.time() * 1000)   # fake ticket
@@ -439,38 +468,49 @@ class LiveTrader:
             bid, ask = self.quote()
             price = ask if direction == 1 else bid
             req = {
-                "action": self.mt5.TRADE_ACTION_DEAL,
+                "action": _action_deal,
                 "symbol": self.symbol,
                 "volume": round(float(lots), 2),
-                "type": self.mt5.ORDER_TYPE_BUY if direction == 1 else self.mt5.ORDER_TYPE_SELL,
+                "type": _order_buy if direction == 1 else _order_sell,
                 "price": price,
                 "sl": round(float(sl), digits),
                 "tp": 0,  # v0.9.15.2: no TP on broker — hybrid ladder manages exits
                 "deviation": deviation,
                 "magic": MAGIC,
                 "comment": comment[:31],
-                "type_time": self.mt5.ORDER_TIME_GTC,
+                "type_time": _time_gtc,
                 "type_filling": fill_mode,
             }
-            res = _to_dict(self.mt5.order_send(req))
+            # v0.9.15.4: wrap in try/except to catch RPyC bridge exceptions
+            try:
+                raw_res = self.mt5.order_send(req)
+            except Exception as exc:
+                fill_name = {0: "FOK", 1: "IOC", 2: "RETURN"}.get(fill_mode, str(fill_mode))
+                print(f"    [FILL-EXCEPTION] mode={fill_name} exc={exc!r} — trying next")
+                time.sleep(0.3)
+                continue
+            res = _to_dict(raw_res)
             retcode = int(res.get("retcode", -1))
             if retcode in DONE:
                 if fill_mode != filling_modes[0]:
-                    fill_name = {1: "IOC", 2: "RETURN", 0: "FOK"}.get(fill_mode, str(fill_mode))
+                    fill_name = {0: "FOK", 1: "IOC", 2: "RETURN"}.get(fill_mode, str(fill_mode))
                     print(f"    [INFO] order filled with {fill_name} (previous modes failed)")
                 self._record_fill_success(fill_mode)
                 return int(res.get("order", 0)) or int(res.get("deal", 0))
             if retcode in RETRY_RETCODES:
                 # Brief pause before retry — bridge hiccups need a moment
-                fill_name = {1: "IOC", 2: "RETURN", 0: "FOK"}.get(fill_mode, str(fill_mode))
-                print(f"    [FILL-RETRY] retcode={retcode} mode={fill_name} — trying next")
+                fill_name = {0: "FOK", 1: "IOC", 2: "RETURN"}.get(fill_mode, str(fill_mode))
                 if retcode == -1:
-                    time.sleep(0.2)
+                    # v0.9.15.4: log the raw bridge response for diagnosis
+                    print(f"    [FILL-RETRY] retcode=-1 mode={fill_name} raw={raw_res!r} res={res} — trying next")
+                    time.sleep(0.3)
+                else:
+                    print(f"    [FILL-RETRY] retcode={retcode} mode={fill_name} — trying next")
                 continue
             # Definitive broker rejection (10016 invalid stops, etc.) — don't retry
             print(f"    [REJECT] {retcode} {res.get('comment','')} fill={fill_mode} req={req}")
             return None
-        print(f"    [REJECT] all filling modes failed for {comment} (tried {len(filling_modes)} modes)")
+        print(f"    [REJECT] all filling modes failed for {comment} (tried {len(filling_modes)} modes: {filling_modes})")
         return None
 
     def _close_position(self, ticket: int, reason: str) -> bool:
@@ -488,6 +528,9 @@ class LiveTrader:
         DONE = {int(getattr(self.mt5, "TRADE_RETCODE_DONE", 10009)),
                 int(getattr(self.mt5, "TRADE_RETCODE_DONE_PARTIAL", 10010))}
         RETRY_RETCODES = {10030, -1}
+        # v0.9.15.4: Resolve MT5 constants to plain ints (RPyC proxy safety)
+        _action_deal = int(self.mt5.TRADE_ACTION_DEAL)
+        _time_gtc = int(self.mt5.ORDER_TIME_GTC)
         if not self.live:
             lt = self._trades.get(int(ticket))
             if lt:
@@ -498,7 +541,7 @@ class LiveTrader:
             bid, ask = self.quote()
             price = bid if ptype == 0 else ask
             req = {
-                "action": self.mt5.TRADE_ACTION_DEAL,
+                "action": _action_deal,
                 "symbol": self.symbol,
                 "volume": round(vol, 2),
                 "type": close_type,
@@ -507,17 +550,23 @@ class LiveTrader:
                 "deviation": deviation,
                 "magic": MAGIC,
                 "comment": reason[:31],
-                "type_time": self.mt5.ORDER_TIME_GTC,
+                "type_time": _time_gtc,
                 "type_filling": fill_mode,
             }
-            res = _to_dict(self.mt5.order_send(req))
+            try:
+                raw_res = self.mt5.order_send(req)
+            except Exception as exc:
+                print(f"    [CLOSE-EXCEPTION] ticket={ticket} fill={fill_mode} exc={exc!r}")
+                time.sleep(0.3)
+                continue
+            res = _to_dict(raw_res)
             retcode = int(res.get("retcode", -1))
             if retcode in DONE:
                 self._record_fill_success(fill_mode)
                 return True
             if retcode in RETRY_RETCODES:
                 if retcode == -1:
-                    time.sleep(0.2)
+                    time.sleep(0.3)
                 continue
             print(f"    [CLOSE-REJECT] ticket={ticket} retcode={retcode} {res.get('comment','')} fill={fill_mode}")
             return False
@@ -536,6 +585,9 @@ class LiveTrader:
         close_type = self.mt5.ORDER_TYPE_SELL if ptype == 0 else self.mt5.ORDER_TYPE_BUY
         DONE = {int(getattr(self.mt5, "TRADE_RETCODE_DONE", 10009)),
                 int(getattr(self.mt5, "TRADE_RETCODE_DONE_PARTIAL", 10010))}
+        # v0.9.15.4: Resolve MT5 constants to plain ints (RPyC proxy safety)
+        _action_deal = int(self.mt5.TRADE_ACTION_DEAL)
+        _time_gtc = int(self.mt5.ORDER_TIME_GTC)
         if not self.live:
             bid, ask = self.quote()
             price = bid if ptype == 0 else ask
@@ -545,7 +597,7 @@ class LiveTrader:
             bid, ask = self.quote()
             price = bid if ptype == 0 else ask
             req = {
-                "action": self.mt5.TRADE_ACTION_DEAL,
+                "action": _action_deal,
                 "symbol": self.symbol,
                 "volume": vol,
                 "type": close_type,
@@ -554,10 +606,16 @@ class LiveTrader:
                 "deviation": 500,
                 "magic": MAGIC,
                 "comment": reason[:31],
-                "type_time": self.mt5.ORDER_TIME_GTC,
+                "type_time": _time_gtc,
                 "type_filling": fill_mode,
             }
-            res = _to_dict(self.mt5.order_send(req))
+            try:
+                raw_res = self.mt5.order_send(req)
+            except Exception as exc:
+                print(f"    [PARTIAL-EXCEPTION] ticket={ticket} fill={fill_mode} exc={exc!r}")
+                time.sleep(0.3)
+                continue
+            res = _to_dict(raw_res)
             retcode = int(res.get("retcode", -1))
             if retcode in DONE:
                 print(f"    [PARTIAL] ticket={ticket} closed {vol} lots ({reason})")
@@ -565,7 +623,7 @@ class LiveTrader:
                 return True
             if retcode in {10030, -1}:
                 if retcode == -1:
-                    time.sleep(0.2)
+                    time.sleep(0.3)
                 continue
             print(f"    [PARTIAL-REJECT] ticket={ticket} retcode={retcode} fill={fill_mode}")
             return False
@@ -1478,8 +1536,8 @@ class LiveTrader:
 
     # ------------------------------------------------------------------ #
     def run(self) -> None:
-        persona_label = "v0.9.15.3 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.15.3 champion (long-only A+/A/B hybrid ladder)"
-        print(f"SlyTrade LIVE v0.9.15.3  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  working_lot={self.working_lot}  max_open={self.max_open}")
+        persona_label = "v0.9.15.4 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.15.4 champion (long-only A+/A/B hybrid ladder)"
+        print(f"SlyTrade LIVE v0.9.15.4  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  working_lot={self.working_lot}  max_open={self.max_open}")
         print(f"persona: {persona_label}")
         print("setups : RETEST_OB RETEST_FVG LIQ_SWEEP BOS_CONT DISP_TRAP BREAKER  (champion gates apply unless --all)")
         print(f"Magic={MAGIC}")
@@ -1529,7 +1587,7 @@ class LiveTrader:
 # --------------------------------------------------------------------------- #
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="SlyTrade v0.9.15.3 SCALPER LIVE trader (live hybrid ladder + all filling modes + DISP_TRAP/BREAKER + SL clamp + limit retests)")
+    ap = argparse.ArgumentParser(description="SlyTrade v0.9.15.4 SCALPER LIVE trader (live hybrid ladder + all filling modes + RPyC proxy fix + DISP_TRAP/BREAKER + SL clamp + limit retests)")
     ap.add_argument("--symbol", default="XAUUSDm")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=18812)
