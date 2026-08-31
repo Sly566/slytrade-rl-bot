@@ -60,14 +60,14 @@ class TestExitPlan:
         assert ep.tp2_r == 2.5
         assert ep.tp2_pct == 0.25
 
-    def test_runner_trail_025_atr(self):
+    def test_runner_trail_050_atr(self):
         ep = ExitPlan()
-        assert ep.runner_trail_atr_mult == 0.25
+        assert ep.runner_trail_atr_mult == 0.5
 
     def test_sl_clamp_defaults(self):
         ep = ExitPlan()
         assert ep.sl_clamp_min_atr == 0.5
-        assert ep.sl_clamp_max_atr == 3.0
+        assert ep.sl_clamp_max_atr == 2.5
 
 
 # --------------------------------------------------------------------------- #
@@ -82,10 +82,10 @@ class TestSlClamp:
         assert abs(3000.0 - result) == pytest.approx(1.0)  # 0.5 * 2.0
 
     def test_clamps_too_wide(self):
-        """Stop 5 ATR away → clamped to 3 ATR = 6 pts."""
+        """Stop 5 ATR away → clamped to 2.5 ATR = 5 pts."""
         ep = ExitPlan()
         result = _clamp_sl(3000.0, 2990.0, 1, 2.0, ep)  # 10 pts = 5 ATR
-        assert abs(3000.0 - result) == pytest.approx(6.0)  # 3*2
+        assert abs(3000.0 - result) == pytest.approx(5.0)  # 2.5*2
 
     def test_no_clamp_within_bounds(self):
         """Stop 2 ATR away → no clamping."""
@@ -97,14 +97,14 @@ class TestSlClamp:
         """Short: stop above entry, clamp symmetric."""
         ep = ExitPlan()
         result = _clamp_sl(3000.0, 3010.0, -1, 2.0, ep)  # 10 pts = 5 ATR
-        assert abs(result - 3000.0) == pytest.approx(6.0)
+        assert abs(result - 3000.0) == pytest.approx(5.0)
 
     def test_no_absolute_cap_pts(self):
         """v0.9.15.1: removed absolute pts cap — purely ATR-based."""
         ep = ExitPlan()
-        # ATR=100 (BTC-like), 3*ATR=300 — no artificial 12pt cap
+        # ATR=100 (BTC-like), 2.5*ATR=250 — no artificial 12pt cap
         result = _clamp_sl(77000.0, 76700.0, 1, 100.0, ep)  # 300 pts = 3 ATR
-        assert abs(77000.0 - result) == pytest.approx(300.0)
+        assert abs(77000.0 - result) == pytest.approx(250.0)
 
 
 # --------------------------------------------------------------------------- #
@@ -333,5 +333,7 @@ class TestVolMinRiskV0915:
         )
         # 1.2% actual vs 0.3% target = 4× — under risk_cap=2% → OK (no 3× REJECT)
         assert trader._vol_min_risk_ok(0.012, 0.003, silent=True) is True
-        # 2.1% actual > risk_cap=2% → REJECT
-        assert trader._vol_min_risk_ok(0.021, 0.003, silent=True) is False
+        # 2.1% actual > risk_cap=2% but < 3x risk_cap=6% → ACCEPT (v0.9.15.15 min-lot safety)
+        assert trader._vol_min_risk_ok(0.021, 0.003, silent=True) is True
+        # 7% actual > 3x risk_cap=6% → REJECT
+        assert trader._vol_min_risk_ok(0.07, 0.003, silent=True) is False

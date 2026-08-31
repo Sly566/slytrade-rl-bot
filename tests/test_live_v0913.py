@@ -120,7 +120,10 @@ def trader() -> LiveTrader:
 class TestVolMinRiskOk:
     def test_rejects_when_actual_above_risk_cap(self, trader: LiveTrader):
         trader.risk_cap = 0.01
-        assert trader._vol_min_risk_ok(0.012, 0.003, silent=True) is False
+        # 1.2% > 1% risk_cap but < 3x=3% → ACCEPT (v0.9.15.15 min-lot safety)
+        assert trader._vol_min_risk_ok(0.012, 0.003, silent=True) is True
+        # 4% > 3x risk_cap=3% → REJECT
+        assert trader._vol_min_risk_ok(0.04, 0.003, silent=True) is False
 
     def test_allows_when_under_risk_cap_even_if_above_3x_target(self, trader: LiveTrader):
         # 1.2% actual vs 0.3% target (>3x target) but under 2% risk_cap -> allowed in v0.9.14
@@ -133,13 +136,17 @@ class TestVolMinRiskOk:
     def test_respects_risk_cap_hard_rail(self, trader: LiveTrader):
         trader.risk_cap = 0.01
         assert trader._vol_min_risk_ok(0.009, 0.01, silent=True) is True
-        assert trader._vol_min_risk_ok(0.011, 0.01, silent=True) is False
+        # 1.1% > 1% risk_cap but < 3x=3% → ACCEPT (v0.9.15.15 min-lot safety)
+        assert trader._vol_min_risk_ok(0.011, 0.01, silent=True) is True
+        # 4% > 3x risk_cap=3% → REJECT
+        assert trader._vol_min_risk_ok(0.04, 0.01, silent=True) is False
 
-    def test_reject_log_names_risk_cap(self, trader: LiveTrader, capsys):
+    def test_accept_log_names_risk_cap(self, trader: LiveTrader, capsys):
         trader.risk_cap = 0.01
-        assert trader._vol_min_risk_ok(0.015, 0.01, side="SHORT", setup="LIQ_SWEEP") is False
+        # 1.5% > 1% risk_cap but < 3x=3% → ACCEPT with SIZE-ACCEPT log
+        assert trader._vol_min_risk_ok(0.015, 0.01, side="SHORT", setup="LIQ_SWEEP") is True
         out = capsys.readouterr().out
-        assert "risk=1.50% > cap=1.00%" in out
+        assert "SIZE-ACCEPT" in out
 
 
 class TestWorkingLotSizing:

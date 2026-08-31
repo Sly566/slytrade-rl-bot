@@ -373,7 +373,7 @@ class TestBOSControlAnchor:
         assert sig.stop == pytest.approx(2998.0 - 0.1 * 2.0)
 
     def test_sl_clamp_rescues_stale_anchors(self):
-        """v0.9.15: SL clamp [0.5 ATR, 3 ATR] brings far anchors within bounds."""
+        """v0.9.15: SL clamp [0.5 ATR, 2.5 ATR] brings far anchors within bounds."""
         cfg = self._cfg()
         row = _row(
             close=3000.0, atr_14=2.0,
@@ -383,10 +383,10 @@ class TestBOSControlAnchor:
         )
         sig = _evaluate_row(0, row, cfg, _empty_state())
         # v0.9.15: SL clamp brings the stop to 3*2 = 6 pts from entry
-        # so risk = 6 pts = 3 ATR, which is within the 0.5-7 ATR band
+        # so risk = 5 pts = 2.5 ATR, which is within the 0.5-2.5 ATR band
         assert sig is not None
         assert sig.setup_kind == "BOS_CONT"
-        assert sig.risk_per_unit == pytest.approx(6.0, abs=0.1)  # clamped to 3 ATR
+        assert sig.risk_per_unit == pytest.approx(5.0, abs=0.1)  # clamped to 2.5 ATR
 
     def test_falls_back_to_m5_when_m1_anchor_missing(self):
         cfg = self._cfg()
