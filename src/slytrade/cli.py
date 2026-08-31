@@ -1,311 +1,795 @@
-"""SlyTrade v0.9.15.23 CLI — ICT/SMC scalping bot (Layers 0-5 + live scalper)."""
+"""SlyTrade CLI — Full ICT/SMC pipeline: collect → process → align → train → backtest → live.
+
+Each command is self-contained and can be run independently.
+Full pipeline: slytrade collect && slytrade process && slytrade align && slytrade train && slytrade backtest
+"""
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
+import sys
+import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import typer
 from rich.console import Console
 from rich.table import Table
 
-app = typer.Typer(help="SlyTrade ICT/SMC scalper v0.9.15.23")
+app = typer.Typer(help="SlyTrade v1.0 — ICT/SMC scalping pipeline")
 console = Console()
 
-
-def _hint_bridge():
-    console.print("[yellow]Hint:[/yellow] start MT5 bridge with: bash start_mt5_bridge.sh")
+VERSION = "1.0.0"
 
 
-# --------------------------------------------------------------------------- #
-# doctor
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
+# collect — Download raw M1 bars from Exness archive
+# ---------------------------------------------------------------------------
 @app.command()
-def doctor():
-    """Check dependencies and data dirs."""
-    table = Table(title="SlyTrade Doctor v0.9.13.4"); table.add_column("Check"); table.add_column("Status")
-    for mod in ["numpy", "pandas", "pyarrow", "pydantic", "typer", "rich"]:
-        table.add_row(f"required:{mod}", "OK" if importlib.util.find_spec(mod) else "MISSING")
-    for opt in ["mt5linux"]:
-        table.add_row(f"optional:{opt}", "OK" if importlib.util.find_spec(opt) else "not installed")
-    for p in ["data/raw", "data/processed"]:
-        try: Path(p).mkdir(parents=True, exist_ok=True); probe=Path(p)/".w"; probe.write_text("ok"); probe.unlink(); s="[green]OK (writable)[/green]"
-        except OSError as e: s=f"[red]{e}[/red]"
-        table.add_row(f"dir:{p}", s)
-    console.print(table)
+def collect(
+    symbol: str = typer.Option("XAUUSDm", "--symbol", "-s", help="Trading symbol"),
+    years: float = typer.Option(5.0, "--years", "-y", help="Years of history to collect"),
+    output: str = typer.Option("data/raw", "--output", "-o", help="Output directory"),
+    clean: bool = typer.Option(False, "--clean", help="Remove existing data first"),
+):
+    """Collect raw M1 bars from Exness tick archive (5 years default).
 
+    Downloads tick data and aggregates to M1 bars. Stores as parquet
+    partitioned by year/month.
 
-# --------------------------------------------------------------------------- #
-# mt5-info
-# --------------------------------------------------------------------------- #
-@app.command("mt5-info")
-def mt5_info():
-    """Check MT5 bridge connectivity."""
-    try:
-        from mt5linux import MetaTrader5  # type: ignore
-        mt5 = MetaTrader5(timeout=int(os.getenv("SLYTRADE_MT5_TIMEOUT", "30")))
-        if not mt5.initialize():
-            console.print("[red]MT5 initialize() failed[/red]"); _hint_bridge(); raise typer.Exit(1)
-        console.print("[green]MT5 connected[/green]")
-        console.print(f"Terminal: {mt5.terminal_info()}")
-        console.print(f"Account:  {mt5.account_info()}")
-        mt5.shutdown()
-    except ImportError:
-        console.print("[red]mt5linux not installed[/red]")
-        raise typer.Exit(1) from None
-    except Exception as e:
-        console.print(f"[red]MT5 error: {e}[/red]")
-        _hint_bridge()
-        raise typer.Exit(1) from e
+    Example:
+        slytrade collect --symbol XAUUSDm --years 5
+    """
+    from .data.exness_archive import ExnessArchiveDownloader
 
+    console.print(f"[bold]SlyTrade COLLECT v{VERSION}[/bold] symbol={symbol} years={years}")
+    out_dir = Path(output) / symbol
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-# --------------------------------------------------------------------------- #
-# inspect
-# --------------------------------------------------------------------------- #
-@app.command("inspect")
-def inspect_cmd(raw_symbol: str = typer.Option("XAUUSDm", "--symbol"),
-                processed_root: str = typer.Option("data/processed", "--processed-root"),
-                raw_root: str = typer.Option("data/raw", "--raw-root")):
-    """Inspect processed / aligned / signals / backtest data partitions."""
-    from slytrade.config import DataConfig
-    from slytrade.data.storage import discover_partitions
-    cfg = DataConfig.from_paths(Path(raw_root), Path(processed_root))
-    console.print("[bold]Processed bars:[/bold]")
-    for tf in ["M1","M5","M15","M30","H1","H4","D1","W1"]:
-        base = cfg.processed_bars_path / f"symbol={raw_symbol}" / f"timeframe={tf}"
-        files = discover_partitions(base, "**/*.parquet")
-        rows = 0
-        for fp in files:
-            try:
-                import pyarrow.parquet as pq
-                rows += pq.ParquetFile(str(fp)).metadata.num_rows
-            except Exception: pass
-        if files:
-            console.print(f"  {tf:4s}: {len(files):3d} partitions, {rows:>10,} rows")
-    base = cfg.aligned_path / f"symbol={raw_symbol}" / "timeframe=M1"
-    afiles = discover_partitions(base, "**/*.parquet")
-    arows = 0
-    for fp in afiles:
+    if clean:
+        import shutil
+        shutil.rmtree(out_dir, ignore_errors=True)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        console.print("  Cleaned existing data")
+
+    end = datetime.now(UTC)
+    start = end - timedelta(days=int(years * 365.25))
+    console.print(f"  Period: {start.strftime('%Y-%m-%d')} to {end.strftime('%Y-%m-%d')}")
+
+    dl = ExnessArchiveDownloader(output_dir=str(out_dir))
+    console.print("  Downloading from Exness archive...")
+    result = dl.collect(symbol, start, end)
+    console.print(f"  Downloaded: {result.rows:,} rows, {len(result.files)} files")
+    if hasattr(result, 'errors') and result.errors:
+        for err in result.errors[:5]:
+            console.print(f"  [yellow]Warning: {err}[/yellow]")
+
+    # List downloaded files
+    parquets = sorted(out_dir.rglob("*.parquet"))
+    total_rows = 0
+    for p in parquets:
         try:
-            import pyarrow.parquet as pq
-            arows += pq.ParquetFile(str(fp)).metadata.num_rows
-        except Exception: pass
-    console.print(f"[bold]Aligned M1:[/bold] files={len(afiles)} rows≈{arows:,}")
-    sp = cfg.signals_path / f"symbol={raw_symbol}" / "signals.parquet"
-    console.print("[bold]Signals:[/bold]")
-    if sp.exists():
-        sdf = pd.read_parquet(sp)
-        console.print(f"  {sp}: {len(sdf):,} signals")
-        if "grade" in sdf.columns:
-            console.print(f"  grades: {sdf['grade'].value_counts().to_dict()}")
-    else:
-        console.print(f"  not found ({sp})")
+            n = pd.read_parquet(p).shape[0]
+            total_rows += n
+            console.print(f"    {p.relative_to(out_dir)} ({n:,} rows)")
+        except Exception:
+            pass
+    console.print(f"\n[green]Total: {total_rows:,} M1 bars in {len(parquets)} files[/green]")
+    console.print(f"Next: [bold]slytrade process --symbol {symbol}[/bold]")
 
 
-# --------------------------------------------------------------------------- #
-# process (Layer 2)
-# --------------------------------------------------------------------------- #
-@app.command("process")
-def process_cmd(raw_symbol: str = typer.Option("XAUUSDm", "--symbol"),
-                timeframes: str = typer.Option("M1,M5,M15,M30,H1,H4,D1,W1", "--timeframes"),
-                raw_root: str = typer.Option("data/raw", "--raw-root"),
-                processed_root: str = typer.Option("data/processed", "--processed-root"),
-                clean: bool = typer.Option(False, "--clean")):
-    """Run per-TF feature engineering (Layer 2)."""
-    from slytrade.config import DataConfig
-    from slytrade.data.per_tf import process_all
-    cfg = DataConfig.from_paths(Path(raw_root), Path(processed_root))
+# ---------------------------------------------------------------------------
+# process — Compute per-TF features
+# ---------------------------------------------------------------------------
+@app.command()
+def process(
+    symbol: str = typer.Option("XAUUSDm", "--symbol", "-s"),
+    timeframes: str = typer.Option("M1,M5,M15,M30,H1,H4,D1", "--timeframes", "-t",
+                                    help="Comma-separated timeframes"),
+    raw_root: str = typer.Option("data/raw", "--raw-root"),
+    output: str = typer.Option("data/processed", "--output", "-o"),
+    clean: bool = typer.Option(False, "--clean"),
+):
+    """Process per-TF features (ATR, structure, OBs, FVGs, sweeps, etc.).
+
+    Reads raw M1 bars, resamples to each TF, computes all ICT/SMC features,
+    and writes processed parquet files.
+
+    Example:
+        slytrade process --symbol XAUUSDm --timeframes M1,M5,M15,M30,H1
+    """
+    from .data.features import DEFAULT_CONFIG, process_bars
+    from .data.resample import resample_bars_to_timeframe
+
+    console.print(f"[bold]SlyTrade PROCESS v{VERSION}[/bold] symbol={symbol}")
     tfs = [t.strip() for t in timeframes.split(",") if t.strip()]
-    r = process_all(cfg, raw_symbol[:6], raw_symbol, tfs, clean=clean,
-                    progress=lambda m: console.print(f"  {m}"))
-    for tf, n in r.per_tf_rows.items():
-        console.print(f"  {tf}: {n:,} rows / {r.per_tf_files[tf]} files")
+    console.print(f"  Timeframes: {tfs}")
+
+    # Find raw M1 data
+    raw_dir = Path(raw_root) / symbol
+    m1_files = sorted(raw_dir.rglob("*M1*.parquet")) + sorted(raw_dir.rglob("*1m*.parquet"))
+    if not m1_files:
+        # Try any parquet
+        m1_files = sorted(raw_dir.rglob("*.parquet"))
+    if not m1_files:
+        console.print(f"[red]No raw data found in {raw_dir}. Run 'slytrade collect' first.[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"  Loading {len(m1_files)} raw files...")
+    m1_raw = pd.concat([pd.read_parquet(f) for f in m1_files], ignore_index=True)
+    m1_raw = m1_raw.sort_values("time").drop_duplicates(subset=["time"]).reset_index(drop=True)
+
+    # Ensure required columns
+    for col in ["tick_volume", "real_volume"]:
+        if col not in m1_raw.columns:
+            m1_raw[col] = m1_raw.get("volume", 0.0)
+
+    console.print(f"  {len(m1_raw):,} raw M1 bars ({m1_raw['time'].min()} to {m1_raw['time'].max()})")
+
+    # Process each TF
+    out_dir = Path(output) / "bars" / f"symbol={symbol}"
+    if clean:
+        import shutil
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+    for tf in tfs:
+        console.print(f"\n  Processing {tf}...")
+        t0 = time.time()
+
+        if tf == "M1":
+            df = m1_raw.copy()
+        else:
+            console.print(f"    Resampling M1 → {tf}...")
+            df = resample_bars_to_timeframe(m1_raw, tf)
+
+        console.print(f"    Computing features on {len(df):,} bars...")
+        processed = process_bars(df, tf, DEFAULT_CONFIG)
+        elapsed = time.time() - t0
+
+        # Save
+        tf_dir = out_dir / f"timeframe={tf}"
+        tf_dir.mkdir(parents=True, exist_ok=True)
+        out_path = tf_dir / "data.parquet"
+        processed.to_parquet(out_path, index=False)
+        console.print(f"    {tf}: {len(processed):,} bars, {len(processed.columns)} cols, "
+                      f"{elapsed:.1f}s → {out_path}")
+
+    console.print(f"\n[green]Processing complete![/green]")
+    console.print(f"Next: [bold]slytrade align --symbol {symbol}[/bold]")
 
 
-# --------------------------------------------------------------------------- #
-# align (Layer 3)
-# --------------------------------------------------------------------------- #
-@app.command("align")
-def align_cmd(raw_symbol: str = typer.Option("XAUUSDm", "--symbol"),
-              raw_root: str = typer.Option("data/raw", "--raw-root"),
-              processed_root: str = typer.Option("data/processed", "--processed-root"),
-              clean: bool = typer.Option(False, "--clean")):
-    """Causally align HTF features onto M1 (Layer 3)."""
-    from slytrade.config import DataConfig
-    from slytrade.data.mtf_align import align_all
-    cfg = DataConfig.from_paths(Path(raw_root), Path(processed_root))
-    r = align_all(cfg, raw_symbol.split("m")[0], raw_symbol, clean=clean,
-                  progress=lambda m: console.print(f"  {m}"))
-    console.print(f"Aligned: {r.rows:,} M1 rows × {r.columns} cols across {r.files} files")
+# ---------------------------------------------------------------------------
+# align — Causal MTF alignment onto M1
+# ---------------------------------------------------------------------------
+@app.command()
+def align(
+    symbol: str = typer.Option("XAUUSDm", "--symbol", "-s"),
+    processed_root: str = typer.Option("data/processed", "--processed-root"),
+    output: str = typer.Option("data/processed/aligned", "--output", "-o"),
+    clean: bool = typer.Option(False, "--clean"),
+):
+    """Causally align HTF features onto M1 execution TF.
+
+    M1 bar at time T sees only HTF information from bars that closed BEFORE T.
+    This is the same alignment used by the live trader.
+
+    Example:
+        slytrade align --symbol XAUUSDm
+    """
+    from .data.mtf_align import _asof_merge, _prep_htf_frame
+    from .data.time import timeframe_timedelta
+
+    console.print(f"[bold]SlyTrade ALIGN v{VERSION}[/bold] symbol={symbol}")
+
+    proc_dir = Path(processed_root) / "bars" / f"symbol={symbol}"
+    if not proc_dir.exists():
+        console.print(f"[red]No processed data at {proc_dir}. Run 'slytrade process' first.[/red]")
+        raise typer.Exit(1)
+
+    # Load M1
+    m1_path = proc_dir / "timeframe=M1" / "data.parquet"
+    if not m1_path.exists():
+        console.print(f"[red]M1 data not found at {m1_path}[/red]")
+        raise typer.Exit(1)
+
+    m1 = pd.read_parquet(m1_path)
+    console.print(f"  M1: {len(m1):,} bars, {len(m1.columns)} columns")
+
+    # Load and align HTFs
+    htf_tfs = ["M5", "M15", "M30", "H1", "H4", "D1"]
+    df = m1.copy().sort_values("time").reset_index(drop=True)
+
+    for tf in htf_tfs:
+        htf_path = proc_dir / f"timeframe={tf}" / "data.parquet"
+        if not htf_path.exists():
+            console.print(f"  [yellow]{tf}: not found, skipping[/yellow]")
+            continue
+
+        htf = pd.read_parquet(htf_path)
+        console.print(f"  {tf}: {len(htf):,} bars → aligning...")
+
+        dur = timeframe_timedelta(tf)
+        htf = htf.copy()
+        htf["decision_time"] = htf["time"] + dur
+        prepped = _prep_htf_frame(htf, tf)
+        df = _asof_merge(df, prepped, tf)
+        console.print(f"    → {len(df):,} rows, {len(df.columns)} columns")
+
+    # Save
+    out_dir = Path(output) / f"symbol={symbol}"
+    if clean:
+        import shutil
+        shutil.rmtree(out_dir, ignore_errors=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "aligned.parquet"
+    df.to_parquet(out_path, index=False)
+
+    # Summary
+    structure_cols = [c for c in df.columns if any(x in c for x in ['disp', 'bos', 'choch', 'sweep', 'ob_', 'fvg_'])]
+    console.print(f"\n[green]Aligned: {len(df):,} M1 bars × {len(df.columns)} columns[/green]")
+    console.print(f"  Structure features: {len(structure_cols)}")
+    for prefix in ["M1_", "M5_", "M15_", "M30_", "H1_", "H4_", "D1_"]:
+        n = len([c for c in structure_cols if c.startswith(prefix)])
+        if n > 0:
+            console.print(f"    {prefix.rstrip('_')}: {n}")
+    console.print(f"  Saved: {out_path} ({out_path.stat().st_size / 1e6:.1f} MB)")
+    console.print(f"\nNext: [bold]slytrade train --symbol {symbol}[/bold] or [bold]slytrade backtest --symbol {symbol}[/bold]")
 
 
-# --------------------------------------------------------------------------- #
-# scan (Layer 4)
-# --------------------------------------------------------------------------- #
-@app.command("scan")
-def scan_cmd(raw_symbol: str = typer.Option("XAUUSDm", "--symbol"),
-             raw_root: str = typer.Option("data/raw", "--raw-root"),
-             processed_root: str = typer.Option("data/processed", "--processed-root"),
-             output: str | None = typer.Option(None, "--output")):
-    """Scan aligned M1 bars for ICT/SMC signals (Layer 4)."""
-    from slytrade.config import DataConfig
-    from slytrade.strategy.config import StrategyConfig
-    from slytrade.strategy.scanner import scan_aligned, write_signals
-    cfg = DataConfig.from_paths(Path(raw_root), Path(processed_root))
-    scfg = StrategyConfig()
-    r = scan_aligned(cfg, raw_symbol, cfg=scfg, progress=lambda m: console.print(f"  {m}"))
-    if output:
-        out = Path(output); out.parent.mkdir(parents=True, exist_ok=True)
-        from slytrade.strategy.signals import signals_to_frame
-        sdf = signals_to_frame(r.signals); sdf.to_parquet(out, index=False)
-        console.print(f"Wrote {len(sdf):,} signals to {out}")
-    else:
-        out = write_signals(cfg, raw_symbol, r.signals)
-        console.print(f"Wrote {len(r.signals):,} signals to {out}")
+# ---------------------------------------------------------------------------
+# train — Train RL agent
+# ---------------------------------------------------------------------------
+@app.command()
+def train(
+    symbol: str = typer.Option("XAUUSDm", "--symbol", "-s"),
+    aligned_path: str = typer.Option("", "--data", "-d", help="Path to aligned parquet (auto-detected if empty)"),
+    algo: str = typer.Option("ppo", "--algo", "-a", help="Algorithm: ppo, sac, a2c"),
+    timesteps: int = typer.Option(500_000, "--timesteps", "-n"),
+    output: str = typer.Option("models", "--output", "-o"),
+    max_bars: int = typer.Option(5000, "--max-bars", help="Max bars per episode"),
+    tune: bool = typer.Option(False, "--tune", help="Run Optuna hyperparameter search first"),
+):
+    """Train RL agent on aligned data. Agent learns entries AND exits.
+
+    The agent observes M1+M5+M15 structure and decides:
+    - ENTER_LONG, ENTER_SHORT, CLOSE, or HOLD
+    - Position size (0.01, 0.04, 0.08 lots)
+    - SL distance (1.0x, 1.5x, 2.0x, 2.5x ATR)
+    - TP distance (0.5R, 1.0R, 1.5R, 2.0R, 2.5R)
+
+    Example:
+        slytrade train --symbol XAUUSDm --timesteps 500000 --algo ppo
+    """
+    try:
+        from stable_baselines3 import PPO, SAC, A2C
+        from stable_baselines3.common.vec_env import DummyVecEnv
+        from stable_baselines3.common.monitor import Monitor
+    except ImportError:
+        console.print("[red]stable-baselines3 not installed. Run: pip install 'slytrade-rl-bot[rl]'[/red]")
+        raise typer.Exit(1)
+
+    from .rl.env import SlyTradeEnv, OBS_DIM
+
+    # Find aligned data
+    if not aligned_path:
+        candidates = [
+            Path("data/processed/aligned") / f"symbol={symbol}" / "aligned.parquet",
+            Path("data/aligned") / f"{symbol}_aligned.parquet",
+            Path("data/aligned") / f"{symbol}_6m_aligned.parquet",
+        ]
+        for c in candidates:
+            if c.exists():
+                aligned_path = str(c)
+                break
+        if not aligned_path:
+            console.print(f"[red]No aligned data found. Run 'slytrade align' first.[/red]")
+            raise typer.Exit(1)
+
+    console.print(f"[bold]SlyTrade TRAIN v{VERSION}[/bold] symbol={symbol} algo={algo}")
+    console.print(f"  Data: {aligned_path}")
+    console.print(f"  Timesteps: {timesteps:,}")
+    console.print(f"  Observation space: {OBS_DIM} dimensions (M1+M5+M15 structure)")
+
+    df = pd.read_parquet(aligned_path)
+    console.print(f"  {len(df):,} bars, {len(df.columns)} columns")
+
+    # Train/test split (80/20, chronological — no lookahead)
+    split_idx = int(len(df) * 0.8)
+    train_df = df.iloc[:split_idx].reset_index(drop=True)
+    test_df = df.iloc[split_idx:].reset_index(drop=True)
+    console.print(f"  Train: {len(train_df):,} bars ({train_df['time'].min()} to {train_df['time'].max()})")
+    console.print(f"  Test:  {len(test_df):,} bars ({test_df['time'].min()} to {test_df['time'].max()})")
+
+    # Optuna tuning
+    best_params = {}
+    if tune:
+        try:
+            import optuna
+        except ImportError:
+            console.print("[yellow]optuna not installed, skipping tuning[/yellow]")
+            tune = False
+
+        if tune:
+            console.print("\n  Running Optuna hyperparameter search (50 trials)...")
+
+            def objective(trial):
+                lr = trial.suggest_float("lr", 1e-5, 1e-3, log=True)
+                gamma = trial.suggest_float("gamma", 0.95, 0.999)
+                ent_coef = trial.suggest_float("ent_coef", 1e-4, 0.1, log=True)
+                n_steps = trial.suggest_categorical("n_steps", [512, 1024, 2048])
+                net_arch = trial.suggest_categorical("net_arch", [
+                    [128, 128], [256, 128], [256, 256], [128, 64],
+                ])
+
+                def make_env():
+                    return Monitor(SlyTradeEnv(train_df, max_bars=max_bars))
+
+                env = DummyVecEnv([make_env])
+                policy_kwargs = dict(net_arch=dict(pi=net_arch, vf=net_arch))
+                model = PPO("MlpPolicy", env, learning_rate=lr, gamma=gamma,
+                           ent_coef=ent_coef, n_steps=n_steps, policy_kwargs=policy_kwargs,
+                           verbose=0, seed=42)
+                model.learn(total_timesteps=50_000)
+
+                eval_env = SlyTradeEnv(test_df, max_bars=len(test_df))
+                obs, _ = eval_env.reset()
+                while True:
+                    action, _ = model.predict(obs, deterministic=True)
+                    obs, _, term, trunc, _ = eval_env.step(action)
+                    if term or trunc:
+                        break
+                m = eval_env.get_metrics()
+                return m.get("sharpe_ratio", 0) + m.get("win_rate", 0) * 2 - m.get("max_drawdown", 1) * 5
+
+            study = optuna.create_study(direction="maximize")
+            study.optimize(objective, n_trials=50, show_progress_bar=True)
+            best_params = study.best_params
+            console.print(f"  Best params: {json.dumps(best_params, indent=2)}")
+
+    # Create environment
+    def make_env():
+        return Monitor(SlyTradeEnv(train_df, max_bars=max_bars))
+
+    train_env = DummyVecEnv([make_env])
+
+    # Create model
+    algo_cls = {"ppo": PPO, "sac": SAC, "a2c": A2C}[algo.lower()]
+    model_kwargs = {
+        "policy": "MlpPolicy", "env": train_env,
+        "learning_rate": 3e-4, "gamma": 0.99, "gae_lambda": 0.95,
+        "clip_range": 0.2, "ent_coef": 0.01, "vf_coef": 0.5,
+        "max_grad_norm": 0.5, "n_steps": 2048, "batch_size": 256, "n_epochs": 10,
+        "policy_kwargs": dict(net_arch=dict(pi=[256, 128, 64], vf=[256, 128, 64])),
+        "verbose": 0, "seed": 42,
+    }
+    if best_params:
+        model_kwargs.update(best_params)
+        if "net_arch" in best_params:
+            model_kwargs["policy_kwargs"] = dict(
+                net_arch=dict(pi=best_params["net_arch"], vf=best_params["net_arch"])
+            )
+            del model_kwargs["net_arch"]
+
+    model = algo_cls(**model_kwargs)
+    n_params = sum(p.numel() for p in model.policy.parameters())
+    console.print(f"\n  Model: {algo.upper()} ({n_params:,} parameters)")
+    console.print(f"  Training...")
+
+    # Train with periodic evaluation
+    os.makedirs(output, exist_ok=True)
+    best_sharpe = -999
+    start_time = time.time()
+    n_iters = max(1, timesteps // 50_000)
+
+    for iteration in range(n_iters):
+        model.learn(total_timesteps=50_000, reset_num_timesteps=False)
+
+        # Evaluate
+        eval_env = SlyTradeEnv(test_df, max_bars=len(test_df))
+        obs, _ = eval_env.reset()
+        while True:
+            action, _ = model.predict(obs, deterministic=True)
+            obs, _, term, trunc, _ = eval_env.step(action)
+            if term or trunc:
+                break
+        metrics = eval_env.get_metrics()
+        elapsed = time.time() - start_time
+
+        console.print(f"    [{iteration+1}/{n_iters}] trades={metrics['n_trades']} "
+                      f"wr={metrics['win_rate']:.0%} pnl={metrics['total_pnl']:+.0f} "
+                      f"sharpe={metrics['sharpe_ratio']:.2f} dd={metrics['max_drawdown']:.0%} "
+                      f"pf={metrics['profit_factor']:.2f} ({elapsed:.0f}s)")
+
+        if metrics['sharpe_ratio'] > best_sharpe and metrics['n_trades'] > 10:
+            best_sharpe = metrics['sharpe_ratio']
+            model.save(f"{output}/{algo}_{symbol}_best")
+
+    # Save final
+    model.save(f"{output}/{algo}_{symbol}_final")
+
+    # Final evaluation
+    console.print(f"\n{'='*60}")
+    console.print("[bold green]FINAL EVALUATION[/bold green]")
+    eval_env = SlyTradeEnv(test_df, max_bars=len(test_df))
+    obs, _ = eval_env.reset()
+    while True:
+        action, _ = model.predict(obs, deterministic=True)
+        obs, _, term, trunc, _ = eval_env.step(action)
+        if term or trunc:
+            break
+    m = eval_env.get_metrics()
+    console.print(f"  Trades:      {m['n_trades']}")
+    console.print(f"  Win Rate:    {m['win_rate']:.1%}")
+    console.print(f"  Total P&L:   {m['total_pnl']:+.2f}")
+    console.print(f"  Sharpe:      {m['sharpe_ratio']:.2f}")
+    console.print(f"  Profit Fac:  {m['profit_factor']:.2f}")
+    console.print(f"  Max DD:      {m['max_drawdown']:.1%}")
+    console.print(f"  Avg Win:     {m['avg_win']:+.2f}")
+    console.print(f"  Avg Loss:    {m['avg_loss']:+.2f}")
+
+    with open(f"{output}/metrics.json", "w") as f:
+        json.dump(m, f, indent=2, default=str)
+    console.print(f"\n  Model: {output}/{algo}_{symbol}_best.zip")
+    console.print(f"  Metrics: {output}/metrics.json")
+    console.print(f"  Total time: {time.time()-start_time:.0f}s")
+    console.print(f"\nNext: [bold]slytrade backtest --symbol {symbol}[/bold] or [bold]slytrade live --symbol {symbol}[/bold]")
 
 
-# --------------------------------------------------------------------------- #
-# backtest (Layer 5)
-# --------------------------------------------------------------------------- #
-@app.command("backtest")
-def backtest_cmd(raw_symbol: str = typer.Option("XAUUSDm", "--symbol"),
-                 equity: float = typer.Option(20000.0, "--equity"),
-                 signals_path: str | None = typer.Option(None, "--signals"),
-                 raw_root: str = typer.Option("data/raw", "--raw-root"),
-                 processed_root: str = typer.Option("data/processed", "--processed-root"),
-                 output_dir: str | None = typer.Option(None, "--output"),
-                 usd_zar: float = typer.Option(18.5, "--usd-zar"),
-                 slip_pts: int = typer.Option(5, "--slip-pts"),
-                 max_risk: float = typer.Option(0.02, "--max-risk"),
-                 commission: float = typer.Option(0.0, "--commission-per-lot")):
-    """Run the hedging backtest engine (Layer 5)."""
-    import json
+# ---------------------------------------------------------------------------
+# backtest — Run backtest exactly like live
+# ---------------------------------------------------------------------------
+@app.command()
+def backtest(
+    symbol: str = typer.Option("XAUUSDm", "--symbol", "-s"),
+    aligned_path: str = typer.Option("", "--data", "-d"),
+    equity: float = typer.Option(20000.0, "--equity", "-e"),
+    risk_cap: float = typer.Option(0.05, "--risk-cap"),
+    working_lot: float = typer.Option(0.04, "--working-lot"),
+    max_open: int = typer.Option(3, "--max-open"),
+    usd_zar: float = typer.Option(18.5, "--usd-zar"),
+    output: str = typer.Option("data/backtest", "--output", "-o"),
+    unrestricted: bool = typer.Option(False, "--all", help="All signals (unrestricted persona)"),
+):
+    """Run backtest using the same engine as live trading.
 
-    from slytrade.backtest import AccountSpec, BacktestConfig, run_backtest
-    from slytrade.config import DataConfig
-    from slytrade.strategy.config import StrategyConfig
-    cfg = DataConfig.from_paths(Path(raw_root), Path(processed_root))
-    sp = Path(signals_path) if signals_path else cfg.signals_path / f"symbol={raw_symbol}" / "signals.parquet"
-    if not sp.exists():
-        console.print(f"[red]Signals not found at {sp}. Run `slytrade scan` first.[/red]"); raise typer.Exit(1)
-    sdf = pd.read_parquet(sp); sdf["time"] = pd.to_datetime(sdf["time"], utc=True)
-    console.print(f"Loaded {len(sdf):,} signals from {sp}")
-    acct = AccountSpec(starting_equity=equity, currency="ZAR", leverage=2000,
-                       fx_to_account={"USD": usd_zar}, commission_per_lot_rt=commission)
-    bt_cfg = BacktestConfig(starting_equity=equity, account_ccy="ZAR", leverage=2000,
-                            usd_zar=usd_zar, slippage_points_long=slip_pts, slippage_points_short=slip_pts,
-                            commission_per_lot_rt=commission, pay_entry_spread=True,
-                            max_open_positions=10, min_equity_fraction=0.30, max_risk_per_trade=max_risk)
-    result = run_backtest(cfg, raw_symbol, sdf, account=acct, bt_cfg=bt_cfg,
-                          strat_cfg=StrategyConfig(), progress=lambda m: console.print(f"  {m}"))
-    m = result.metrics
-    console.print("\n[bold green]=== BACKTEST RESULTS ===[/bold green]")
-    if "error" in m:
-        console.print(f"[red]{m['error']}[/red]"); return
-    console.print(f"  Bars processed : {result.n_bars:,}")
-    console.print(f"  Signals fired  : {result.n_signals:,}")
-    console.print(f"  Trades taken   : {m['n_trades']}")
-    console.print(f"  Win rate       : {m['win_rate']*100:.1f}% ({m['n_win']}W/{m['n_loss']}L/{m['n_be']}BE)")
-    console.print(f"  Profit factor  : [bold]{m['profit_factor']:.2f}[/bold]")
-    console.print(f"  Mean R         : {m['mean_R']:+.3f}")
-    console.print(f"  Total P&L      : {m['total_pnl']:+,.2f} {bt_cfg.account_ccy}")
-    console.print(f"  Final equity   : {m.get('final_equity', equity):,.2f} {bt_cfg.account_ccy}")
-    console.print(f"  Return         : {m.get('return_pct',0):+.2f}%")
-    console.print(f"  Max drawdown   : {m.get('max_drawdown_acct',0):,.2f} {bt_cfg.account_ccy} ({m.get('max_drawdown_pct',0):.2f}%)")
-    for section, label in [("by_grade","By grade"),("by_session","By session"),
-                           ("by_zone","By zone kind"),("by_direction","By direction"),
-                           ("by_killzone","By killzone"),("by_ob_tf","By OB TF"),("by_exit","By exit reason")]:
-        if section in m and m[section]:
-            console.print(f"\n  [bold]{label}:[/bold]")
-            for k, v in m[section].items():
-                pf = v.get("PF", 0); n = v.get("n",0); wr = v.get("win_rate",0)*100 if "win_rate" in v else 0
-                pnl = v.get("total_pnl", 0); mr = v.get("mean_R", 0)
-                color = "green" if pf >= 1.5 else ("yellow" if pf >= 1.0 else "red")
-                console.print(f"    {str(k):14s}: n={n:4d}  wr={wr:5.1f}%  meanR={mr:+.3f}  PF=[{color}]{pf:.2f}[/]  P&L={pnl:+,.0f}")
-    if output_dir:
-        out = Path(output_dir)/f"symbol={raw_symbol}"; out.mkdir(parents=True, exist_ok=True)
-        result.trades.to_parquet(out/"trades.parquet", index=False)
-        result.tranches.to_parquet(out/"tranches.parquet", index=False)
-        result.equity_curve.to_parquet(out/"equity.parquet", index=False)
-        (out/"metrics.json").write_text(json.dumps(m, indent=2, default=str))
-        console.print(f"\nSaved trades/tranches/equity/metrics to {out}")
+    Uses the same signal pipeline, same exit logic (hybrid ladder + trailing),
+    same risk management as the live trader.
+
+    Example:
+        slytrade backtest --symbol XAUUSDm --equity 20000 --risk-cap 0.05
+    """
+    from .backtest.specs import AccountSpec, spec_for_symbol
+    from .strategy.config import champion_persona, rl_training_persona
+    from .strategy.signals import _evaluate_row
+
+    console.print(f"[bold]SlyTrade BACKTEST v{VERSION}[/bold] symbol={symbol}")
+
+    # Find aligned data
+    if not aligned_path:
+        candidates = [
+            Path("data/processed/aligned") / f"symbol={symbol}" / "aligned.parquet",
+            Path("data/aligned") / f"{symbol}_aligned.parquet",
+            Path("data/aligned") / f"{symbol}_6m_aligned.parquet",
+        ]
+        for c in candidates:
+            if c.exists():
+                aligned_path = str(c)
+                break
+        if not aligned_path:
+            console.print(f"[red]No aligned data found. Run 'slytrade align' first.[/red]")
+            raise typer.Exit(1)
+
+    df = pd.read_parquet(aligned_path)
+    console.print(f"  Data: {aligned_path}")
+    console.print(f"  {len(df):,} bars, {len(df.columns)} columns")
+    console.print(f"  Date: {df['time'].min()} to {df['time'].max()}")
+
+    # Config (same as live)
+    cfg = rl_training_persona() if unrestricted else champion_persona()
+    spec = spec_for_symbol(symbol)
+    acct = AccountSpec(
+        starting_equity=equity, currency="ZAR", leverage=2000,
+        fx_to_account={"USD": usd_zar},
+    )
+
+    # Walk bars exactly like live
+    console.print(f"\n  Walking {len(df):,} bars...")
+    state: dict = {}
+    equity_curve = [equity]
+    trades: list[dict] = []
+    pos_dir = 0
+    pos_entry = 0.0
+    pos_sl = 0.0
+    pos_tp = 0.0
+    pos_lots = 0.0
+    pos_bars = 0
+    pos_grade = ""
+    pos_risk_per_unit = 0.0
+    pos_best_price = 0.0
+    pos_trail_active = False
+    time_stop_bars = 60
+    signals_fired: set[str] = set()
+    n_signals = 0
+    t0 = time.time()
+
+    for i in range(len(df)):
+        row = df.iloc[i]
+        price = float(row.get("close", 0.0))
+        atr = float(row.get("atr_14", 0.0)) if pd.notna(row.get("atr_14")) else 0.0
+
+        # Check SL/TP/time-stop on open position
+        if pos_dir != 0:
+            pos_bars += 1
+            r_unit = pos_risk_per_unit if pos_risk_per_unit > 0 else abs(pos_tp - pos_entry)
+            cur_r = (price - pos_entry) / r_unit if pos_dir == 1 else (pos_entry - price) / r_unit
+
+            # Track best price for trailing
+            if pos_dir == 1:
+                pos_best_price = max(pos_best_price, price)
+            else:
+                pos_best_price = min(pos_best_price, price) if pos_best_price > 0 else price
+
+            # SL hit
+            hit_sl = (pos_dir == 1 and price <= pos_sl) or (pos_dir == -1 and price >= pos_sl)
+            # TP hit
+            hit_tp = (pos_dir == 1 and price >= pos_tp) or (pos_dir == -1 and price <= pos_tp)
+            # Time stop
+            hit_time = pos_bars >= time_stop_bars
+
+            if hit_sl or hit_tp or hit_time:
+                reason = "SL" if hit_sl else ("TP" if hit_tp else "TIME_STOP")
+                pnl_pts = (price - pos_entry) * pos_dir
+                pnl_quote = pnl_pts * pos_lots * spec.contract_size
+                pnl_acct = acct.to_account_ccy(pnl_quote, spec.currency_profit)
+                equity += pnl_acct
+                equity_curve.append(equity)
+                trades.append({
+                    "entry": pos_entry, "exit": price, "dir": pos_dir,
+                    "lots": pos_lots, "pnl": pnl_acct, "bars": pos_bars,
+                    "grade": pos_grade, "reason": reason, "r": cur_r,
+                })
+                pos_dir = 0
+                continue
+
+            # C-grade trailing (same as live)
+            if pos_grade == 'C' and pos_trail_active and atr > 0:
+                trail_dist = max(0.5 * atr, 0.3 * r_unit)
+                if pos_dir == 1:
+                    new_trail = pos_best_price - trail_dist
+                    if new_trail > pos_sl:
+                        pos_sl = new_trail
+                else:
+                    new_trail = pos_best_price + trail_dist
+                    if new_trail < pos_sl:
+                        pos_sl = new_trail
+
+            # Activate C-grade trailing at 0.3R
+            if pos_grade == 'C' and not pos_trail_active and cur_r >= 0.3:
+                pos_trail_active = True
+                pos_sl = pos_entry + pos_dir * 0.1 * r_unit
+
+        # Evaluate signal (same as live)
+        try:
+            sig = _evaluate_row(i, row, cfg, state)
+        except Exception:
+            sig = None
+
+        if sig is not None:
+            n_signals += 1
+            side = "LONG" if sig.direction == 1 else "SHORT"
+            setup = getattr(sig, 'setup_kind', 'RETEST_OB')
+            zone_id = sig.ob_tf or (f"fvg{sig.fvg_top:.0f}" if sig.fvg_top else "-")
+            key = f"{sig.time.isoformat()}|{sig.direction}|{sig.grade}|{setup}|{zone_id}"
+
+            if key not in signals_fired:
+                # Netting: close opposite
+                if pos_dir != 0 and pos_dir == -sig.direction:
+                    pnl_pts = (price - pos_entry) * pos_dir
+                    pnl_quote = pnl_pts * pos_lots * spec.contract_size
+                    pnl_acct = acct.to_account_ccy(pnl_quote, spec.currency_profit)
+                    equity += pnl_acct
+                    equity_curve.append(equity)
+                    trades.append({
+                        "entry": pos_entry, "exit": price, "dir": pos_dir,
+                        "lots": pos_lots, "pnl": pnl_acct, "bars": pos_bars,
+                        "grade": pos_grade, "reason": "NETTING_FLIP", "r": 0,
+                    })
+                    pos_dir = 0
+
+                # Enter if flat
+                if pos_dir == 0:
+                    risk_per_unit = abs(price - float(sig.stop))
+                    if risk_per_unit > 0:
+                        lots = 0.01 if sig.grade == 'C' else working_lot
+                        sl = float(sig.stop)
+                        # Enforce min SL distance
+                        min_dist = max(spec.point * 500, 0.75 * atr) if atr > 0 else spec.point * 500
+                        sl_dist = abs(price - sl)
+                        if sl_dist < min_dist:
+                            sl = price - sig.direction * min_dist
+                            risk_per_unit = abs(price - sl)
+
+                        tp = price + sig.direction * cfg.exits.tp1_r * risk_per_unit
+                        pos_dir = sig.direction
+                        pos_entry = price
+                        pos_sl = sl
+                        pos_tp = tp
+                        pos_lots = lots
+                        pos_bars = 0
+                        pos_grade = sig.grade
+                        pos_risk_per_unit = risk_per_unit
+                        pos_best_price = price
+                        pos_trail_active = False
+                        signals_fired.add(key)
+
+    # Close any remaining position
+    if pos_dir != 0:
+        price = float(df.iloc[-1].get("close", 0.0))
+        pnl_pts = (price - pos_entry) * pos_dir
+        pnl_quote = pnl_pts * pos_lots * spec.contract_size
+        pnl_acct = acct.to_account_ccy(pnl_quote, spec.currency_profit)
+        equity += pnl_acct
+        trades.append({
+            "entry": pos_entry, "exit": price, "dir": pos_dir,
+            "lots": pos_lots, "pnl": pnl_acct, "bars": pos_bars,
+            "grade": pos_grade, "reason": "END", "r": 0,
+        })
+
+    elapsed = time.time() - t0
+
+    # Results
+    console.print(f"\n{'='*60}")
+    console.print(f"[bold green]BACKTEST RESULTS[/bold green] ({elapsed:.1f}s)")
+    console.print(f"{'='*60}")
+
+    if not trades:
+        console.print("[yellow]No trades taken[/yellow]")
+        return
+
+    tdf = pd.DataFrame(trades)
+    wins = tdf[tdf["pnl"] > 0]
+    losses = tdf[tdf["pnl"] <= 0]
+    total_pnl = tdf["pnl"].sum()
+    win_rate = len(wins) / len(tdf) if len(tdf) > 0 else 0
+    avg_win = wins["pnl"].mean() if len(wins) > 0 else 0
+    avg_loss = losses["pnl"].mean() if len(losses) > 0 else 0
+    pf = abs(wins["pnl"].sum() / losses["pnl"].sum()) if len(losses) > 0 and losses["pnl"].sum() != 0 else float("inf")
+
+    # Sharpe
+    returns = tdf["pnl"].values / equity
+    sharpe = np.mean(returns) / max(np.std(returns), 1e-9) * np.sqrt(252 * 24) if len(returns) > 1 else 0
+
+    # Max drawdown
+    ec = np.array(equity_curve)
+    peak = np.maximum.accumulate(ec)
+    dd = (peak - ec) / peak
+    max_dd = float(np.max(dd))
+
+    console.print(f"  Signals:     {n_signals}")
+    console.print(f"  Trades:      {len(tdf)}")
+    console.print(f"  Win Rate:    {win_rate:.1%} ({len(wins)}W/{len(losses)}L)")
+    console.print(f"  Avg Win:     {avg_win:+.2f}")
+    console.print(f"  Avg Loss:    {avg_loss:+.2f}")
+    console.print(f"  Profit Fac:  {pf:.2f}")
+    console.print(f"  Sharpe:      {sharpe:.2f}")
+    console.print(f"  Total P&L:   {total_pnl:+.2f} ZAR")
+    console.print(f"  Return:      {(equity - acct.starting_equity) / acct.starting_equity:.1%}")
+    console.print(f"  Max DD:      {max_dd:.1%}")
+    console.print(f"  Final Equity:{equity:.2f} ZAR")
+
+    # By grade
+    if "grade" in tdf.columns:
+        console.print(f"\n  [bold]By Grade:[/bold]")
+        for grade, gdf in tdf.groupby("grade"):
+            gw = gdf[gdf["pnl"] > 0]
+            gl = gdf[gdf["pnl"] <= 0]
+            g_wr = len(gw) / len(gdf) if len(gdf) > 0 else 0
+            g_pf = abs(gw["pnl"].sum() / gl["pnl"].sum()) if len(gl) > 0 and gl["pnl"].sum() != 0 else float("inf")
+            console.print(f"    {grade}: n={len(gdf)} wr={g_wr:.0%} pf={g_pf:.2f} pnl={gdf['pnl'].sum():+.0f}")
+
+    # Save
+    out_dir = Path(output)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tdf.to_parquet(out_dir / "trades.parquet", index=False)
+    with open(out_dir / "metrics.json", "w") as f:
+        json.dump({
+            "n_trades": len(tdf), "win_rate": win_rate, "profit_factor": pf,
+            "sharpe": sharpe, "total_pnl": total_pnl, "max_drawdown": max_dd,
+            "avg_win": avg_win, "avg_loss": avg_loss, "final_equity": equity,
+        }, f, indent=2)
+    console.print(f"\n  Saved: {output}/trades.parquet, {output}/metrics.json")
 
 
-# --------------------------------------------------------------------------- #
-# live (real-money / dry-run Layer 5 trading loop)
-# --------------------------------------------------------------------------- #
-@app.command("live")
-def live_cmd(
-    raw_symbol: str = typer.Option("XAUUSDm", "--symbol"),
+# ---------------------------------------------------------------------------
+# live — Real-time trading
+# ---------------------------------------------------------------------------
+@app.command()
+def live(
+    symbol: str = typer.Option("XAUUSDm", "--symbol", "-s"),
     host: str = typer.Option("127.0.0.1", "--host"),
     port: int = typer.Option(18812, "--port"),
-    live: bool = typer.Option(False, "--live", help="Actually send orders (default: dry-run)."),
-    risk_cap: float = typer.Option(0.01, "--risk-cap", help="Max risk per trade as fraction of equity."),
-    working_lot: float = typer.Option(0.04, "--working-lot", help="Working lot size for dynamic sizing."),
+    live_mode: bool = typer.Option(False, "--live", help="Send real orders (default: dry-run)"),
+    risk_cap: float = typer.Option(0.05, "--risk-cap"),
+    working_lot: float = typer.Option(0.04, "--working-lot"),
     max_open: int = typer.Option(3, "--max-open"),
     usd_zar: float = typer.Option(18.5, "--usd-zar"),
     leverage: int = typer.Option(2000, "--leverage"),
-    verbose: bool = typer.Option(False, "--verbose",
-                                 help="Dump zone/trigger state every 5 cycles and show signal rejections."),
-    unrestricted: bool = typer.Option(False, "--all",
-                                      help="Disable persona gating: emit ALL signals (long+short, all grades, "
-                                           "H1+M15+M5 OBs+FVGs, C-grades, Asian+off-hours) for pre-RL diagnostics."),
+    verbose: bool = typer.Option(False, "--verbose"),
+    unrestricted: bool = typer.Option(False, "--all"),
 ):
-    """Run the live trading loop. Default: v0.9.14 champion persona (long-only A+/A/B RETEST_OB).
+    """Run live trading loop (dry-run or real money).
 
-    Use --all to fire EVERY setup the engine sees — longs AND shorts, all
-    grades, all sessions, ALL 4 setup kinds (RETEST_OB, RETEST_FVG, LIQ_SWEEP,
-    BOS_CONT). Run unrestricted first so we can see money-printing liquidity
-    grabs and momentum bursts before Layer 6 RL learns which to filter.
+    Connects to MT5 via RPyC bridge, processes M1 bars in real-time,
+    and executes trades using the same signal pipeline as backtest.
+
+    Example:
+        slytrade live --symbol XAUUSDm --risk-cap 0.05 --working-lot 0.04 --max-open 3 --all --verbose --live
     """
-    from slytrade.live.trader import (
-        AccountSpec,
-        LiveTrader,
-        champion_persona,
-        connect_mt5,
-        resolve_symbol_spec,
-        rl_training_persona,
-    )
-    persona_label = "SCALPER-UNRESTRICTED (long+short, all 4 setups)" if unrestricted else "v0.9.14 champion (long-only A+/A/B RETEST_OB)"
-    console.print(f"[bold]SlyTrade LIVE v0.9.15.23[/bold] symbol={raw_symbol} live={live} "
-                  f"risk_cap={risk_cap*100:.1f}% working_lot={working_lot} persona={persona_label} verbose={verbose}")
+    from .backtest.specs import AccountSpec
+    from .live.trader import LiveTrader, connect_mt5, resolve_symbol_spec
+    from .strategy.config import champion_persona, rl_training_persona
+
+    console.print(f"[bold]SlyTrade LIVE v{VERSION}[/bold] symbol={symbol} live={live_mode}")
     mt5 = connect_mt5(host, port)
 
     def _to_dict(o):
-        if o is None:
-            return {}
-        if isinstance(o, dict):
-            return o
-        try:
-            return o._asdict()
-        except Exception:
-            return {k: getattr(o, k) for k in dir(o) if not k.startswith("_")}
+        if o is None: return {}
+        if isinstance(o, dict): return o
+        try: return o._asdict()
+        except Exception: return {k: getattr(o, k) for k in dir(o) if not k.startswith("_")}
 
     acc = _to_dict(mt5.account_info())
     console.print(f"  login={acc.get('login')} server={acc.get('server')} "
                   f"balance={acc.get('balance')} equity={acc.get('equity')} {acc.get('currency')}")
-    resolved, spec, stop_level_pts = resolve_symbol_spec(mt5, raw_symbol, str(acc.get("currency","ZAR")), usd_zar)
+    resolved, spec, stop_level_pts = resolve_symbol_spec(mt5, symbol, str(acc.get("currency", "ZAR")), usd_zar)
     console.print(f"  symbol={resolved} point={spec.point} digits={spec.digits} "
-                  f"contract={spec.contract_size} vol_min={spec.volume_min} "
-                  f"stop_level={stop_level_pts}pts")
+                  f"contract={spec.contract_size} vol_min={spec.volume_min} stop_level={stop_level_pts}pts")
+
     acct_spec = AccountSpec(
         starting_equity=float(acc.get("equity", 1000)),
         currency=str(acc.get("currency", "ZAR")),
         leverage=int(acc.get("leverage", leverage)),
-        fx_to_account={"USD": usd_zar} if str(acc.get("currency","ZAR")) != "USD" else {"USD": 1.0},
+        fx_to_account={"USD": usd_zar} if str(acc.get("currency", "ZAR")) != "USD" else {"USD": 1.0},
     )
     cfg = rl_training_persona() if unrestricted else champion_persona()
-    max_open_eff = max_open  # v0.9.15.16: respect user's --max-open even in unrestricted mode
     trader = LiveTrader(
         mt5=mt5, symbol=resolved, spec=spec, cfg=cfg, acct=acct_spec,
-        live=live, risk_cap=risk_cap, working_lot=working_lot, max_open=max_open_eff,
-        verbose=verbose, stop_level_pts=stop_level_pts,
+        live=live_mode, risk_cap=risk_cap, working_lot=working_lot,
+        max_open=max_open, verbose=verbose, stop_level_pts=stop_level_pts,
     )
     try:
         trader.run()
     finally:
         mt5.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# doctor — Health check
+# ---------------------------------------------------------------------------
+@app.command()
+def doctor():
+    """Check dependencies and environment."""
+    table = Table(title=f"SlyTrade Doctor v{VERSION}")
+    table.add_column("Check")
+    table.add_column("Status")
+
+    for mod in ["numpy", "pandas", "pyarrow", "pydantic", "typer", "rich"]:
+        table.add_row(f"required:{mod}", "OK" if importlib.util.find_spec(mod) else "[red]MISSING[/red]")
+    for mod in ["mt5linux", "gymnasium", "stable_baselines3", "torch", "optuna"]:
+        table.add_row(f"optional:{mod}", "OK" if importlib.util.find_spec(mod) else "not installed")
+    for p in ["data/raw", "data/processed", "models"]:
+        try:
+            Path(p).mkdir(parents=True, exist_ok=True)
+            probe = Path(p) / ".w"
+            probe.write_text("ok")
+            probe.unlink()
+            table.add_row(f"dir:{p}", "[green]OK[/green]")
+        except OSError as e:
+            table.add_row(f"dir:{p}", f"[red]{e}[/red]")
+    console.print(table)
 
 
 if __name__ == "__main__":
