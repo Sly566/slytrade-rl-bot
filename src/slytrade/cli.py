@@ -26,7 +26,7 @@ VERSION = "1.0.0"
 
 
 # ---------------------------------------------------------------------------
-# collect — Hybrid MT5 + Exness data collection
+# collect — MT5 bars (full period) + ticks hybrid
 # ---------------------------------------------------------------------------
 @app.command()
 def collect(
@@ -38,18 +38,18 @@ def collect(
     port: int = typer.Option(18812, "--port", help="MT5 bridge port"),
     clean: bool = typer.Option(False, "--clean", help="Remove existing data first"),
 ):
-    """Collect per-TF bars: MT5 (current year) + Exness archive (older data).
+    """Collect per-TF bars from MT5 (full period) + ticks hybrid (MT5 + Exness).
 
-    Hybrid collection strategy:
-    1. MT5 bridge: collect per-TF bars for current year (fast, direct)
-    2. Exness archive: collect ticks for older periods, aggregate to M1
-    3. Already present data is SKIPPED (safe to re-run)
+    Collection strategy:
+    - BARS: ALL timeframes from MT5 for the FULL period (5 years)
+    - TICKS: MT5 for current year, Exness archive for older periods
+    - Already present data is SKIPPED (safe to re-run)
 
     Example:
         slytrade collect --symbol XAUUSDm --years 5
     """
     from .data.exness_archive import ExnessArchiveDownloader
-    from .data.mt5_collectors import MT5BarCollector
+    from .data.mt5_collectors import MT5BarCollector, MT5TickCollector
     from .data.storage import MarketDataStorage
 
     console.print(f"[bold]SlyTrade COLLECT v{VERSION}[/bold] symbol={symbol} years={years}")
@@ -71,45 +71,56 @@ def collect(
     storage = MarketDataStorage(root=out_dir)
     total_rows = 0
 
-    # Phase 1: MT5 bars (current year, fast)
-    console.print(f"\n  [bold]Phase 1: MT5 bars (current year)[/bold]")
+    # Connect to MT5
+    console.print(f"\n  [bold]Connecting to MT5...[/bold]")
     try:
         from .live.trader import connect_mt5
         mt5 = connect_mt5(host, port)
         console.print("  MT5 bridge connected")
-
-        mt5_start = datetime(end.year, 1, 1, tzinfo=UTC)
-        collector = MT5BarCollector(mt5, storage)
-
-        for tf in tfs:
-            console.print(f"    Collecting {tf} from MT5 ({mt5_start.strftime('%Y-%m-%d')} to {end.strftime('%Y-%m-%d')})...")
-            result = collector.collect(symbol, tf, mt5_start, end)
-            total_rows += result.rows
-            if result.rows > 0:
-                console.print(f"      {tf}: {result.rows:,} rows, {result.file_count} files")
-            else:
-                console.print(f"      {tf}: no new data")
-
-        mt5.shutdown()
     except Exception as e:
-        console.print(f"  [yellow]MT5 not available ({e}) — skipping MT5 phase[/yellow]")
+        console.print(f"  [red]MT5 connection failed: {e}[/red]")
+        console.print(f"  [yellow]Start MT5 bridge: bash start_mt5_bridge.sh[/yellow]")
+        raise typer.Exit(1)
 
-    # Phase 2: Exness archive (older data)
-    console.print(f"\n  [bold]Phase 2: Exness archive (older data)[/bold]")
-    exness_start = start
-    exness_end = datetime(end.year, 1, 1, tzinfo=UTC)
+    # Phase 1: ALL bars from MT5 for FULL period
+    console.print(f"\n  [bold]Phase 1: Bars from MT5 (full {years:.0f} years)[/bold]")
+    bar_collector = MT5BarCollector(mt5, storage)
 
-    if exness_start < exness_end:
-        console.print(f"  Downloading ticks from {exness_start.strftime('%Y-%m-%d')} to {exness_end.strftime('%Y-%m-%d')}...")
-        dl = ExnessArchiveDownloader(output_dir=str(out_dir / symbol))
-        result = dl.collect(symbol, exness_start, exness_end)
+    for tf in tfs:
+        console.print(f"    Collecting {tf} from MT5 ({start.strftime('%Y-%m-%d')} to {end.strftime('%Y-%m-%d')})...")
+        result = bar_collector.collect(symbol, tf, start, end)
         total_rows += result.rows
-        console.print(f"  Exness: {result.rows:,} rows, {len(result.files)} files")
-        if hasattr(result, 'errors') and result.errors:
-            for err in result.errors[:5]:
-                console.print(f"    [yellow]Warning: {err}[/yellow]")
+        if result.rows > 0:
+            console.print(f"      {tf}: {result.rows:,} rows, {result.file_count} files")
+        else:
+            console.print(f"      {tf}: no new data (already present or empty)")
+
+    # Phase 2: Ticks hybrid — MT5 current year + Exness older
+    console.print(f"\n  [bold]Phase 2: Ticks (hybrid MT5 + Exness)[/bold]")
+    mt5_tick_start = datetime(end.year, 1, 1, tzinfo=UTC)
+
+    # MT5 ticks for current year
+    console.print(f"    MT5 ticks ({mt5_tick_start.strftime('%Y-%m-%d')} to {end.strftime('%Y-%m-%d')})...")
+    tick_collector = MT5TickCollector(mt5, storage)
+    tick_result = tick_collector.collect(symbol, mt5_tick_start, end)
+    total_rows += tick_result.rows
+    if tick_result.rows > 0:
+        console.print(f"      Ticks: {tick_result.rows:,} rows, {tick_result.file_count} files")
     else:
-        console.print(f"  No older data needed (MT5 covers full period)")
+        console.print(f"      Ticks: no new data")
+
+    # Exness ticks for older period
+    if start < mt5_tick_start:
+        console.print(f"    Exness ticks ({start.strftime('%Y-%m-%d')} to {mt5_tick_start.strftime('%Y-%m-%d')})...")
+        dl = ExnessArchiveDownloader(output_dir=str(out_dir / symbol))
+        exness_result = dl.collect(symbol, start, mt5_tick_start)
+        total_rows += exness_result.rows
+        console.print(f"      Exness: {exness_result.rows:,} rows, {len(exness_result.files)} files")
+        if hasattr(exness_result, 'errors') and exness_result.errors:
+            for err in exness_result.errors[:5]:
+                console.print(f"        [yellow]Warning: {err}[/yellow]")
+
+    mt5.shutdown()
 
     # Summary
     console.print(f"\n[green]Collection complete: {total_rows:,} total rows[/green]")
