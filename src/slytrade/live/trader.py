@@ -917,17 +917,28 @@ class LiveTrader:
             self._vlog(f"{side} {setup} blocked by accept_shorts=False"); self._signals_fired.add(key); return
         if sig.direction == 1 and not self.cfg.confluence.accept_longs:
             self._vlog(f"{side} {setup} blocked by accept_longs=False"); self._signals_fired.add(key); return
-        # Single source of truth for open count: _our_open_positions() queries
-        # MT5 directly for all positions with our magic number. v0.9.7 double-
-        # counted by adding len(_trades) on top — _trades tracks LiveTrade
-        # metadata for positions we opened THIS run, all of which are already
-        # in the MT5 query. Orphan positions from prior bot runs that are not
-        # in _trades ARE still in the MT5 query, so this correctly caps total
-        # exposure (orphans count against max_open until they close broker-side).
-        open_n = len(self._our_open_positions())
-        if open_n >= self.max_open:
-            self._vlog(f"{side} {setup}/{sig.grade} rejected: max_open={self.max_open} reached (open={open_n})")
-            return
+
+        # --- Netting mode: one position, one direction at a time ---
+        # Close any opposite-direction positions before opening new one.
+        # Skip if we already have a same-direction position open.
+        our_positions = self._our_open_positions()
+        for tkt, pos in list(our_positions.items()):
+            pos_dir = 1 if int(pos.get("type", 0)) == 0 else -1
+            if pos_dir == -sig.direction:
+                # Opposite direction — close it to flip
+                lt = self._trades.get(tkt)
+                reason = "NETTING_FLIP"
+                print(f"    [NETTING] closing {'LONG' if pos_dir==1 else 'SHORT'} ticket={tkt} to open {side}")
+                self._close_position(tkt, reason)
+                if lt:
+                    lt.closed = True
+                    lt.close_reason = reason
+                our_positions.pop(tkt, None)
+            elif pos_dir == sig.direction:
+                # Same direction already open — skip (netting: one position only)
+                self._vlog(f"{side} {setup}/{sig.grade} skipped: already have {'LONG' if pos_dir==1 else 'SHORT'} open")
+                self._signals_fired.add(key)
+                return
         equity = self.equity()
         bid, ask = self.quote()
         entry_approx = ask if sig.direction == 1 else bid
