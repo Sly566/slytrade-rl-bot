@@ -1077,29 +1077,7 @@ class LiveTrader:
                     to_close.append((ticket, "SL"))
                     continue
                 # Hybrid ladder: TP1 → partial close + BE
-                # v0.9.15.17: C grades skip TP1/TP2 — trail from start
-                if lt.grade == 'C':
-                    # C-grade trailing: 0.5 ATR trail from entry, no partials
-                    if atr > 0:
-                        trail_dist = 0.5 * atr
-                        if lt.direction == 1:
-                            new_trail = price - trail_dist
-                            if new_trail > lt.sl:
-                                lt.sl = new_trail
-                        else:
-                            new_trail = price + trail_dist
-                            if new_trail < lt.sl:
-                                lt.sl = new_trail
-                    # M5 CHoCH kill for C grades
-                    if latest_m1_row is not None:
-                        m5_choch = (
-                            (lt.direction == 1 and bool(latest_m1_row.get("M5_minor_choch_dn", False))) or
-                            (lt.direction == -1 and bool(latest_m1_row.get("M5_minor_choch_up", False)))
-                        )
-                        if m5_choch:
-                            to_close.append((ticket, "M5_CHOCH_C"))
-                            continue
-                elif not lt.tp1_hit:
+                if not lt.tp1_hit:
                     hit_tp1 = (lt.direction == 1 and price >= lt.tp) or (lt.direction == -1 and price <= lt.tp)
                     if hit_tp1:
                         lt.tp1_hit = True
@@ -1199,31 +1177,7 @@ class LiveTrader:
                     continue
 
                 # TP1 → partial close 50% + move SL to BE
-                # v0.9.15.17: C grades skip TP1/TP2 — trail from start
-                if lt.grade == 'C':
-                    # C-grade trailing: 0.5 ATR trail from entry, no partials
-                    if atr > 0:
-                        trail_dist = 0.5 * atr
-                        if lt.direction == 1:
-                            new_trail = price - trail_dist
-                            if new_trail > lt.sl:
-                                lt.sl = new_trail
-                                self._modify_sl(ticket, lt.sl)
-                        else:
-                            new_trail = price + trail_dist
-                            if new_trail < lt.sl:
-                                lt.sl = new_trail
-                                self._modify_sl(ticket, lt.sl)
-                    # M5 CHoCH kill for C grades
-                    if latest_m1_row is not None:
-                        m5_choch = (
-                            (lt.direction == 1 and bool(latest_m1_row.get("M5_minor_choch_dn", False))) or
-                            (lt.direction == -1 and bool(latest_m1_row.get("M5_minor_choch_up", False)))
-                        )
-                        if m5_choch:
-                            to_close.append((ticket, "M5_CHOCH_C"))
-                            continue
-                elif not lt.tp1_hit:
+                if not lt.tp1_hit:
                     hit_tp1 = (lt.direction == 1 and price >= lt.tp) or (lt.direction == -1 and price <= lt.tp)
                     if hit_tp1:
                         lt.tp1_hit = True
