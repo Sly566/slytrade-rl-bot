@@ -882,6 +882,197 @@ def process_bars(
     _add_fvgs(out)
     _add_liquidity_sweeps(out)
     _add_premium_discount(out)
+    # v1.0: ICT/SMC concepts
+    _add_silver_bullet(out)
+    _add_power_of_3(out)
+    _add_judas_swing(out)
+    _add_consequent_encroachment(out)
     if progress:
         progress(f"    {timeframe}: done ({len(out):,} rows, {len(out.columns)} cols)")
     return out
+
+
+# --------------------------------------------------------------------------- #
+# v1.0: ICT/SMC concepts — Silver Bullet, Power of 3, Judas Swing, CE
+# --------------------------------------------------------------------------- #
+
+def _add_silver_bullet(df: pd.DataFrame) -> None:
+    """Add Silver Bullet time windows (ICT 2022 Mentorship).
+
+    Silver Bullet windows are high-probability entry zones:
+    - London Silver Bullet: 03:00-05:00 EST (08:00-10:00 UTC)
+    - NY Silver Bullet: 10:00-12:00 EST (15:00-17:00 UTC)
+    - AM Silver Bullet: 02:00-04:00 EST (07:00-09:00 UTC) — overlap
+
+    During these windows, ICT says institutional algorithms drive price
+    to sweep liquidity before the real move. Entries during these windows
+    have higher probability of success.
+    """
+    ts = df["time"].dt
+    h = ts.hour.astype(np.int32)
+    m = ts.minute.astype(np.int32)
+    hm = h * 60 + m
+
+    # London Silver Bullet: 08:00-10:00 UTC
+    df["silver_bullet_london"] = ((hm >= 480) & (hm < 600)).astype(bool)
+    # NY Silver Bullet: 15:00-17:00 UTC
+    df["silver_bullet_ny"] = ((hm >= 900) & (hm < 1020)).astype(bool)
+    # Any Silver Bullet window
+    df["in_silver_bullet"] = (df["silver_bullet_london"] | df["silver_bullet_ny"]).astype(bool)
+
+
+def _add_power_of_3(df: pd.DataFrame) -> None:
+    """Add Power of 3 (AMD) cycle detection per session.
+
+    ICT's Power of 3: Accumulation → Manipulation → Distribution
+    - Accumulation: price consolidates in a range (low volatility)
+    - Manipulation: price sweeps one side of the range (liquidity grab)
+    - Distribution: price reverses and moves to the other side (real move)
+
+    We detect this by tracking the session range and identifying:
+    - Asian range (consolidation)
+    - London/NY sweep of Asian high/low (manipulation)
+    - Reversal after sweep (distribution)
+    """
+    ts = df["time"].dt
+    h = ts.hour.astype(np.int32)
+    hm = h * 60 + ts.minute.astype(np.int32)
+
+    # Track Asian range high/low (00:00-08:00 UTC)
+    is_asian = hm < 480  # before London open
+    is_london = (hm >= 480) & (hm < 780)  # 08:00-13:00 UTC
+    is_ny = (hm >= 780) & (hm < 1020)  # 13:00-17:00 UTC
+
+    # Rolling Asian range (using expanding window within each day)
+    df["_asian_hi"] = np.where(is_asian, df["high"], np.nan)
+    df["_asian_lo"] = np.where(is_asian, df["low"], np.nan)
+
+    # Forward-fill Asian range to London/NY sessions
+    df["_asian_hi"] = df["_asian_hi"].ffill()
+    df["_asian_lo"] = df["_asian_lo"].ffill()
+
+    # Detect sweep of Asian range during London/NY
+    asian_hi = df["_asian_hi"].values
+    asian_lo = df["_asian_lo"].values
+    close = df["close"].values
+    high = df["high"].values
+    low = df["low"].values
+
+    # Sweep high: price trades above Asian high then closes below
+    sweep_asian_high = (high > asian_hi) & (close < asian_hi) & (is_london | is_ny)
+    # Sweep low: price trades below Asian low then closes above
+    sweep_asian_low = (low < asian_lo) & (close > asian_lo) & (is_london | is_ny)
+
+    df["pow3_sweep_high"] = sweep_asian_high.astype(bool)
+    df["pow3_sweep_low"] = sweep_asian_low.astype(bool)
+    df["in_pow3_manipulation"] = (sweep_asian_high | sweep_asian_low).astype(bool)
+
+    # Clean up temp columns
+    df.drop(columns=["_asian_hi", "_asian_lo"], inplace=True, errors="ignore")
+
+
+def _add_judas_swing(df: pd.DataFrame) -> None:
+    """Add Judas Swing detection.
+
+    ICT's Judas Swing: a fake move at session open that traps traders
+    before the real move in the opposite direction.
+
+    Detection:
+    - At London open (08:00 UTC): if price moves UP in first 30min then
+      reverses DOWN = bearish Judas (trap longs)
+    - At London open: if price moves DOWN in first 30min then reverses
+      UP = bullish Judas (trap shorts)
+    - Same pattern at NY open (13:30 UTC)
+
+    We detect this by comparing the first 30min direction with the
+    subsequent 30min direction.
+    """
+    ts = df["time"].dt
+    h = ts.hour.astype(np.int32)
+    m = ts.minute.astype(np.int32)
+    hm = h * 60 + m
+
+    close = df["close"].values
+    open_ = df["open"].values
+
+    # London Judas: first 30min (08:00-08:30) vs next 30min (08:30-09:00)
+    in_lon_first30 = (hm >= 480) & (hm < 510)
+    in_lon_next30 = (hm >= 510) & (hm < 540)
+
+    # NY Judas: first 30min (13:30-14:00) vs next 30min (14:00-14:30)
+    in_ny_first30 = (hm >= 810) & (hm < 840)
+    in_ny_next30 = (hm >= 840) & (hm < 870)
+
+    # Direction of first 30min candle
+    first30_dir = np.where(close > open_, 1, np.where(close < open_, -1, 0))
+
+    # Judas = first30 direction opposite to subsequent move
+    # We flag bars in the "next 30min" if they reverse the first30 move
+    judas_bull = np.zeros(len(df), dtype=bool)
+    judas_bear = np.zeros(len(df), dtype=bool)
+
+    # Simple heuristic: if first30 was bearish and next30 is bullish = bullish Judas
+    # This is a simplified version — full implementation would track the actual
+    # first30 range and detect the sweep+reversal
+    for i in range(1, len(df)):
+        if in_lon_next30[i] or in_ny_next30[i]:
+            # Look back to find the first30 candle
+            for j in range(i-1, max(0, i-10), -1):
+                if in_lon_first30[j] or in_ny_first30[j]:
+                    if first30_dir[j] == -1 and close[i] > open_[i]:
+                        judas_bull[i] = True  # Bullish Judas (trapped shorts)
+                    elif first30_dir[j] == 1 and close[i] < open_[i]:
+                        judas_bear[i] = True  # Bearish Judas (trapped longs)
+                    break
+
+    df["judas_bull"] = judas_bull
+    df["judas_bear"] = judas_bear
+    df["in_judas_swing"] = (judas_bull | judas_bear).astype(bool)
+
+
+def _add_consequent_encroachment(df: pd.DataFrame) -> None:
+    """Add Consequent Encroachment (CE) — 50% midpoint of FVGs.
+
+    ICT says the 50% level of a Fair Value Gap is a high-probability
+    reaction zone. When price returns to the CE, it often bounces.
+
+    For each active FVG:
+    - CE = (top + bottom) / 2
+    - Track distance from current price to nearest CE
+    """
+    close = df["close"].values
+
+    # Bull FVG CE
+    bull_fvg_top = df.get("bull_fvg_top", pd.Series(np.nan, index=df.index)).values
+    bull_fvg_bot = df.get("bull_fvg_bottom", pd.Series(np.nan, index=df.index)).values
+    bull_ce = np.where(
+        ~np.isnan(bull_fvg_top) & ~np.isnan(bull_fvg_bot),
+        (bull_fvg_top + bull_fvg_bot) / 2.0,
+        np.nan,
+    )
+
+    # Bear FVG CE
+    bear_fvg_top = df.get("bear_fvg_top", pd.Series(np.nan, index=df.index)).values
+    bear_fvg_bot = df.get("bear_fvg_bottom", pd.Series(np.nan, index=df.index)).values
+    bear_ce = np.where(
+        ~np.isnan(bear_fvg_top) & ~np.isnan(bear_fvg_bot),
+        (bear_fvg_top + bear_fvg_bot) / 2.0,
+        np.nan,
+    )
+
+    df["bull_ce"] = bull_ce
+    df["bear_ce"] = bear_ce
+
+    # Distance to nearest CE (normalized by ATR)
+    atr = df.get("atr_14", pd.Series(1.0, index=df.index)).values
+    atr = np.where(np.isnan(atr) | (atr <= 0), 1.0, atr)
+
+    dist_bull_ce = np.abs(close - bull_ce) / atr
+    dist_bear_ce = np.abs(close - bear_ce) / atr
+
+    df["dist_to_bull_ce"] = dist_bull_ce
+    df["dist_to_bear_ce"] = dist_bear_ce
+
+    # Price is at CE if within 0.3 ATR
+    df["at_bull_ce"] = (dist_bull_ce < 0.3).astype(bool)
+    df["at_bear_ce"] = (dist_bear_ce < 0.3).astype(bool)
