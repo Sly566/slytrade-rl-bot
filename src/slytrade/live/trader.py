@@ -1,4 +1,4 @@
-"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.15.12 hybrid-ladder persona.
+"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.15.13 hybrid-ladder persona.
 
 Connects to MT5 via the mt5linux RPyC bridge (run `bash start_mt5_bridge.sh`
 in another terminal first), pulls multi-timeframe bars, computes Layer 2
@@ -1462,6 +1462,28 @@ class LiveTrader:
                     flags.append(col.replace("M5_", "").replace("M15_", "M15:"))
             if flags:
                 print(f"  [latest M1 bar flags] {', '.join(flags)}")
+            # v0.9.15.13: M1 structure alignment diagnostic
+            m1_struct: list[str] = []
+            for col in ("bull_disp", "bear_disp",
+                        "minor_bos_up", "minor_bos_dn",
+                        "minor_choch_up", "minor_choch_dn",
+                        "major_bos_up", "major_bos_dn",
+                        "major_choch_up", "major_choch_dn",
+                        "bull_liq_sweep", "bear_liq_sweep"):
+                if col in aligned.columns and bool(lb.get(col, False)):
+                    m1_struct.append(col)
+            if m1_struct:
+                print(f"  [M1 structure] {', '.join(m1_struct)}")
+            # Show trigger timestamps for MSS alignment check
+            for trig, label in [('_last_bull_trigger', 'bull_trig'), ('_last_bear_trigger', 'bear_trig'),
+                                ('_last_bull_sweep_ts', 'bull_sweep'), ('_last_bear_sweep_ts', 'bear_sweep')]:
+                ts = self._state.get(trig)
+                if ts is not None:
+                    try:
+                        age_s = (pd.Timestamp.now(tz=UTC) - pd.Timestamp(ts, tz=UTC)).total_seconds()
+                        print(f"  [state] {label}={pd.Timestamp(ts).strftime('%H:%M:%S')} age={age_s/60:.0f}m")
+                    except Exception:
+                        pass
 
         latest = aligned.iloc[-1]
         self._monitor_positions(latest, new_bar=True)
@@ -1545,8 +1567,8 @@ class LiveTrader:
 
     # ------------------------------------------------------------------ #
     def run(self) -> None:
-        persona_label = "v0.9.15.12 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.15.12 champion (long-only A+/A/B hybrid ladder)"
-        print(f"SlyTrade LIVE v0.9.15.12  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  working_lot={self.working_lot}  max_open={self.max_open}")
+        persona_label = "v0.9.15.13 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.15.13 champion (long-only A+/A/B hybrid ladder)"
+        print(f"SlyTrade LIVE v0.9.15.13  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  working_lot={self.working_lot}  max_open={self.max_open}")
         print(f"persona: {persona_label}")
         print("setups : RETEST_OB RETEST_FVG LIQ_SWEEP BOS_CONT DISP_TRAP BREAKER  (champion gates apply unless --all)")
         print(f"Magic={MAGIC}")
@@ -1643,7 +1665,7 @@ class LiveTrader:
 # --------------------------------------------------------------------------- #
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="SlyTrade v0.9.15.12 SCALPER LIVE trader (10s real-time polling + 5s bar lag + massive lookback windows + ATR-adaptive proximity gate + ATR-adaptive retest window + bridge diagnostics + smoke test + hardcoded MT5 constants + dynamic BOS_CONT freshness + hybrid ladder + all filling modes)")
+    ap = argparse.ArgumentParser(description="SlyTrade v0.9.15.13 SCALPER LIVE trader (10s real-time polling + 5s bar lag + massive lookback windows + ATR-adaptive proximity gate + ATR-adaptive retest window + bridge diagnostics + smoke test + hardcoded MT5 constants + dynamic BOS_CONT freshness + hybrid ladder + all filling modes)")
     ap.add_argument("--symbol", default="XAUUSDm")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=18812)
@@ -1679,7 +1701,7 @@ def main() -> None:
         fx_to_account={"USD": args.usd_zar} if str(acc.get("currency","ZAR")) != "USD" else {"USD": 1.0},
     )
     cfg = rl_training_persona() if args.unrestricted else champion_persona()
-    max_open_eff = args.max_open  # v0.9.15.12: respect user's --max-open even in unrestricted mode
+    max_open_eff = args.max_open  # v0.9.15.13: respect user's --max-open even in unrestricted mode
     print(f"  verbose       : {args.verbose}")
     print(f"  risk_cap      : {args.risk_cap*100:.1f}% per trade")
     print(f"  working_lot   : {args.working_lot}")

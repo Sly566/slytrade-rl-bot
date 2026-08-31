@@ -1,4 +1,4 @@
-"""Layer 4 — ICT/SMC scalper signal engine (v0.9.15.12).
+"""Layer 4 — ICT/SMC scalper signal engine (v0.9.15.13).
 
 Produces strictly-causal entry signals from the M1-aligned frame. Each signal
 carries: direction, entry price, stop loss, take-profit ladder, setup grade,
@@ -703,13 +703,18 @@ def _evaluate_row(i: int,
         # are the primary signal after a liquidity grab) were silently
         # skipped -- added them here so a fresh sweep+CHoCH reversal fires.
         #
-        # v0.9.15.12: In unrestricted mode, the sweep itself is sufficient
-        # confirmation.  The sweep IS the signal -- sell-side liquidity was
-        # taken, reversal is the thesis.  Requiring displacement on the SAME
-        # bar blocks legitimate sweeps when the next bar has opposing momentum
-        # (e.g. bull sweep at 21:09, bear disp at 21:10 -> bot entered SHORT
-        # instead of LONG on the sweep).  Displacement is now a bonus tag,
-        # not a gate, in unrestricted mode.
+        # v0.9.15.13: ICT Silver Bullet requires sweep + MSS + entry.
+        # The sweep alone is NOT sufficient -- we need a Market Structure
+        # Shift (M1 BOS/CHoCH in the reversal direction) to confirm the
+        # stop-run actually reversed.  Without MSS, a bear sweep in a
+        # bullish M1 trend is just buyside liquidity being taken before
+        # continuation higher (Cameron's Model: stop-raid toward DOL).
+        #
+        # Two gates in unrestricted mode:
+        #   1. MSS gate: M1 or trigger-TF BOS/CHoCH in reversal direction
+        #      within 5 bars of the sweep (before or after).
+        #   2. Anti-alignment gate: reject if M1 has a FRESH opposing
+        #      displacement on THIS bar (e.g. bull disp while trying SHORT).
         m1_disp = bool(row.get('bull_disp' if direction==1 else 'bear_disp', False))
         tf_disp = bool(row.get(f'{trigger_tf}_{"bull" if direction==1 else "bear"}_disp', False))
         m1_bos = bool(row.get('minor_bos_up' if direction==1 else 'minor_bos_dn', False)) or \
@@ -724,8 +729,32 @@ def _evaluate_row(i: int,
                 if fail_trace is not None:
                     _reject(f"LIQ_SWEEP {side}: no disp/BOS confirmation (champion requires vol_surge)")
                 continue
-        # Unrestricted mode: sweep alone is sufficient -- no additional gate.
-        # Displacement/BOS/CHoCH are bonus tags only.
+        else:
+            # Unrestricted mode: Silver Bullet gate -- sweep + MSS required.
+            # Gate 1: MSS -- need M1/trigger-TF BOS/CHoCH in reversal direction
+            # within 5 bars of the sweep.  This catches the case where sweep
+            # fires at 21:09 and MSS fires at 21:10-21:14.
+            mss_window = pd.Timedelta(minutes=5)
+            if direction == 1:
+                last_reversal_trig = state.get('_last_bull_trigger')
+            else:
+                last_reversal_trig = state.get('_last_bear_trigger')
+            has_mss = False
+            if last_reversal_trig is not None:
+                time_diff = abs((last_reversal_trig - last_sweep_ts).total_seconds())
+                if time_diff <= mss_window.total_seconds():
+                    has_mss = True
+            if not has_mss:
+                if fail_trace is not None:
+                    _reject(f"LIQ_SWEEP {side}: no MSS (BOS/CHoCH in reversal dir) within 5min of sweep")
+                continue
+            # Gate 2: Anti-alignment -- reject if M1 has fresh opposing
+            # displacement on THIS bar.  A bull disp bar while trying to go
+            # SHORT means M1 momentum is against us.
+            opposing_disp = bool(row.get('bear_disp' if direction==1 else 'bull_disp', False))
+            if opposing_disp:
+                if fail_trace is not None:
+                    _reject(f"LIQ_SWEEP {side}: M1 opposing displacement on this bar (anti-alignment)")
                 continue
         # One entry per sweep event (dedupe by timestamp)
         sweep_key = f"_swept_{direction}_{last_sweep_ts.isoformat()}"
