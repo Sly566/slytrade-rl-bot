@@ -433,14 +433,15 @@ class LiveTrader:
         self._best_fill_mode = fill_mode
 
     def _place_market(self, direction: int, lots: float, sl: float, tp: float,
-                      comment: str) -> int | None:
+                      comment: str, *, broker_tp: float = 0.0) -> int | None:
         """Place a market order. Returns ticket or None.
 
-        v0.9.15.2: DON'T set TP on the broker order. The hybrid ladder
-        (TP1 partial close → BE → TP2 → runner) is managed in code via
+        v0.9.15.2: DON'T set TP on the broker order for A/B grades. The hybrid
+        ladder (TP1 partial close → BE → TP2 → runner) is managed in code via
         _partial_close() and _modify_sl(). Setting TP on the broker causes
         the entire position to close at TP1 — the runner never fires.
-        We set tp=0 on the order and store TP targets in LiveTrade.
+
+        v0.9.15.22: C grades use broker_tp (set on broker). Simple SL/TP trade.
         """
         bid, ask = self.quote()
         price = ask if direction == 1 else bid
@@ -471,7 +472,7 @@ class LiveTrader:
                 "type": MT5_ORDER_TYPE_BUY if direction == 1 else MT5_ORDER_TYPE_SELL,
                 "price": price,
                 "sl": round(float(sl), digits),
-                "tp": 0.0,  # v0.9.15.2: no TP on broker — hybrid ladder manages exits
+                "tp": round(float(broker_tp), digits),  # C grades: real TP; A/B: 0.0 (hybrid ladder)
                 "deviation": deviation,
                 "magic": MAGIC,
                 "comment": comment[:31],
@@ -1019,7 +1020,12 @@ class LiveTrader:
         self._vlog(f"{side} {setup}/{sig.grade} {zone_label} kz={sig.killzone} fill={fill:.{self.spec.digits}f} "
                    f"sl={sl:.{self.spec.digits}f} tp={tp:.{self.spec.digits}f} lots={lots:.2f} risk={risk_pct*100:.2f}%")
         comment = f"L5 {sig.grade} {setup} {sig.killzone}"
-        ticket = self._place_market(sig.direction, lots, sl, tp, comment)
+        # C grades: set TP on broker at 0.5R (simple SL/TP, no hybrid ladder)
+        # A/B grades: broker_tp=0.0, hybrid ladder manages exits in code
+        broker_tp = 0.0
+        if sig.grade == 'C':
+            broker_tp = fill + sig.direction * 0.5 * risk_per_unit
+        ticket = self._place_market(sig.direction, lots, sl, tp, comment, broker_tp=broker_tp)
         if ticket is None:
             self._vlog(f"{side} {setup}/{sig.grade} ORDER REJECTED by broker")
             return
@@ -1075,6 +1081,9 @@ class LiveTrader:
                 hit_sl = (lt.direction == 1 and price <= lt.sl) or (lt.direction == -1 and price >= lt.sl)
                 if hit_sl:
                     to_close.append((ticket, "SL"))
+                    continue
+                # C grades: broker manages SL/TP — skip hybrid ladder
+                if lt.grade == 'C':
                     continue
                 # Hybrid ladder: TP1 → partial close + BE
                 if not lt.tp1_hit:
@@ -1176,6 +1185,9 @@ class LiveTrader:
                     to_close.append((ticket, "SL"))
                     continue
 
+                # C grades: broker manages SL/TP — skip hybrid ladder
+                if lt.grade == 'C':
+                    continue
                 # TP1 → partial close 50% + move SL to BE
                 if not lt.tp1_hit:
                     hit_tp1 = (lt.direction == 1 and price >= lt.tp) or (lt.direction == -1 and price <= lt.tp)
