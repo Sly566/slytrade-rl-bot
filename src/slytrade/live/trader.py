@@ -321,7 +321,7 @@ class LiveTrader:
         risk_cap: float = 0.02,
         working_lot: float = 0.04,
         max_open: int = 3,
-        poll_interval: float = 5.0,
+        poll_interval: float = 2.0,
         verbose: bool = False,
         stop_level_pts: int = 0,
     ):
@@ -1647,6 +1647,27 @@ class LiveTrader:
         self._monitor_positions(latest, new_bar=True)
         self._print_status(latest)
 
+    def _print_floating(self) -> None:
+        """Lightweight real-time floating P&L — printed every 2s poll."""
+        bid, ask = self.quote()
+        positions = self._our_open_positions()
+        if not positions:
+            return
+        for tkt, pos in positions.items():
+            lt = self._trades.get(tkt)
+            profit = float(pos.get("profit", 0.0))
+            price = bid if int(pos.get("type", 0)) == 0 else ask
+            entry = float(pos.get("price_open", 0.0))
+            trail_tag = ""
+            if lt and lt.grade == 'C':
+                r_unit = lt.risk_per_unit if lt.risk_per_unit > 0 else abs(lt.tp - lt.entry)
+                cur_r = (price - lt.entry) / r_unit if lt.direction == 1 else (lt.entry - price) / r_unit
+                trail_tag = f" r={cur_r:+.2f}{' TRL' if lt.trail_active else ''}"
+            print(f"  >> ticket={tkt} {'LONG' if int(pos.get('type',0))==0 else 'SHORT'} "
+                  f"@ {entry:.{self.spec.digits}f} now={price:.{self.spec.digits}f} "
+                  f"floating={profit:+.2f}{self.acct.currency}{trail_tag}",
+                  flush=True)
+
     def _print_status(self, latest: pd.Series) -> None:
         bid, ask = self.quote()
         eq = self.equity()
@@ -1747,26 +1768,23 @@ class LiveTrader:
             print(f"[ERROR] initial cycle: {e}")
             traceback.print_exc()
         while running["v"]:
-            # v0.9.15.11: Poll every 10 seconds instead of waiting for the
-            # next minute.  The old code waited until second 5 of the NEXT
-            # minute — adding 65 seconds of dead lag on every M1 bar.  For a
-            # scalper that's fatal.  Now we check every 10s; _cycle_fn only
-            # processes NEW bars (via _last_processed_m1_time), so frequent
-            # polls don't re-process old data.
-            sleep_s = 10.0
+            # v0.9.15.23: Real-time polling — 5s cycle, 2s poll interval.
+            # Positions monitored + floating P&L printed every 2s in live
+            # mode so trailing stops react within seconds, not 15-20s.
+            sleep_s = 5.0
             end_wait = time.time() + sleep_s
             while running["v"] and time.time() < end_wait:
-                # In live mode, check positions every poll_interval (5s) so
-                # hybrid ladder TP1/TP2/runner detect fast moves. In dry-run
-                # only check every 6th iteration (30s) to reduce noise.
+                # In live mode: monitor positions + print floating every 2s
+                # In dry-run: every 6th iteration (12s) to reduce noise
                 if self.live or self._cycle % 6 == 0:
                     try:
                         self._monitor_positions(None)
+                        # Real-time floating P&L stream
+                        if self.live:
+                            self._print_floating()
                     except Exception:
                         pass
-                # v0.9.13.1: clamp BEFORE sleep — a negative remaining
-                # duration (clock crossing end_wait mid-iteration) made
-                # time.sleep raise ValueError and killed the loop at 13:14.
+                # v0.9.13.1: clamp BEFORE sleep
                 time.sleep(self._clamp_sleep(end_wait - time.time(), max_seconds=self.poll_interval))
             if not running["v"]: break
             try:
@@ -1774,7 +1792,7 @@ class LiveTrader:
             except Exception as e:
                 print(f"[ERROR] cycle: {e}")
                 traceback.print_exc()
-                time.sleep(self._clamp_sleep(10.0))
+                time.sleep(self._clamp_sleep(5.0))
 
 
 # --------------------------------------------------------------------------- #
