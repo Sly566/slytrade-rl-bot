@@ -918,9 +918,9 @@ class LiveTrader:
         if sig.direction == 1 and not self.cfg.confluence.accept_longs:
             self._vlog(f"{side} {setup} blocked by accept_longs=False"); self._signals_fired.add(key); return
 
-        # --- Netting mode: one position, one direction at a time ---
-        # Close any opposite-direction positions before opening new one.
-        # Skip if we already have a same-direction position open.
+        # --- Netting mode: flip on direction change, scale into winners ---
+        # Close opposite-direction positions before opening new one.
+        # Allow same-direction positions up to max_open (scaling into winners).
         our_positions = self._our_open_positions()
         for tkt, pos in list(our_positions.items()):
             pos_dir = 1 if int(pos.get("type", 0)) == 0 else -1
@@ -934,11 +934,11 @@ class LiveTrader:
                     lt.closed = True
                     lt.close_reason = reason
                 our_positions.pop(tkt, None)
-            elif pos_dir == sig.direction:
-                # Same direction already open — skip (netting: one position only)
-                self._vlog(f"{side} {setup}/{sig.grade} skipped: already have {'LONG' if pos_dir==1 else 'SHORT'} open")
-                self._signals_fired.add(key)
-                return
+        # Re-check after any flips — now enforce max_open for same-direction scaling
+        open_n = len(self._our_open_positions())
+        if open_n >= self.max_open:
+            self._vlog(f"{side} {setup}/{sig.grade} rejected: max_open={self.max_open} reached (open={open_n})")
+            return
         equity = self.equity()
         bid, ask = self.quote()
         entry_approx = ask if sig.direction == 1 else bid
