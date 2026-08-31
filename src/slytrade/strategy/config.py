@@ -1,4 +1,4 @@
-"""Layer 4 strategy config — ICT/SMC scalper (v0.9.15).
+"""Layer 4 strategy config — ICT/SMC scalper (v0.9.15.14).
 
 All tunables here; the signal/backtest engines consume them. Defaults are
 calibrated for XAUUSD M1 but the code is asset-class agnostic (dynamic sizing
@@ -46,11 +46,11 @@ class ExitPlan:
     tp2_r:       float = 2.5
     tp2_pct:     float = 0.25   # 25% off at TP2
     # Runner (remaining 25% after TP2): trail stop by trail_atr_mult × ATR OR exit on M5 CHoCH against
-    runner_trail_atr_mult: float = 0.25
+    runner_trail_atr_mult: float = 0.50  # wider trail for BTC/XAU volatility
     runner_stop_tf: str = "M5"          # CHoCH on this TF exits the runner
     # Emergency / time stops
     emergency_choch_tf: str = "M15"     # CHoCH on this TF => emergency exit full
-    time_stop_bars:      int = 240      # M1 bars = 4 hours; if BE not hit -> close
+    time_stop_bars:      int = 60       # M1 bars = 1 hour; ICT scalps = one impulse
     time_stop_min_r:     float = 0.0    # if price is within ±this R of entry, flat
     ob_invalidation_buffer: float = 0.05  # buffer past OB/FVG edge, in ATR multiples
                                          # (tightened from 0.1 to 0.05 ATR after
@@ -61,7 +61,7 @@ class ExitPlan:
     # blow the risk budget.  Purely ATR-based so it scales to any asset
     # (XAU, BTC, forex) without hard-coded point values.
     sl_clamp_min_atr: float = 0.5       # SL must be at least 0.5 ATR from entry
-    sl_clamp_max_atr: float = 3.0       # SL must be at most 3 ATR from entry
+    sl_clamp_max_atr: float = 2.5       # tighter SL for scalp precision
 
 
 # --------------------------------------------------------------------------- #
@@ -125,7 +125,7 @@ class ConfluenceConfig:
     # Only accept OBs on these TFs (H1 OBs had PF=0.84 and are filtered out).
     # FVGs are also disabled at default (only OBs passed the OOS test).
     accept_ob_tfs: tuple[str, ...] = ("M15", "M5")
-    accept_zone_kinds: tuple[str, ...] = ("OB",)  # "OB","FVG"
+    accept_zone_kinds: tuple[str, ...] = ("OB", "FVG")  # ICT 2022: FVG required
     # v0.9.15: setup kinds accepted by the engine.
     # DISP_TRAP = displacement trap (fake breakout reversal)
     # BREAKER   = breaker block (failed OB that becomes support/resistance)

@@ -1,4 +1,4 @@
-"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.15.13 hybrid-ladder persona.
+"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.15.14 hybrid-ladder persona.
 
 Connects to MT5 via the mt5linux RPyC bridge (run `bash start_mt5_bridge.sh`
 in another terminal first), pulls multi-timeframe bars, computes Layer 2
@@ -126,7 +126,7 @@ WARMUP_BARS = {
 }
 HTFS = ["M5", "M15", "M30", "H1", "H4", "D1"]
 CHOPCH_EMERGENCY_TF = "M15"
-TIME_STOP_BARS = 240
+TIME_STOP_BARS = 60  # v0.9.15.14: ICT scalps = one impulse
 
 
 # --------------------------------------------------------------------------- #
@@ -1567,8 +1567,8 @@ class LiveTrader:
 
     # ------------------------------------------------------------------ #
     def run(self) -> None:
-        persona_label = "v0.9.15.13 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.15.13 champion (long-only A+/A/B hybrid ladder)"
-        print(f"SlyTrade LIVE v0.9.15.13  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  working_lot={self.working_lot}  max_open={self.max_open}")
+        persona_label = "v0.9.15.14 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.15.14 champion (long-only A+/A/B hybrid ladder)"
+        print(f"SlyTrade LIVE v0.9.15.14  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  working_lot={self.working_lot}  max_open={self.max_open}")
         print(f"persona: {persona_label}")
         print("setups : RETEST_OB RETEST_FVG LIQ_SWEEP BOS_CONT DISP_TRAP BREAKER  (champion gates apply unless --all)")
         print(f"Magic={MAGIC}")
@@ -1665,7 +1665,7 @@ class LiveTrader:
 # --------------------------------------------------------------------------- #
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="SlyTrade v0.9.15.13 SCALPER LIVE trader (10s real-time polling + 5s bar lag + massive lookback windows + ATR-adaptive proximity gate + ATR-adaptive retest window + bridge diagnostics + smoke test + hardcoded MT5 constants + dynamic BOS_CONT freshness + hybrid ladder + all filling modes)")
+    ap = argparse.ArgumentParser(description="SlyTrade v0.9.15.14 SCALPER LIVE trader (10s real-time polling + 5s bar lag + massive lookback windows + ATR-adaptive proximity gate + ATR-adaptive retest window + bridge diagnostics + smoke test + hardcoded MT5 constants + dynamic BOS_CONT freshness + hybrid ladder + all filling modes)")
     ap.add_argument("--symbol", default="XAUUSDm")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=18812)
@@ -1701,7 +1701,7 @@ def main() -> None:
         fx_to_account={"USD": args.usd_zar} if str(acc.get("currency","ZAR")) != "USD" else {"USD": 1.0},
     )
     cfg = rl_training_persona() if args.unrestricted else champion_persona()
-    max_open_eff = args.max_open  # v0.9.15.13: respect user's --max-open even in unrestricted mode
+    max_open_eff = args.max_open  # v0.9.15.14: respect user's --max-open even in unrestricted mode
     print(f"  verbose       : {args.verbose}")
     print(f"  risk_cap      : {args.risk_cap*100:.1f}% per trade")
     print(f"  working_lot   : {args.working_lot}")

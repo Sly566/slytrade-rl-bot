@@ -296,7 +296,7 @@ def live_cmd(
         fx_to_account={"USD": usd_zar} if str(acc.get("currency","ZAR")) != "USD" else {"USD": 1.0},
     )
     cfg = rl_training_persona() if unrestricted else champion_persona()
-    max_open_eff = max_open  # v0.9.15.13: respect user's --max-open even in unrestricted mode
+    max_open_eff = max_open  # v0.9.15.14: respect user's --max-open even in unrestricted mode
     trader = LiveTrader(
         mt5=mt5, symbol=resolved, spec=spec, cfg=cfg, acct=acct_spec,
         live=live, risk_cap=risk_cap, working_lot=working_lot, max_open=max_open_eff,

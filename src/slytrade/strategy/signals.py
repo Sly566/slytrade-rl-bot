@@ -1,4 +1,4 @@
-"""Layer 4 — ICT/SMC scalper signal engine (v0.9.15.13).
+"""Layer 4 — ICT/SMC scalper signal engine (v0.9.15.14).
 
 Produces strictly-causal entry signals from the M1-aligned frame. Each signal
 carries: direction, entry price, stop loss, take-profit ladder, setup grade,
@@ -703,6 +703,22 @@ def _evaluate_row(i: int,
         # are the primary signal after a liquidity grab) were silently
         # skipped -- added them here so a fresh sweep+CHoCH reversal fires.
         #
+        # v0.9.15.14: Premium/Discount hard gate.
+        # ICT rule: only enter LONG in discount (<50% of range) and SHORT in
+        # premium (>50% of range).  Buying in premium or selling in discount
+        # is trading against the institutional edge.
+        pd_pct = float(row.get('price_in_range_pct', 0.5))
+        if pd.isna(pd_pct):
+            pd_pct = 0.5
+        if direction == 1 and pd_pct > 0.55:
+            if fail_trace is not None:
+                _reject(f"LIQ_SWEEP {side}: price in premium ({pd_pct:.0%}) — ICT says LONG only in discount")
+            continue
+        if direction == -1 and pd_pct < 0.45:
+            if fail_trace is not None:
+                _reject(f"LIQ_SWEEP {side}: price in discount ({pd_pct:.0%}) — ICT says SHORT only in premium")
+            continue
+
         # v0.9.15.13: ICT Silver Bullet requires sweep + MSS + entry.
         # The sweep alone is NOT sufficient -- we need a Market Structure
         # Shift (M1 BOS/CHoCH in the reversal direction) to confirm the
@@ -762,7 +778,28 @@ def _evaluate_row(i: int,
             continue
         state[sweep_key] = True
 
+        # v0.9.15.14: FVG retrace entry (ICT 2022 model).
+        # Instead of entering at market on the MSS bar, look for an
+        # unmitigated FVG in the trade direction.  Enter at FVG midpoint
+        # for better R:R.  If no FVG exists, fall back to market entry.
         entry = c
+        fvg_entry_used = False
+        if direction == 1:
+            fvg_top = row.get('bull_fvg_top', np.nan)
+            fvg_bot = row.get('bull_fvg_bottom', np.nan)
+            fvg_mit = bool(row.get('bull_fvg_mitigated', True))
+        else:
+            fvg_top = row.get('bear_fvg_top', np.nan)
+            fvg_bot = row.get('bear_fvg_bottom', np.nan)
+            fvg_mit = bool(row.get('bear_fvg_mitigated', True))
+        if pd.notna(fvg_top) and pd.notna(fvg_bot) and not fvg_mit:
+            fvg_mid = (float(fvg_top) + float(fvg_bot)) / 2.0
+            if direction == 1 and fvg_mid <= c + 0.5 * atr:
+                entry = fvg_mid
+                fvg_entry_used = True
+            elif direction == -1 and fvg_mid >= c - 0.5 * atr:
+                entry = fvg_mid
+                fvg_entry_used = True
         # LIQ_SWEEP SL buffer: 0.30 ATR past the wick (not 0.075). A liquidity
         # sweep is a stop-run rejection — price frequently retests the wick by
         # 0.10-0.25 ATR (20-50c on XAU) before reversing. v0.9.9- used
@@ -826,6 +863,8 @@ def _evaluate_row(i: int,
             tags.append('reversal_confirmed')
         else:
             tags.append('sweep_only_no_confirm')
+        if fvg_entry_used:
+            tags.append('fvg_entry')
         bias_summary = {}
         for tf in ('W1','D1','H4','H1','M30','M15','M5'):
             b = row.get(f'{tf}_major_bias', 0)
