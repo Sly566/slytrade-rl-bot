@@ -1,4 +1,4 @@
-"""Layer 4 strategy config — ICT/SMC scalper (v0.9.15.14).
+"""Layer 4 strategy config — ICT/SMC scalper (v0.9.15.15).
 
 All tunables here; the signal/backtest engines consume them. Defaults are
 calibrated for XAUUSD M1 but the code is asset-class agnostic (dynamic sizing

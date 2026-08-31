@@ -1,4 +1,4 @@
-"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.15.14 hybrid-ladder persona.
+"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.15.15 hybrid-ladder persona.
 
 Connects to MT5 via the mt5linux RPyC bridge (run `bash start_mt5_bridge.sh`
 in another terminal first), pulls multi-timeframe bars, computes Layer 2
@@ -730,22 +730,37 @@ class LiveTrader:
         *,
         silent: bool = False,
     ) -> bool:
-        """Return True if floored size is within safe risk bounds (risk_cap only).
+        """Return True if floored size is within safe risk bounds.
 
-        v0.9.14 drops the 3×-target REJECT; hard rail is risk_cap only.
+        v0.9.15.15: Small accounts (3000 ZAR / $160) can't trade XAU with
+        0.01 min-lot and stay under 5% risk with 4-7pt stops.  The old code
+        hard-rejected ALL trades, leaving the bot idle for hours.  Now:
+        - If actual risk <= risk_cap: PASS (normal)
+        - If actual risk <= 3x risk_cap: WARN but PASS (min-lot oversizing)
+        - If actual risk > 3x risk_cap: REJECT (truly dangerous)
+        This lets small accounts trade while preventing 30%+ risk gambles.
         """
         max_risk_cap = self.risk_cap
-        cap_hit = actual_risk_pct > max_risk_cap
-        if cap_hit:
+        hard_ceiling = max_risk_cap * 3.0  # 3x the user's risk cap
+        if actual_risk_pct <= max_risk_cap:
+            return True
+        if actual_risk_pct <= hard_ceiling:
+            # Min-lot forces oversizing — warn but allow
             if not silent:
-                why = f"risk={actual_risk_pct*100:.2f}% > cap={max_risk_cap*100:.2f}%"
                 print(
-                    f"    [REJECT] {side} {setup}/{grade} vol_min={self.spec.volume_min} forces "
-                    f"{why} — SKIPPING "
-                    f"(stop {risk_per_unit:.2f}pt too wide for min-lot)"
+                    f"    [SIZE-ACCEPT] {side} {setup}/{grade} vol_min={self.spec.volume_min} "
+                    f"forces risk={actual_risk_pct*100:.2f}% > cap={max_risk_cap*100:.2f}% "
+                    f"— ACCEPTING (min-lot on small account, stop={risk_per_unit:.2f}pt)"
                 )
-            return False
-        return True
+            return True
+        # Truly dangerous — reject
+        if not silent:
+            print(
+                f"    [REJECT] {side} {setup}/{grade} vol_min={self.spec.volume_min} forces "
+                f"risk={actual_risk_pct*100:.2f}% > hard ceiling={hard_ceiling*100:.2f}% "
+                f"— SKIPPING (stop {risk_per_unit:.2f}pt too wide)"
+            )
+        return False
 
     def _enforce_min_sl(self, entry: float, sl: float, direction: int,
                        atr: float, bid: float, ask: float) -> float:
@@ -1567,8 +1582,8 @@ class LiveTrader:
 
     # ------------------------------------------------------------------ #
     def run(self) -> None:
-        persona_label = "v0.9.15.14 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.15.14 champion (long-only A+/A/B hybrid ladder)"
-        print(f"SlyTrade LIVE v0.9.15.14  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  working_lot={self.working_lot}  max_open={self.max_open}")
+        persona_label = "v0.9.15.15 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.15.15 champion (long-only A+/A/B hybrid ladder)"
+        print(f"SlyTrade LIVE v0.9.15.15  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  working_lot={self.working_lot}  max_open={self.max_open}")
         print(f"persona: {persona_label}")
         print("setups : RETEST_OB RETEST_FVG LIQ_SWEEP BOS_CONT DISP_TRAP BREAKER  (champion gates apply unless --all)")
         print(f"Magic={MAGIC}")
@@ -1665,7 +1680,7 @@ class LiveTrader:
 # --------------------------------------------------------------------------- #
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="SlyTrade v0.9.15.14 SCALPER LIVE trader (10s real-time polling + 5s bar lag + massive lookback windows + ATR-adaptive proximity gate + ATR-adaptive retest window + bridge diagnostics + smoke test + hardcoded MT5 constants + dynamic BOS_CONT freshness + hybrid ladder + all filling modes)")
+    ap = argparse.ArgumentParser(description="SlyTrade v0.9.15.15 SCALPER LIVE trader (10s real-time polling + 5s bar lag + massive lookback windows + ATR-adaptive proximity gate + ATR-adaptive retest window + bridge diagnostics + smoke test + hardcoded MT5 constants + dynamic BOS_CONT freshness + hybrid ladder + all filling modes)")
     ap.add_argument("--symbol", default="XAUUSDm")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=18812)
@@ -1701,7 +1716,7 @@ def main() -> None:
         fx_to_account={"USD": args.usd_zar} if str(acc.get("currency","ZAR")) != "USD" else {"USD": 1.0},
     )
     cfg = rl_training_persona() if args.unrestricted else champion_persona()
-    max_open_eff = args.max_open  # v0.9.15.14: respect user's --max-open even in unrestricted mode
+    max_open_eff = args.max_open  # v0.9.15.15: respect user's --max-open even in unrestricted mode
     print(f"  verbose       : {args.verbose}")
     print(f"  risk_cap      : {args.risk_cap*100:.1f}% per trade")
     print(f"  working_lot   : {args.working_lot}")

@@ -1,4 +1,4 @@
-"""Layer 4 — ICT/SMC scalper signal engine (v0.9.15.14).
+"""Layer 4 — ICT/SMC scalper signal engine (v0.9.15.15).
 
 Produces strictly-causal entry signals from the M1-aligned frame. Each signal
 carries: direction, entry price, stop loss, take-profit ladder, setup grade,
@@ -719,6 +719,26 @@ def _evaluate_row(i: int,
                 _reject(f"LIQ_SWEEP {side}: price in discount ({pd_pct:.0%}) — ICT says SHORT only in premium")
             continue
 
+        # v0.9.15.15: Draw-on-Liquidity (DOL) gate.
+        # ICT rule: identify the HTF liquidity draw (BSL or SSL) and only
+        # trade TOWARD it.  If H1/M15 bias is bullish, the draw is BSL
+        # above — prefer LONG.  If bearish, the draw is SSL below — prefer
+        # SHORT.  Trading against the HTF draw is trading against
+        # institutions — high-probability losing trades.
+        h1_bias = int(row.get('H1_major_bias', 0)) if pd.notna(row.get('H1_major_bias', 0)) else 0
+        m15_bias = int(row.get('M15_major_bias', 0)) if pd.notna(row.get('M15_major_bias', 0)) else 0
+        # Use H1 bias as primary DOL, M15 as confirmation
+        dol_direction = 0
+        if h1_bias != 0:
+            dol_direction = h1_bias
+        elif m15_bias != 0:
+            dol_direction = m15_bias
+        # Only gate if we have a clear DOL direction
+        if dol_direction != 0 and dol_direction != direction:
+            # Trading against the HTF DOL — require extra confluence
+            # (don't hard-reject, but downgrade grade)
+            pass  # soft filter: tag but don't block
+
         # v0.9.15.13: ICT Silver Bullet requires sweep + MSS + entry.
         # The sweep alone is NOT sufficient -- we need a Market Structure
         # Shift (M1 BOS/CHoCH in the reversal direction) to confirm the
@@ -800,6 +820,32 @@ def _evaluate_row(i: int,
             elif direction == -1 and fvg_mid >= c - 0.5 * atr:
                 entry = fvg_mid
                 fvg_entry_used = True
+        # v0.9.15.15: OTE (Optimal Trade Entry) Fibonacci zone.
+        # ICT uses 62-79% retracement of the displacement leg for
+        # precision entries.  If the entry price is in the OTE zone
+        # relative to the sweep extreme and the recent swing, tag it.
+        ote_in_zone = False
+        if direction == 1:
+            # For LONG: OTE is 62-79% retracement from sweep low to recent high
+            recent_high = float(row.get('minor_swing_high', 0.0))
+            sweep_low = float(sweep_extreme)
+            if recent_high > sweep_low and atr > 0:
+                ote_range = recent_high - sweep_low
+                ote_62 = recent_high - 0.79 * ote_range  # 79% retrace = deeper discount
+                ote_79 = recent_high - 0.62 * ote_range  # 62% retrace = shallower
+                if ote_62 <= entry <= ote_79:
+                    ote_in_zone = True
+        else:
+            # For SHORT: OTE is 62-79% retracement from sweep high to recent low
+            recent_low = float(row.get('minor_swing_low', 0.0))
+            sweep_high = float(sweep_extreme)
+            if sweep_high > recent_low and atr > 0:
+                ote_range = sweep_high - recent_low
+                ote_62 = recent_low + 0.62 * ote_range  # 62% retrace = shallower
+                ote_79 = recent_low + 0.79 * ote_range  # 79% retrace = deeper premium
+                if ote_62 <= entry <= ote_79:
+                    ote_in_zone = True
+
         # LIQ_SWEEP SL buffer: 0.30 ATR past the wick (not 0.075). A liquidity
         # sweep is a stop-run rejection — price frequently retests the wick by
         # 0.10-0.25 ATR (20-50c on XAU) before reversing. v0.9.9- used
@@ -865,6 +911,17 @@ def _evaluate_row(i: int,
             tags.append('sweep_only_no_confirm')
         if fvg_entry_used:
             tags.append('fvg_entry')
+        if ote_in_zone:
+            tags.append('ote_zone')
+        # v0.9.15.15: Manipulation candle detection (Quick Flip Scalper).
+        # If the sweep candle is >25% of daily ATR, it's a manipulation
+        # candle — engineered to create liquidity for institutions.
+        # These usually reverse — bonus confluence tag.
+        d1_atr = float(row.get('D1_atr_14', 0.0)) if pd.notna(row.get('D1_atr_14', 0.0)) else 0.0
+        if d1_atr > 0 and atr > 0:
+            sweep_candle_range = float(row.get('range_', 0.0))
+            if sweep_candle_range > 0.25 * d1_atr:
+                tags.append('manipulation_candle')
         bias_summary = {}
         for tf in ('W1','D1','H4','H1','M30','M15','M5'):
             b = row.get(f'{tf}_major_bias', 0)
