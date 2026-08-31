@@ -53,28 +53,37 @@ _OBS_M5_BOS_UP = 12
 _OBS_M5_BOS_DN = 13
 _OBS_M5_CHOCH_UP = 14
 _OBS_M5_CHOCH_DN = 15
+# M15 structure (broader intraday blanket)
+_OBS_M15_BULL_DISP = 16
+_OBS_M15_BEAR_DISP = 17
+_OBS_M15_BOS_UP = 18
+_OBS_M15_BOS_DN = 19
+_OBS_M15_CHOCH_UP = 20
+_OBS_M15_CHOCH_DN = 21
+_OBS_M15_MAJOR_CHOCH_UP = 22
+_OBS_M15_MAJOR_CHOCH_DN = 23
 # Zone proximity (distance to nearest OB/FVG normalized by ATR)
-_OBS_OB_PROX = 16     # distance to nearest unmitigated OB
-_OBS_FVG_PROX = 17    # distance to nearest unmitigated FVG
-_OBS_SWEEP_PROX = 18  # distance to nearest liquidity sweep level
+_OBS_OB_PROX = 24     # distance to nearest unmitigated OB
+_OBS_FVG_PROX = 25    # distance to nearest unmitigated FVG
+_OBS_SWEEP_PROX = 26  # distance to nearest liquidity sweep level
 # Position state
-_OBS_POS_DIR = 19     # +1 long, -1 short, 0 flat
-_OBS_POS_R = 20       # current P&L in R-multiples
-_OBS_POS_BARS = 21    # bars held (normalized by time_stop)
-_OBS_POS_AGE = 22     # time since entry (normalized)
+_OBS_POS_DIR = 27     # +1 long, -1 short, 0 flat
+_OBS_POS_R = 28       # current P&L in R-multiples
+_OBS_POS_BARS = 29    # bars held (normalized by time_stop)
+_OBS_POS_AGE = 30     # time since entry (normalized)
 # Account state
-_OBS_EQUITY_CURVE = 23  # equity / starting_equity
-_OBS_DRAWDOWN = 24      # current drawdown from peak
-_OBS_WIN_RATE = 25      # recent win rate (last 20 trades)
+_OBS_EQUITY_CURVE = 31  # equity / starting_equity
+_OBS_DRAWDOWN = 32      # current drawdown from peak
+_OBS_WIN_RATE = 33      # recent win rate (last 20 trades)
 # Killzone
-_OBS_KZ_ASIA = 26
-_OBS_KZ_LONDON = 27
-_OBS_KZ_NY = 28
+_OBS_KZ_ASIA = 34
+_OBS_KZ_LONDON = 35
+_OBS_KZ_NY = 36
 # Time features
-_OBS_HOUR_SIN = 29    # hour encoded as sin
-_OBS_HOUR_COS = 30    # hour encoded as cos
+_OBS_HOUR_SIN = 37    # hour encoded as sin
+_OBS_HOUR_COS = 38    # hour encoded as cos
 
-OBS_DIM = 31
+OBS_DIM = 39
 
 # Action space
 ACT_HOLD = 0
@@ -196,6 +205,11 @@ class SlyTradeEnv(gym.Env):
             ("M5_bull_disp", _OBS_M5_BULL_DISP), ("M5_bear_disp", _OBS_M5_BEAR_DISP),
             ("M5_minor_bos_up", _OBS_M5_BOS_UP), ("M5_minor_bos_dn", _OBS_M5_BOS_DN),
             ("M5_minor_choch_up", _OBS_M5_CHOCH_UP), ("M5_minor_choch_dn", _OBS_M5_CHOCH_DN),
+            # M15 structure (broader intraday blanket)
+            ("M15_bull_disp", _OBS_M15_BULL_DISP), ("M15_bear_disp", _OBS_M15_BEAR_DISP),
+            ("M15_minor_bos_up", _OBS_M15_BOS_UP), ("M15_minor_bos_dn", _OBS_M15_BOS_DN),
+            ("M15_minor_choch_up", _OBS_M15_CHOCH_UP), ("M15_minor_choch_dn", _OBS_M15_CHOCH_DN),
+            ("M15_major_choch_up", _OBS_M15_MAJOR_CHOCH_UP), ("M15_major_choch_dn", _OBS_M15_MAJOR_CHOCH_DN),
         ]:
             obs[idx] = 1.0 if bool(row.get(col, False)) else 0.0
 

@@ -91,6 +91,10 @@ class RLFilter:
             _OBS_M5_BULL_DISP, _OBS_M5_BEAR_DISP,
             _OBS_M5_BOS_UP, _OBS_M5_BOS_DN,
             _OBS_M5_CHOCH_UP, _OBS_M5_CHOCH_DN,
+            _OBS_M15_BULL_DISP, _OBS_M15_BEAR_DISP,
+            _OBS_M15_BOS_UP, _OBS_M15_BOS_DN,
+            _OBS_M15_CHOCH_UP, _OBS_M15_CHOCH_DN,
+            _OBS_M15_MAJOR_CHOCH_UP, _OBS_M15_MAJOR_CHOCH_DN,
             _OBS_OB_PROX, _OBS_FVG_PROX, _OBS_SWEEP_PROX,
             _OBS_POS_DIR, _OBS_POS_R, _OBS_POS_BARS, _OBS_POS_AGE,
             _OBS_EQUITY_CURVE, _OBS_DRAWDOWN, _OBS_WIN_RATE,
@@ -120,6 +124,11 @@ class RLFilter:
             ("M5_bull_disp", _OBS_M5_BULL_DISP), ("M5_bear_disp", _OBS_M5_BEAR_DISP),
             ("M5_minor_bos_up", _OBS_M5_BOS_UP), ("M5_minor_bos_dn", _OBS_M5_BOS_DN),
             ("M5_minor_choch_up", _OBS_M5_CHOCH_UP), ("M5_minor_choch_dn", _OBS_M5_CHOCH_DN),
+            # M15 structure
+            ("M15_bull_disp", _OBS_M15_BULL_DISP), ("M15_bear_disp", _OBS_M15_BEAR_DISP),
+            ("M15_minor_bos_up", _OBS_M15_BOS_UP), ("M15_minor_bos_dn", _OBS_M15_BOS_DN),
+            ("M15_minor_choch_up", _OBS_M15_CHOCH_UP), ("M15_minor_choch_dn", _OBS_M15_CHOCH_DN),
+            ("M15_major_choch_up", _OBS_M15_MAJOR_CHOCH_UP), ("M15_major_choch_dn", _OBS_M15_MAJOR_CHOCH_DN),
         ]:
             try:
                 obs[idx] = 1.0 if bool(row.get(col, False)) else 0.0
