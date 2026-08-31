@@ -1,9 +1,11 @@
-"""Unit tests for v0.9.13 live-trader risk + orphan-adoption helpers.
+"""Unit tests for v0.9.13 / v0.9.13.1+ live-trader risk + orphan-adoption helpers.
 
 These pin the incomplete-merge regressions that bit the first v0.9.13 land:
   1. vol_min floor must HARD-REJECT when actual risk > max(risk_cap, 1.5%) or 3× target
   2. orphan adoption must seed bars_held from wall-clock age (time-stop continuity)
   3. broker open-time parsing must accept unix ints and datetime objects
+  4. _clamp_sleep must guarantee time.sleep NEVER gets a negative duration
+     (the 13:14 ValueError crash in the bar-boundary poll loop)
 """
 from __future__ import annotations
 
@@ -14,9 +16,8 @@ from typing import Any
 import pytest
 
 from slytrade.backtest.specs import AccountSpec, spec_for_symbol
-from slytrade.live.trader import LiveTrade, LiveTrader, MAGIC
+from slytrade.live.trader import MAGIC, LiveTrade, LiveTrader
 from slytrade.strategy.config import champion_persona
-
 
 # --------------------------------------------------------------------------- #
 # Fixtures
@@ -34,9 +35,25 @@ class _FakeMT5:
     TRADE_RETCODE_DONE = 10009
     TRADE_RETCODE_DONE_PARTIAL = 10010
 
-    def __init__(self, positions: list[dict] | None = None, equity: float = 3000.0):
+    def __init__(self, positions: list[dict] | None = None, equity: float = 3000.0,
+                 history_deals: list[dict] | None = None):
         self._positions = list(positions or [])
         self._equity = equity
+        self._history = list(history_deals or [])
+        self._select_calls: list[tuple[Any, Any]] = []
+
+    def history_deals_select(self, date_from: Any = None, date_to: Any = None,
+                             *_args, **_kwargs) -> bool:
+        self._select_calls.append((date_from, date_to))
+        return True
+
+    def history_deals_get(self, **kwargs: Any) -> list[SimpleNamespace]:
+        pos_id = kwargs.get("position", -1)
+        out = []
+        for d in self._history:
+            if int(d.get("position", -1)) == int(pos_id):
+                out.append(SimpleNamespace(**d))
+        return out
 
     def account_info(self) -> SimpleNamespace:
         return SimpleNamespace(equity=self._equity, balance=self._equity, currency="ZAR", leverage=2000)
@@ -97,40 +114,44 @@ def trader() -> LiveTrader:
 
 
 # --------------------------------------------------------------------------- #
-# vol_min hard-REJECT thresholds
+# vol_min hard-REJECT thresholds (v0.9.14: risk_cap only, no 3x target reject)
 # --------------------------------------------------------------------------- #
 
 class TestVolMinRiskOk:
-    def test_rejects_when_actual_above_1_5pct_cap(self, trader: LiveTrader):
-        # 3% actual vs 0.15% target → must REJECT (the 12:28 short case)
-        assert trader._vol_min_risk_ok(0.03, 0.0015, silent=True) is False
+    def test_rejects_when_actual_above_risk_cap(self, trader: LiveTrader):
+        trader.risk_cap = 0.01
+        # 1.2% > 1% risk_cap but < 3x=3% → ACCEPT (v0.9.15.15 min-lot safety)
+        assert trader._vol_min_risk_ok(0.012, 0.003, silent=True) is True
+        # 4% > 3x risk_cap=3% → REJECT
+        assert trader._vol_min_risk_ok(0.04, 0.003, silent=True) is False
 
-    def test_rejects_when_actual_above_3x_target_even_if_under_cap(self, trader: LiveTrader):
-        # risk_cap=1%, actual=1.2% is under the 1.5% floor-cap BUT 1.2/0.3%=4× target
-        # → still REJECT via the 3× rule
-        assert trader._vol_min_risk_ok(0.012, 0.003, silent=True) is False
-
-    def test_allows_mild_1_25x_oversize(self, trader: LiveTrader):
-        # 0.4% actual vs 0.3% target = 1.33× — under 1.5% cap and under 3× → OK (SIZE-WARN path)
-        assert trader._vol_min_risk_ok(0.004, 0.003, silent=True) is True
+    def test_allows_when_under_risk_cap_even_if_above_3x_target(self, trader: LiveTrader):
+        # 1.2% actual vs 0.3% target (>3x target) but under 2% risk_cap -> allowed in v0.9.14
+        trader.risk_cap = 0.02
+        assert trader._vol_min_risk_ok(0.012, 0.003, silent=True) is True
 
     def test_allows_exact_target(self, trader: LiveTrader):
         assert trader._vol_min_risk_ok(0.005, 0.005, silent=True) is True
 
-    def test_rejects_at_exactly_3x_plus_epsilon(self, trader: LiveTrader):
-        assert trader._vol_min_risk_ok(0.0091, 0.003, silent=True) is False  # 3.03×
+    def test_respects_risk_cap_hard_rail(self, trader: LiveTrader):
+        trader.risk_cap = 0.01
+        assert trader._vol_min_risk_ok(0.009, 0.01, silent=True) is True
+        # 1.1% > 1% risk_cap but < 3x=3% → ACCEPT (v0.9.15.15 min-lot safety)
+        assert trader._vol_min_risk_ok(0.011, 0.01, silent=True) is True
+        # 4% > 3x risk_cap=3% → REJECT
+        assert trader._vol_min_risk_ok(0.04, 0.01, silent=True) is False
 
-    def test_allows_just_under_3x_and_under_cap(self, trader: LiveTrader):
-        # 0.0089 / 0.003 ≈ 2.97× and < 1.5% → OK
-        assert trader._vol_min_risk_ok(0.0089, 0.003, silent=True) is True
+    def test_accept_log_names_risk_cap(self, trader: LiveTrader, capsys):
+        trader.risk_cap = 0.01
+        # 1.5% > 1% risk_cap but < 3x=3% → ACCEPT with SIZE-ACCEPT log
+        assert trader._vol_min_risk_ok(0.015, 0.01, side="SHORT", setup="LIQ_SWEEP") is True
+        out = capsys.readouterr().out
+        assert "SIZE-ACCEPT" in out
 
-    def test_respects_higher_risk_cap(self, trader: LiveTrader):
-        # With risk_cap raised to 2%, max_risk_cap = 2%; 1.8% actual vs 1% target
-        # is under 2% and under 3× → OK
-        trader.risk_cap = 0.02
-        assert trader._vol_min_risk_ok(0.018, 0.01, silent=True) is True
-        # 2.1% still REJECTS against the 2% cap
-        assert trader._vol_min_risk_ok(0.021, 0.01, silent=True) is False
+
+class TestWorkingLotSizing:
+    def test_default_working_lot_is_0_04(self, trader: LiveTrader):
+        assert trader.working_lot == 0.04
 
 
 # --------------------------------------------------------------------------- #
@@ -210,6 +231,130 @@ class TestOrphanAge:
         assert lt is not None
         assert lt.direction == -1
         assert lt.lots == 0.02
+
+
+# --------------------------------------------------------------------------- #
+# Realized P&L from broker deal history (was last-poll estimate -> 4x understated)
+# --------------------------------------------------------------------------- #
+
+class TestDealProfit:
+    def test_returns_realized_from_history(self, trader: LiveTrader):
+        mt5 = _FakeMT5(
+            history_deals=[
+                {"position": 3148230553, "profit": -37.75, "commission": -0.0, "swap": 0.0},
+            ]
+        )
+        trader.mt5 = mt5
+        # The 16:14 live SL in v0.9.13.1: bot recorded -9.60ZAR (last-poll
+        # unrealized) but the broker really lost -37.75ZAR.
+        assert trader._deal_profit(3148230553) == pytest.approx(-37.75)
+
+    def test_returns_none_when_no_deals(self, trader: LiveTrader):
+        assert trader._deal_profit(999) is None
+
+    def test_history_window_covers_server_time_offset(self, trader: LiveTrader):
+        """Regression (v0.9.13.4): the old [now-1h, now+2min] naive-UTC window
+        is interpreted in SERVER time (Exness MT5Trial9 = UTC+3), so the close
+        deal was excluded and _deal_profit returned None — the bot booked the
+        last-poll unrealized estimate instead of the real P&L."""
+        mt5 = _FakeMT5(
+            history_deals=[
+                {"position": 3149064313, "profit": -28.18, "commission": 0.0, "swap": 0.0},
+            ]
+        )
+        trader.mt5 = mt5
+        assert trader._deal_profit(3149064313) == pytest.approx(-28.18)
+        # The selection window must span ~7 days and reach into the future so
+        # a ±hours/DST server offset can never exclude the deal.
+        assert len(mt5._select_calls) == 1
+        frm, to = mt5._select_calls[0]
+        # _deal_profit uses naive utcnow() (MT5 server-time convention)
+        assert to > datetime.utcnow()
+        assert (to - frm) >= timedelta(days=6, hours=23)
+
+    def test_exit_prefers_deal_history_over_last_poll_estimate(self, trader: LiveTrader):
+        """Regression: a stop filled between polls must book the REALIZED
+        broker loss, not the stale unrealized profit from the previous poll."""
+        ticket = 3148230553
+        trader.live = True
+        mt5 = _FakeMT5(
+            positions=[],  # position already closed broker-side
+            history_deals=[
+                {"position": ticket, "profit": -37.75, "commission": 0.0, "swap": 0.0},
+            ],
+        )
+        trader.mt5 = mt5
+        lt = LiveTrade(
+            ticket=ticket, direction=1, entry=4606.919, sl=4604.424, tp=4609.040,
+            lots=0.01, open_time=datetime.now(UTC), grade="A", risk_pct=0.0131,
+        )
+        trader._trades[ticket] = lt
+        # Previous poll saw the position still open at an unrealized -9.60.
+        trader._last_broker_pos = {ticket: {"profit": -9.60, "magic": MAGIC,
+                                            "symbol": "XAUUSDm", "ticket": ticket}}
+
+        trader._monitor_positions(None)
+
+        assert lt.closed is True
+        assert lt.close_reason == "BROKER"
+        assert lt.pnl == pytest.approx(-37.75)  # ground truth, NOT -9.60
+
+    def test_exit_falls_back_to_last_poll_when_no_history(self, trader: LiveTrader):
+        ticket = 7
+        trader.live = True
+        trader.mt5 = _FakeMT5(positions=[])  # no history deals
+        lt = LiveTrade(
+            ticket=ticket, direction=-1, entry=4600.0, sl=4605.0, tp=4595.0,
+            lots=0.01, open_time=datetime.now(UTC), grade="C", risk_pct=0.005,
+        )
+        trader._trades[ticket] = lt
+        trader._last_broker_pos = {ticket: {"profit": -3.0, "magic": MAGIC,
+                                            "symbol": "XAUUSDm", "ticket": ticket}}
+        trader._monitor_positions(None)
+        assert lt.pnl == pytest.approx(-3.0)
+
+
+# --------------------------------------------------------------------------- #
+# _clamp_sleep: time.sleep must NEVER get a negative duration (13:14 crash)
+# --------------------------------------------------------------------------- #
+
+class TestClampSleep:
+    def test_negative_remaining_clamps_to_zero(self):
+        # The 13:14 crash: clock crossed end_wait mid-iteration, so
+        # end_wait - time.time() went negative and time.sleep raised ValueError.
+        assert LiveTrader._clamp_sleep(-0.5) == 0.0
+        assert LiveTrader._clamp_sleep(-1e-9) == 0.0
+
+    def test_negative_remaining_with_cap_clamps_to_zero(self):
+        # Old code: min(poll_interval, negative) → negative still reaches sleep
+        assert LiveTrader._clamp_sleep(-0.5, max_seconds=5.0) == 0.0
+
+    def test_positive_duration_unchanged(self):
+        assert LiveTrader._clamp_sleep(4.2) == 4.2
+
+    def test_cap_applies(self):
+        assert LiveTrader._clamp_sleep(7.0, max_seconds=5.0) == 5.0
+        # cap >= duration → unchanged
+        assert LiveTrader._clamp_sleep(4.2, max_seconds=5.0) == 4.2
+
+    def test_zero_is_fine(self):
+        assert LiveTrader._clamp_sleep(0.0) == 0.0
+        assert LiveTrader._clamp_sleep(0.0, max_seconds=5.0) == 0.0
+
+    def test_nan_and_inf_collapse_to_zero(self):
+        assert LiveTrader._clamp_sleep(float("nan")) == 0.0
+        assert LiveTrader._clamp_sleep(float("inf")) == 0.0
+        assert LiveTrader._clamp_sleep(float("-inf")) == 0.0
+
+    def test_garbage_collapses_to_zero(self):
+        assert LiveTrader._clamp_sleep(None) == 0.0
+        assert LiveTrader._clamp_sleep("not-a-number") == 0.0
+
+    def test_negative_or_nan_cap_clamps_safe(self):
+        assert LiveTrader._clamp_sleep(5.0, max_seconds=-1.0) == 0.0
+        assert LiveTrader._clamp_sleep(5.0, max_seconds=float("nan")) == 0.0
+        # +inf cap == no cap
+        assert LiveTrader._clamp_sleep(5.0, max_seconds=float("inf")) == 5.0
 
 
 # --------------------------------------------------------------------------- #

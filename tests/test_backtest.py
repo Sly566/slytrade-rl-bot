@@ -115,9 +115,59 @@ def test_tranche_allocation_micro_single(spec):
 # ---------------------------------------------------------------------------
 # End-to-end engine: 1 long that hits TP1 on the next bar → close_reason set
 # ---------------------------------------------------------------------------
+def _fill_required_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """Fill all columns the current signal engine requires."""
+    import numpy as np
+    for col in ('session', 'kz_ny', 'kz_london', 'kz_asian',
+                'london_open_30', 'ny_open_30',
+                'vol_spike', 'bull_disp', 'bear_disp',
+                'minor_bos_up', 'minor_bos_dn', 'minor_choch_up', 'minor_choch_dn',
+                'major_bos_up', 'major_bos_dn', 'major_choch_up', 'major_choch_dn',
+                'bull_liq_sweep', 'bear_liq_sweep',
+                'M5_bull_disp', 'M5_bear_disp',
+                'M5_minor_bos_up', 'M5_minor_bos_dn',
+                'M5_minor_choch_up', 'M5_minor_choch_dn',
+                'M5_major_bos_up', 'M5_major_bos_dn',
+                'M5_major_choch_up', 'M5_major_choch_dn',
+                'M5_vol_spike'):
+        if col not in df.columns:
+            if col == 'session':
+                df[col] = 'NY'
+            elif 'bias' in col:
+                df[col] = 1
+            else:
+                df[col] = False
+    for col in ('bull_sweep_px', 'bear_sweep_px',
+                'minor_swing_high', 'minor_swing_low',
+                'M5_minor_swing_low', 'M5_minor_swing_high'):
+        if col not in df.columns:
+            df[col] = np.nan
+    for col in ('D1_major_bias', 'H4_major_bias', 'H1_major_bias',
+                'M15_major_bias', 'M30_major_bias', 'M5_major_bias'):
+        if col not in df.columns:
+            df[col] = 1
+    for col in ('M5_price_in_range_pct', 'M15_price_in_range_pct',
+                'H1_price_in_range_pct', 'H4_price_in_range_pct',
+                'D1_price_in_range_pct', 'M30_price_in_range_pct'):
+        if col not in df.columns:
+            df[col] = 0.5
+    for tf in ('M5', 'M15', 'H1', 'H4', 'D1', 'W1', 'M30'):
+        for side in ('bull', 'bear'):
+            for kind in ('ob', 'fvg'):
+                for suffix in ('top', 'bottom', 'mitigated'):
+                    c = f'{tf}_{side}_{kind}_{suffix}'
+                    if c not in df.columns:
+                        df[c] = True if suffix == 'mitigated' else np.nan
+            for suffix in ('swing_high', 'swing_low'):
+                c = f'{tf}_major_{suffix}'
+                if c not in df.columns:
+                    df[c] = np.nan
+    return df
+
+
 def _bars_long_win() -> pd.DataFrame:
     """Three M1 bars: signal fires on bar 0; bar 1 high hits TP1."""
-    return pd.DataFrame([
+    df = pd.DataFrame([
         {"time": pd.Timestamp("2024-01-02 13:30", tz="UTC"),
          "open": 2500.0, "high": 2500.2, "low": 2499.8, "close": 2500.0,
          "spread": 0, "tick_volume": 100, "atr_14": 2.0, "M5_atr_14": 2.5,
@@ -134,6 +184,7 @@ def _bars_long_win() -> pd.DataFrame:
          "M5_major_choch_up": False, "M5_major_choch_dn": False,
          "M15_major_choch_up": False, "M15_major_choch_dn": False},
     ])
+    return _fill_required_cols(df)
 
 
 def _signal_long_tp1() -> pd.DataFrame:
@@ -175,13 +226,13 @@ def test_engine_long_hits_tp1_sets_close_reason(spec, acct, bt_cfg):
     import pathlib
     import tempfile
     with tempfile.TemporaryDirectory() as td:
-        warm = pd.DataFrame([{
+        warm = _fill_required_cols(pd.DataFrame([{
             "time": pd.Timestamp("2024-01-01", tz="UTC") + pd.Timedelta(minutes=i),
             "open": 2500.0, "high": 2500.1, "low": 2499.9, "close": 2500.0,
             "spread": 0, "tick_volume": 100, "atr_14": 2.0, "M5_atr_14": 2.5,
             "M5_major_choch_up": False, "M5_major_choch_dn": False,
             "M15_major_choch_up": False, "M15_major_choch_dn": False,
-        } for i in range(600)])
+        } for i in range(600)]))
         # Offset the signal bars so they fall AFTER warmup (501st bar onwards)
         t0 = warm["time"].iloc[-1] + pd.Timedelta(minutes=1)
         bars = _bars_long_win().copy()

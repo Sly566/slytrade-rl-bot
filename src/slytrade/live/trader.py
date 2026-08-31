@@ -1,14 +1,55 @@
-"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.13 scalper persona.
+"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.15.23 hybrid-ladder persona.
 
 Connects to MT5 via the mt5linux RPyC bridge (run `bash start_mt5_bridge.sh`
 in another terminal first), pulls multi-timeframe bars, computes Layer 2
 features, performs causal MTF alignment, runs the Layer 4/5 signal scanner
-statefully, and when a signal fires sends a market order with SL/TP sized
-per our grade-tiered risk rules.
+statefully, and when a signal fires sends a market or limit order with SL/TP
+sized per our grade-tiered risk rules and dynamic working-lot sizing.
+
+v0.9.15.7 changes:
+  - Add mt5.last_error() diagnostics when order_send returns None (bridge failure)
+  - Add startup bridge smoke test (--live mode) to verify order_send works
+  - Handle None return separately from retcode=-1 (different failures)
+
+v0.9.15.6 changes:
+  - Fix retcode=-1 on ALL orders: hardcode MT5 protocol constants as plain
+    Python ints (TRADE_ACTION_DEAL=1, ORDER_TYPE_BUY=0, etc.) instead of
+    reading them from self.mt5 which returns RPyC proxy objects that fail
+    to serialize in order_send(). Universal across all MT5 brokers (MQL5 spec).
+
+v0.9.15.4 changes:
+  - Fix retcode=-1 on ALL orders: RPyC proxy objects in order_send request
+    dict caused serialization failures. Resolve MT5 constants (TRADE_ACTION_DEAL,
+    ORDER_TYPE_BUY, etc.) to plain ints before building the request dict.
+  - Fix FOK=0 silently dropped: FOK filling mode has value 0 which is falsy,
+    causing it to be filtered out by 'if m'. Use 'is not None' checks.
+  - Hardcode filling mode values (FOK=0, IOC=1, RETURN=2) as fallback when
+    bridge doesn't expose ORDER_FILLING_* constants.
+  - Add try/except around order_send to catch RPyC bridge exceptions.
+  - Log raw bridge response on retcode=-1 for diagnosis.
+
+v0.9.15.3 changes:
+  - ALWAYS try all 3 filling modes (IOC, FOK, RETURN) regardless of bitmask.
+    The bitmask was unreliable — Exness BTC reported IOC+FOK but needed RETURN.
+  - Log each filling mode retry with retcode for debugging
+
+v0.9.15.2 changes:
+  - LIVE hybrid ladder exits: TP is NOT set on broker (tp=0). TP1/TP2 partial
+    closes + BE + ATR trailing stop + M5 CHoCH kill are managed in code via
+    _partial_close() and _modify_sl(). Broker SL is the safety net only.
+  - Intra-bar position monitoring every 5s in live mode (was every 30s)
+
+v0.9.15 changes:
+  - Hybrid ladder exits: TP1 1.0R @ 50% → BE; TP2 2.5R @ 25%; runner 25% ATR trail + M5 CHoCH kill
+  - working_lot default 0.04; risk_cap is only hard size rail (no 3× grade REJECT)
+  - Limit-at-zone for RETEST/BREAKER with market fallback; market for DISP_TRAP/LIQ/BOS
+  - One-shot re-arm when flat after TP
+  - New setups: DISP_TRAP, BREAKER
 
 Open positions are monitored every 5 seconds for:
   - SL hit (broker-side, redundant check via equity diff)
-  - TP hit (broker-side)
+  - TP1/TP2 hit (partial close + BE/trail adjustment)
+  - M5 CHoCH runner kill
   - M15 CHoCH emergency exit (closes at market if detected)
   - Time-stop (4 hours / 240 M1 bars flat regardless of P&L)
 
@@ -18,10 +59,10 @@ Run:
     python -m slytrade.live.trader --symbol XAUUSDm --all --verbose  # see ALL signals
     python -m slytrade.live.trader --symbol XAUUSDm --live     # real trading (champion)
 
-Default persona: v0.9.13 champion (longs-only, 0.85R one-shot, >=2 ATR stops,
+Default persona: v0.9.15 champion (longs-only, hybrid ladder, >=2 ATR stops,
 grades A+/A/B, M5+M15 OBs, London/NY). Use --all to switch to the unrestricted
-scalper persona (long+short, all grades, H1+M15+M5 OBs+FVGs, LIQ_SWEEP + BOS_CONT
-quick scalps, Asian+off-hours unlocked, persona_gating=False) so you see
+scalper persona (long+short, all grades, H1+M15+M5 OBs+FVGs, DISP_TRAP + BREAKER +
+LIQ_SWEEP + BOS_CONT, Asian+off-hours unlocked, persona_gating=False) so you see
 EVERYTHING the engine fires -- including the money-printing liquidity grabs
 and momentum bursts the champion filters out.
 """
@@ -62,31 +103,45 @@ TIMEFRAME_ATTRS = {
     "D1":  "TIMEFRAME_D1",
 }
 MAGIC = 260810  # SlyTrade magic number
-# Per-TF history windows — GENEROUS by design so the engine sees EVERYTHING.
+# Per-TF history windows — MASSIVE by design so the engine sees the ENTIRE
+# market structure that matters.  Key swing levels, unmitigated OBs/FVGs,
+# liquidity pools, and structural pivots from months/years ago still drive
+# price reactions today — if they fall out of the buffer, the bot is blind
+# to the levels Sly is trading manually.
 #
-# Rule per TF: 3 × EMA200 lookback for full indicator warmup, plus enough
-# swing history for ATR-ZigZag major pivots (mult=4 ATR) to form cleanly,
-# plus enough historical swing reference levels that liquidity sweeps
-# against weeks-old levels are still detectable.
-#
-# M1 is intentionally the LARGEST window — that's where quick scalps fire,
-# and we do NOT want a swing low from last week to fall out of the buffer
-# right as price comes back to sweep it. Total processing per cycle
-# benchmarks at ~1s on a modern CPU — well within our 60-second poll budget.
+# Rule per TF: enough bars to cover the full relevant history for that
+# timeframe's role in the strategy.  M1 needs weeks of swing refs; H4/D1
+# need years of bias structure.  Processing scales linearly but stays well
+# within the 60-second poll budget (~5-10s on a modern CPU for the full set).
 #
 #                   bars         ~calendar days   why
 WARMUP_BARS = {
-    "M1":  60000,  # ~42d  (6 wks)   swing refs + liq levels weeks back
-    "M5":  15000,  # ~52d  (7.5 wks) trigger TF: full multi-week structure
-    "M15":  6000,  # ~62d  (9 wks)   OB TF + A+ premium/discount zone
-    "M30":  3000,  # ~62d  (9 wks)   mid-TF confluence for grade/runner
-    "H1":   2400,  # ~100d (14 wks)  OB TF + runners; H1 EMA200 needs ~12d
-    "H4":   1200,  # ~200d (28 wks)  HTF bias for A+; H4 EMA200 needs ~50 days
-    "D1":    500,  # ~500d (~1.4y)   D1 EMA200 = 200d; yearly hi/lo runners
+    "M1":  20000,  # ~14d (2 wks)   swing refs + liq levels — enough for scalper
+    "M5":  6000,   # ~21d (3 wks)   trigger TF: 3 weeks of structural events
+    "M15": 3000,   # ~31d (4.5 wks) OB TF: 1 month of order blocks
+    "M30": 1500,   # ~31d (4.5 wks) mid-TF confluence
+    "H1":  1000,   # ~42d (6 wks)   OB TF: 6 weeks of H1 zones
+    "H4":  500,    # ~83d (12 wks)  HTF bias: 3 months of H4 structure
+    "D1":  200,    # ~200d (29 wks) D1: 6.5 months — yearly hi/lo + EMA200
 }
 HTFS = ["M5", "M15", "M30", "H1", "H4", "D1"]
 CHOPCH_EMERGENCY_TF = "M15"
-TIME_STOP_BARS = 240
+TIME_STOP_BARS = 60  # v0.9.15.14: ICT scalps = one impulse
+
+
+# --------------------------------------------------------------------------- #
+# MT5 protocol constants — hardcoded to avoid RPyC proxy serialization issues.
+# The mt5linux bridge returns proxy objects for mt5.TRADE_ACTION_DEAL etc.
+# that look like ints but fail to serialize back through RPyC in order_send().
+# These are universal across all MT5 brokers (defined in the MQL5 spec).
+# --------------------------------------------------------------------------- #
+MT5_TRADE_ACTION_DEAL = 1
+MT5_TRADE_ACTION_SLTP = 3
+MT5_ORDER_TYPE_BUY = 0
+MT5_ORDER_TYPE_SELL = 1
+MT5_ORDER_TIME_GTC = 0
+MT5_RETCODE_DONE = 10009
+MT5_RETCODE_DONE_PARTIAL = 10010
 
 
 # --------------------------------------------------------------------------- #
@@ -143,7 +198,11 @@ def resolve_symbol_spec(mt5: Any, symbol: str, account_ccy: str, usd_zar: float)
         "currency_profit": str(info.get("currency_profit", "USD")),
     }
     spec = spec_for_symbol(resolved, overrides=overrides)
-    return resolved, spec
+    # Capture the broker's minimum stop distance (in points) so the live
+    # trader can enforce it after SL clamping.  trade_stops_level is the
+    # minimum distance from current price that SL/TP must be.
+    stop_level_pts = int(info.get("trade_stops_level", 0))
+    return resolved, spec, stop_level_pts
 
 
 def fetch_bars(mt5: Any, symbol: str, timeframe: str, count: int) -> pd.DataFrame:
@@ -152,27 +211,21 @@ def fetch_bars(mt5: Any, symbol: str, timeframe: str, count: int) -> pd.DataFram
     CRITICAL CAUSALITY RULE: MT5's copy_rates_from_pos(symbol, tf, 0, N) ALWAYS
     returns the CURRENTLY-FORMING bar as the LAST row -- its OHLC is mutating
     in real time and must NEVER be fed into the feature pipeline or signal
-    engine. v0.9.7 guard:
+    engine.
 
-      1. Wall-clock filter: keep bars whose close time has already passed
-         on host clock (`time+dur <= now`). Same parity as v0.9.5 wall
-         filter -- this tolerates arbitrary Wine/RPyC/NTP clock drift
-         between host and MT5 server without filtering out legitimately
-         closed bars (the first v0.9.7 build used `<= now - 2s` which
-         filtered every bar on Sly's Pop-OS host when host clock lagged
-         MT5 server time by ~3s under Wine, producing 0 bars / 'not
-         enough M1 data yet' on every cycle). The forming bar's close is
-         always >= now (it closes dur in the future) so it is excluded.
-      2. For M1 ONLY: unconditionally drop the last row as belt-and-
-         suspenders. M1 forming-bar OHLC poisons feature state
-         (displacements, swings) within seconds, and a ~60s lag is
-         acceptable for scalps. For M5+ the forming bar closes 5-1440
-         minutes in the future, so the wall filter ALONE excludes it
-         safely; an extra unconditional tail drop there (v0.9.5 bug)
-         cut off the most recently CLOSED HTF bar, leaving structural
-         flags (bull_disp, minor_choch_up, etc.) always one HTF period
-         stale. v0.9.7 fixes that so HTF structure updates the moment
-         the HTF bar closes.
+    v0.9.15.11: Replaced the 2-layer lag guard (wall-clock filter + M1 tail
+    drop) with a single grace-period wall filter.  The old approach stacked
+    2 full minutes of lag on M1 scalps — unacceptable for a scalper that
+    needs to see price within seconds of the close.
+
+    New approach: `time + dur <= now + _GRACE` where _GRACE = 5 seconds.
+    This handles BOTH failure modes in one filter:
+      - Host clock ahead of MT5: the forming bar's close is `dur` in the
+        future, so `time+dur` is ~60s ahead of `now`.  Even with 5s grace,
+        `60s > 5s` → forming bar is excluded.
+      - Host clock behind MT5 (Wine/NTP drift): a legitimately closed bar
+        whose close time is a few seconds "in the future" on the host clock
+        still passes because `0s <= 5s` → bar is kept.
     """
     tf_const = getattr(mt5, TIMEFRAME_ATTRS[timeframe])
     dur = timeframe_timedelta(timeframe)
@@ -183,27 +236,13 @@ def fetch_bars(mt5: Any, symbol: str, timeframe: str, count: int) -> pd.DataFram
     df = normalize_bar_frame(raw, symbol, timeframe)
     if df.empty:
         return df
-    # Wall-clock filter: drop bars whose close time has not yet passed on
-    # host clock. This is the primary guard against the forming bar, whose
-    # close time is always `dur` in the future (so it fails `<= now`).
-    # Using `<= now` (v0.9.5 parity) not `< now - grace`: the latter caused
-    # 0 bars on Sly's Pop-OS host when host clock was a few seconds behind
-    # MT5 server time -- every bar's close looked "in the future" by more
-    # than the grace window.
+    # Grace-period wall filter: keep bars whose close time is at most
+    # _GRACE seconds in the future on the host clock.  This replaces both
+    # the old `<= now` filter AND the M1 unconditional tail drop, cutting
+    # lag from 2 bars (~120s) to ~5 seconds.
+    _GRACE = timedelta(seconds=5)
     now = datetime.now(UTC)
-    df = df[df["time"] + dur <= now].copy()
-    # M1 only: unconditional 1-bar tail drop as belt-and-suspenders.
-    # Rationale: M1 forming-bar OHLC poisons displacements/swings within
-    # seconds, and host-clock can be up to several seconds ahead of MT5
-    # server under Wine, which lets the forming M1 bar slip past the wall
-    # filter above. Dropping one more M1 bar costs ~60s latency which is
-    # acceptable for scalps. For M5+ the forming bar's close is 5-1440
-    # minutes in the future, so the wall filter ALONE excludes it safely
-    # even with many seconds of clock skew; an extra tail drop there
-    # (v0.9.5 bug) cut off the most recently CLOSED HTF bar, leaving
-    # structural flags one HTF period stale. v0.9.7 fixes that.
-    if timeframe == "M1" and len(df) > 1:
-        df = df.iloc[:-1].copy()
+    df = df[df["time"] + dur <= now + _GRACE].copy()
     # Keep only the last `count` completed bars
     if len(df) > count:
         df = df.iloc[-count:].copy()
@@ -246,7 +285,7 @@ class LiveTrade:
     direction: int           # +1 long, -1 short
     entry: float
     sl: float
-    tp: float
+    tp: float                # TP1 price
     lots: float
     open_time: datetime
     grade: str
@@ -256,6 +295,17 @@ class LiveTrade:
     close_price: float | None = None
     close_reason: str | None = None
     closed: bool = False
+    # v0.9.15 hybrid ladder state
+    tp1_hit: bool = False    # TP1 reached, partial closed, SL moved to BE
+    tp2_hit: bool = False    # TP2 reached, second partial closed
+    tp2_price: float = 0.0   # TP2 target price
+    runner_trail_px: float = 0.0  # current trailing stop for runner
+    remaining_lots: float = 0.0  # lots remaining after partial closes
+    original_lots: float = 0.0   # original lots at entry
+    # v0.9.15.23: C-grade trailing stop state
+    best_price: float = 0.0      # best price seen (high for long, low for short)
+    trail_active: bool = False   # trailing stop activated (profit threshold crossed)
+    risk_per_unit: float = 0.0   # cached risk_per_unit for R-multiple calc
 
 
 class LiveTrader:
@@ -269,9 +319,11 @@ class LiveTrader:
         *,
         live: bool = False,
         risk_cap: float = 0.02,
+        working_lot: float = 0.04,
         max_open: int = 3,
-        poll_interval: float = 5.0,
+        poll_interval: float = 2.0,
         verbose: bool = False,
+        stop_level_pts: int = 0,
     ):
         self.mt5 = mt5
         self.symbol = symbol
@@ -280,9 +332,11 @@ class LiveTrader:
         self.acct = acct
         self.live = live
         self.risk_cap = risk_cap
+        self.working_lot = working_lot
         self.max_open = max_open
         self.poll_interval = poll_interval
         self.verbose = verbose
+        self._stop_level_pts = stop_level_pts
 
         self._state: dict = {}
         self._trades: dict[int, LiveTrade] = {}
@@ -293,6 +347,7 @@ class LiveTrader:
         self._starting_balance: float | None = None  # set after warmup
         self._last_broker_pos: dict[int, dict] = {}  # snapshot for P&L diffing
         self._wins_count: int = 0
+        self._last_atr: float = 0.0  # cached ATR for intra-bar trailing stop
 
     # ------------------------------------------------------------------ #
     # Account info
@@ -319,9 +374,79 @@ class LiveTrader:
     # ------------------------------------------------------------------ #
     # Order entry
     # ------------------------------------------------------------------ #
+    def _get_filling_modes(self) -> list[int]:
+        """Determine filling modes to try, ordered by likelihood of success.
+
+        Strategy (v0.9.15.4):
+          1. If we already found a working mode (cached), try it FIRST.
+          2. Then try modes the broker's bitmask says are supported.
+          3. Finally try all remaining modes as fallback.
+          4. Dedupe so each mode is tried at most once.
+
+        The bitmask is a PREFERENCE hint, not a hard filter — Exness BTC
+        reports IOC+FOK but actually needs RETURN.  We always try everything.
+
+        v0.9.15.4: Hardcode mode integer values as fallback. The RPyC bridge
+        doesn't always expose ORDER_FILLING_* constants (getattr returns 0),
+        which silently dropped FOK from the list.  Also fix: FOK=0 is a valid
+        filling mode but was filtered by 'if m' (0 is falsy).
+        """
+        # Cached winner from a previous successful order this session
+        cached = getattr(self, "_best_fill_mode", None)
+
+        # MT5 Python package filling mode values (0, 1, 2 — NOT the MQL5
+        # bitmask values 1, 2, 4).  The mt5linux bridge uses the Python
+        # convention.  FOK=0 is valid but falsy, so we must use 'is not None'
+        # checks instead of truthiness.
+        FILL_FOK = 0
+        FILL_IOC = 1
+        FILL_RETURN = 2
+
+        # Read the broker's bitmask to know which modes it RECOMMENDS
+        info = _to_dict(self.mt5.symbol_info(self.symbol))
+        mode_mask = int(info.get("filling_mode", 0))
+
+        # Always try all 3 modes.  The bitmask is a hint for ordering only.
+        # Map: bit 0 = FOK, bit 1 = IOC, bit 2 = RETURN (Python convention)
+        all_modes = [
+            ("FOK", FILL_FOK, 1),
+            ("IOC", FILL_IOC, 2),
+            ("RETURN", FILL_RETURN, 4),
+        ]
+
+        recommended: list[int] = []
+        fallback: list[int] = []
+        for _name, val, bit in all_modes:
+            if mode_mask & bit:
+                recommended.append(val)
+            else:
+                fallback.append(val)
+
+        # Build final ordered list: cached winner → recommended → fallback
+        ordered: list[int] = []
+        seen: set[int] = set()
+        candidates = ([cached] if cached is not None else []) + recommended + fallback
+        for m in candidates:
+            if m not in seen:
+                ordered.append(m)
+                seen.add(m)
+        return ordered
+
+    def _record_fill_success(self, fill_mode: int) -> None:
+        """Cache the filling mode that worked so future orders skip retries."""
+        self._best_fill_mode = fill_mode
+
     def _place_market(self, direction: int, lots: float, sl: float, tp: float,
-                      comment: str) -> int | None:
-        """Place a market order. Returns ticket or None."""
+                      comment: str, *, broker_tp: float = 0.0) -> int | None:
+        """Place a market order. Returns ticket or None.
+
+        v0.9.15.2: DON'T set TP on the broker order for A/B grades. The hybrid
+        ladder (TP1 partial close → BE → TP2 → runner) is managed in code via
+        _partial_close() and _modify_sl(). Setting TP on the broker causes
+        the entire position to close at TP1 — the runner never fires.
+
+        v0.9.15.22: C grades use broker_tp (set on broker). Simple SL/TP trade.
+        """
         bid, ask = self.quote()
         price = ask if direction == 1 else bid
         digits = self.spec.digits
@@ -331,43 +456,68 @@ class LiveTrader:
         # 500 points ($0.50 on XAU, ~5 pips on FX) which is tolerable slippage
         # on our 0.01-lot scalps (max 0.50 * 100 * 0.01 = $0.50 ≈ R9 extra).
         deviation = 500
-        # Try ORDER_FILLING_IOC first (Exness ECN accounts accept it); on
-        # rejection (retcode 10030 / "Unsupported filling mode"), fall back to
-        # ORDER_FILLING_RETURN which market-makers accept. v0.9.7 hard-coded
-        # IOC with no fallback, producing silent retcode=-1 failures.
-        filling_modes = [self.mt5.ORDER_FILLING_IOC, self.mt5.ORDER_FILLING_RETURN]
-        DONE = {int(getattr(self.mt5, "TRADE_RETCODE_DONE", 10009)),
-                int(getattr(self.mt5, "TRADE_RETCODE_DONE_PARTIAL", 10010))}
+        # v0.9.15.1: query broker's filling_mode bitmask and try supported modes
+        # in order. Retries on retcode=-1 (RPyC bridge None) instead of giving
+        # up on the first mode.
+        filling_modes = self._get_filling_modes()
+        DONE = {MT5_RETCODE_DONE, MT5_RETCODE_DONE_PARTIAL}
+        RETRY_RETCODES = {10030, -1}  # unsupported fill / bridge None → try next mode
         if not self.live:
             print(f"    [DRY-RUN] {'BUY' if direction==1 else 'SELL'} {lots} {self.symbol} @ {price:.{digits}f}  SL={sl:.{digits}f}  TP={tp:.{digits}f}  ({comment})")
             return -int(time.time() * 1000)   # fake ticket
         for fill_mode in filling_modes:
+            # Refresh price each attempt (stale price causes retcode=-1)
+            bid, ask = self.quote()
+            price = ask if direction == 1 else bid
             req = {
-                "action": self.mt5.TRADE_ACTION_DEAL,
+                "action": MT5_TRADE_ACTION_DEAL,
                 "symbol": self.symbol,
                 "volume": round(float(lots), 2),
-                "type": self.mt5.ORDER_TYPE_BUY if direction == 1 else self.mt5.ORDER_TYPE_SELL,
+                "type": MT5_ORDER_TYPE_BUY if direction == 1 else MT5_ORDER_TYPE_SELL,
                 "price": price,
                 "sl": round(float(sl), digits),
-                "tp": round(float(tp), digits),
+                "tp": round(float(broker_tp), digits),  # C grades: real TP; A/B: 0.0 (hybrid ladder)
                 "deviation": deviation,
                 "magic": MAGIC,
                 "comment": comment[:31],
-                "type_time": self.mt5.ORDER_TIME_GTC,
+                "type_time": MT5_ORDER_TIME_GTC,
                 "type_filling": fill_mode,
             }
-            res = _to_dict(self.mt5.order_send(req))
+            # v0.9.15.4: wrap in try/except to catch RPyC bridge exceptions
+            try:
+                raw_res = self.mt5.order_send(req)
+            except Exception as exc:
+                fill_name = {0: "FOK", 1: "IOC", 2: "RETURN"}.get(fill_mode, str(fill_mode))
+                print(f"    [FILL-EXCEPTION] mode={fill_name} exc={exc!r} — trying next")
+                time.sleep(0.3)
+                continue
+            if raw_res is None:
+                # v0.9.15.7: bridge returned None — query last_error for diagnosis
+                try:
+                    err = self.mt5.last_error()
+                except Exception:
+                    err = "last_error() failed"
+                fill_name = {0: "FOK", 1: "IOC", 2: "RETURN"}.get(fill_mode, str(fill_mode))
+                print(f"    [FILL-RETRY] raw=None mode={fill_name} last_error={err} — trying next")
+                time.sleep(0.3)
+                continue
+            res = _to_dict(raw_res)
             retcode = int(res.get("retcode", -1))
             if retcode in DONE:
-                if fill_mode == self.mt5.ORDER_FILLING_RETURN:
-                    print("    [INFO] order used ORDER_FILLING_RETURN (IOC unsupported)")
+                if fill_mode != filling_modes[0]:
+                    fill_name = {0: "FOK", 1: "IOC", 2: "RETURN"}.get(fill_mode, str(fill_mode))
+                    print(f"    [INFO] order filled with {fill_name} (previous modes failed)")
+                self._record_fill_success(fill_mode)
                 return int(res.get("order", 0)) or int(res.get("deal", 0))
-            # Retcode 10030 = "Unsupported filling mode" → fall through to next.
-            if retcode in (10030,):
+            if retcode in RETRY_RETCODES:
+                fill_name = {0: "FOK", 1: "IOC", 2: "RETURN"}.get(fill_mode, str(fill_mode))
+                print(f"    [FILL-RETRY] retcode={retcode} mode={fill_name} res={res} — trying next")
+                time.sleep(0.3)
                 continue
-            print(f"    [REJECT] {retcode} {res.get('comment','')} req_fill={fill_mode} req={req}")
+            # Definitive broker rejection (10016 invalid stops, etc.) — don't retry
+            print(f"    [REJECT] {retcode} {res.get('comment','')} fill={fill_mode} req={req}")
             return None
-        print(f"    [REJECT] all filling modes rejected for {comment}")
+        print(f"    [REJECT] all filling modes failed for {comment} (tried {len(filling_modes)} modes: {filling_modes})")
         return None
 
     def _close_position(self, ticket: int, reason: str) -> bool:
@@ -377,22 +527,24 @@ class LiveTrader:
             return False
         vol = float(pos.get("volume", 0.0))
         ptype = int(pos.get("type", 0))
-        close_type = self.mt5.ORDER_TYPE_SELL if ptype == 0 else self.mt5.ORDER_TYPE_BUY
+        close_type = MT5_ORDER_TYPE_SELL if ptype == 0 else MT5_ORDER_TYPE_BUY
         bid, ask = self.quote()
         price = bid if ptype == 0 else ask
         digits = self.spec.digits
         deviation = 500  # match _place_market
-        DONE = {int(getattr(self.mt5, "TRADE_RETCODE_DONE", 10009)),
-                int(getattr(self.mt5, "TRADE_RETCODE_DONE_PARTIAL", 10010))}
+        DONE = {MT5_RETCODE_DONE, MT5_RETCODE_DONE_PARTIAL}
+        RETRY_RETCODES = {10030, -1}
         if not self.live:
             lt = self._trades.get(int(ticket))
             if lt:
                 lt.closed = True; lt.close_reason = reason; lt.close_price = price
             print(f"    [DRY-RUN] CLOSE ticket={ticket} @ {price:.{digits}f} ({reason})")
             return True
-        for fill_mode in (self.mt5.ORDER_FILLING_IOC, self.mt5.ORDER_FILLING_RETURN):
+        for fill_mode in self._get_filling_modes():
+            bid, ask = self.quote()
+            price = bid if ptype == 0 else ask
             req = {
-                "action": self.mt5.TRADE_ACTION_DEAL,
+                "action": MT5_TRADE_ACTION_DEAL,
                 "symbol": self.symbol,
                 "volume": round(vol, 2),
                 "type": close_type,
@@ -401,17 +553,145 @@ class LiveTrader:
                 "deviation": deviation,
                 "magic": MAGIC,
                 "comment": reason[:31],
-                "type_time": self.mt5.ORDER_TIME_GTC,
+                "type_time": MT5_ORDER_TIME_GTC,
                 "type_filling": fill_mode,
             }
-            res = _to_dict(self.mt5.order_send(req))
+            try:
+                raw_res = self.mt5.order_send(req)
+            except Exception as exc:
+                print(f"    [CLOSE-EXCEPTION] ticket={ticket} fill={fill_mode} exc={exc!r}")
+                time.sleep(0.3)
+                continue
+            if raw_res is None:
+                try:
+                    err = self.mt5.last_error()
+                except Exception:
+                    err = "last_error() failed"
+                print(f"    [CLOSE-RETRY] ticket={ticket} raw=None fill={fill_mode} last_error={err}")
+                time.sleep(0.3)
+                continue
+            res = _to_dict(raw_res)
             retcode = int(res.get("retcode", -1))
             if retcode in DONE:
+                self._record_fill_success(fill_mode)
                 return True
-            if retcode in (10030,):
+            if retcode in RETRY_RETCODES:
+                if retcode == -1:
+                    time.sleep(0.3)
                 continue
             print(f"    [CLOSE-REJECT] ticket={ticket} retcode={retcode} {res.get('comment','')} fill={fill_mode}")
             return False
+        return False
+
+    def _partial_close(self, ticket: int, lots_to_close: float, reason: str) -> bool:
+        """Close a partial volume of an open position. Returns True on success."""
+        pos = self._get_position(ticket)
+        if pos is None:
+            return False
+        vol = min(lots_to_close, float(pos.get("volume", 0.0)))
+        if vol < self.spec.volume_min:
+            return False
+        vol = round(vol, 2)
+        ptype = int(pos.get("type", 0))
+        close_type = MT5_ORDER_TYPE_SELL if ptype == 0 else MT5_ORDER_TYPE_BUY
+        DONE = {MT5_RETCODE_DONE, MT5_RETCODE_DONE_PARTIAL}
+        if not self.live:
+            bid, ask = self.quote()
+            price = bid if ptype == 0 else ask
+            print(f"    [DRY-RUN] PARTIAL CLOSE ticket={ticket} {vol} lots @ {price:.{self.spec.digits}f} ({reason})")
+            return True
+        for fill_mode in self._get_filling_modes():
+            bid, ask = self.quote()
+            price = bid if ptype == 0 else ask
+            req = {
+                "action": MT5_TRADE_ACTION_DEAL,
+                "symbol": self.symbol,
+                "volume": vol,
+                "type": close_type,
+                "position": int(ticket),
+                "price": price,
+                "deviation": 500,
+                "magic": MAGIC,
+                "comment": reason[:31],
+                "type_time": MT5_ORDER_TIME_GTC,
+                "type_filling": fill_mode,
+            }
+            try:
+                raw_res = self.mt5.order_send(req)
+            except Exception as exc:
+                print(f"    [PARTIAL-EXCEPTION] ticket={ticket} fill={fill_mode} exc={exc!r}")
+                time.sleep(0.3)
+                continue
+            if raw_res is None:
+                try:
+                    err = self.mt5.last_error()
+                except Exception:
+                    err = "last_error() failed"
+                print(f"    [PARTIAL-RETRY] ticket={ticket} raw=None fill={fill_mode} last_error={err}")
+                time.sleep(0.3)
+                continue
+            res = _to_dict(raw_res)
+            retcode = int(res.get("retcode", -1))
+            if retcode in DONE:
+                print(f"    [PARTIAL] ticket={ticket} closed {vol} lots ({reason})")
+                self._record_fill_success(fill_mode)
+                return True
+            if retcode in {10030, -1}:
+                if retcode == -1:
+                    time.sleep(0.3)
+                continue
+            print(f"    [PARTIAL-REJECT] ticket={ticket} retcode={retcode} fill={fill_mode}")
+            return False
+        return False
+
+    def _modify_sl(self, ticket: int, new_sl: float) -> bool:
+        """Modify the SL on an open position (keep TP=0). Returns True on success.
+
+        v0.9.15.23: Enforce minimum stop distance before sending to broker.
+        The old code sent raw SL values which caused retcode=10013 (Invalid
+        request) when the trailing SL was too close to current price.
+        """
+        pos = self._get_position(ticket)
+        if pos is None:
+            return False
+        DONE = {MT5_RETCODE_DONE, MT5_RETCODE_DONE_PARTIAL}
+        # Enforce minimum stop distance
+        point = self.spec.point
+        bid, ask = self.quote()
+        ptype = int(pos.get("type", 0))
+        direction = 1 if ptype == 0 else -1
+        market = bid if direction == 1 else ask
+        broker_min = self._stop_level_pts * point
+        fallback_min = point * 500
+        min_dist = max(broker_min, fallback_min)
+        atr = self._last_atr
+        if atr > 0:
+            min_dist = max(min_dist, 0.75 * atr)
+        if direction == 1:
+            dist = market - new_sl
+            if dist < min_dist:
+                new_sl = market - min_dist
+        else:
+            dist = new_sl - market
+            if dist < min_dist:
+                new_sl = market + min_dist
+        new_sl = round(float(new_sl), self.spec.digits)
+        if not self.live:
+            print(f"    [DRY-RUN] MODIFY SL ticket={ticket} → {new_sl:.{self.spec.digits}f}")
+            return True
+        req = {
+            "action": MT5_TRADE_ACTION_SLTP,
+            "symbol": self.symbol,
+            "position": int(ticket),
+            "sl": new_sl,
+            "tp": 0.0,
+        }
+        res = _to_dict(self.mt5.order_send(req))
+        retcode = int(res.get("retcode", -1))
+        if retcode in DONE:
+            print(f"    [TRAIL] ticket={ticket} SL moved to {new_sl:.{self.spec.digits}f} (market={market:.{self.spec.digits}f})")
+            return True
+        print(f"    [MODIFY-REJECT] ticket={ticket} sl={new_sl:.{self.spec.digits}f} retcode={retcode}")
         return False
 
     def _get_position(self, ticket: int) -> dict | None:
@@ -436,8 +716,18 @@ class LiveTrader:
         try:
             from datetime import datetime as _dt
             from datetime import timedelta as _td
-            utc_to = _dt.utcnow() + _td(minutes=2)
-            utc_from = utc_to - _td(hours=1)
+            # MT5's history_deals_select date range is interpreted in SERVER
+            # time (the mt5linux bridge passes naive datetimes straight to the
+            # Windows-side MT5 API). Exness MT5Trial9 runs at UTC+3, so the
+            # v0.9.13.2 window of [now-1h, now+2min] in naive UTC excluded the
+            # real deal — e.g. a close at 19:16 UTC = 22:16 server time was
+            # outside 18:17-19:19 server, history_deals_get returned [], and
+            # the bot fell back to the last-poll estimate (16:14: -9.60 booked
+            # vs -37.75 real; 19:17: -3.68 booked vs -28.18 total). Use a
+            # generous window that covers any server offset / DST: 7 days back
+            # → now + 1 day.
+            utc_to = _dt.utcnow() + _td(days=1)
+            utc_from = utc_to - _td(days=7)
             self.mt5.history_deals_select(utc_from, utc_to)
             deals = self.mt5.history_deals_get(position=int(ticket)) or []
             total = 0.0
@@ -472,24 +762,73 @@ class LiveTrader:
         *,
         silent: bool = False,
     ) -> bool:
-        """Return True if vol_min-floored size is within safe risk bounds.
+        """Return True if floored size is within safe risk bounds.
 
-        Hard-REJECT when actual risk exceeds max(risk_cap, 1.5%) OR 3× the
-        grade's target risk. Mild 1.25–3× oversize is still allowed (caller
-        may SIZE-WARN). Extracted so unit tests can pin the thresholds without
-        needing a live MT5 bridge.
+        v0.9.15.15: Small accounts (3000 ZAR / $160) can't trade XAU with
+        0.01 min-lot and stay under 5% risk with 4-7pt stops.  The old code
+        hard-rejected ALL trades, leaving the bot idle for hours.  Now:
+        - If actual risk <= risk_cap: PASS (normal)
+        - If actual risk <= 3x risk_cap: WARN but PASS (min-lot oversizing)
+        - If actual risk > 3x risk_cap: REJECT (truly dangerous)
+        This lets small accounts trade while preventing 30%+ risk gambles.
         """
-        max_risk_cap = max(self.risk_cap, 0.015)
-        if actual_risk_pct > max_risk_cap or actual_risk_pct > target_risk_pct * 3.0:
+        max_risk_cap = self.risk_cap
+        hard_ceiling = max_risk_cap * 3.0  # 3x the user's risk cap
+        if actual_risk_pct <= max_risk_cap:
+            return True
+        if actual_risk_pct <= hard_ceiling:
+            # Min-lot forces oversizing — warn but allow
             if not silent:
                 print(
-                    f"    [REJECT] {side} {setup}/{grade} vol_min={self.spec.volume_min} forces "
-                    f"risk={actual_risk_pct*100:.2f}% > cap={max_risk_cap*100:.2f}% "
-                    f"(target {target_risk_pct*100:.2f}%) — SKIPPING "
-                    f"(stop {risk_per_unit:.2f}pt too wide for min-lot)"
+                    f"    [SIZE-ACCEPT] {side} {setup}/{grade} vol_min={self.spec.volume_min} "
+                    f"forces risk={actual_risk_pct*100:.2f}% > cap={max_risk_cap*100:.2f}% "
+                    f"— ACCEPTING (min-lot on small account, stop={risk_per_unit:.2f}pt)"
                 )
-            return False
-        return True
+            return True
+        # Truly dangerous — reject
+        if not silent:
+            print(
+                f"    [REJECT] {side} {setup}/{grade} vol_min={self.spec.volume_min} forces "
+                f"risk={actual_risk_pct*100:.2f}% > hard ceiling={hard_ceiling*100:.2f}% "
+                f"— SKIPPING (stop {risk_per_unit:.2f}pt too wide)"
+            )
+        return False
+
+    def _enforce_min_sl(self, entry: float, sl: float, direction: int,
+                       atr: float, bid: float, ask: float) -> float:
+        """Ensure SL is at least broker stop_level + safety margin from market.
+
+        MT5 rejects orders with retcode 10016 ("Invalid stops") when SL/TP
+        is closer than trade_stops_level points to the current price.  This
+        method bumps the SL outward if needed, logging a warning.
+
+        The minimum distance is: max(stop_level_pts * point, point * 500, 0.75 * ATR).
+        The point*500 fallback handles brokers that report stop_level=0 but
+        still reject tight stops (common on Exness).  0.75*ATR scales to
+        any asset's volatility — BTC ATR≈19 → 14pt min; XAU ATR≈2 → 1.5pt min.
+        v0.9.15.1: also enforces minimum TP distance (prevents 10016 on TP side).
+        """
+        point = self.spec.point
+        broker_min = self._stop_level_pts * point
+        fallback_min = point * 500
+        min_dist = max(broker_min, fallback_min)
+        if atr > 0:
+            min_dist = max(min_dist, 0.75 * atr)
+        market = ask if direction == 1 else bid
+        if direction == 1:
+            dist = market - sl
+        else:
+            dist = sl - market
+        if dist < min_dist:
+            if direction == 1:
+                new_sl = market - min_dist
+            else:
+                new_sl = market + min_dist
+            print(f"    [SL-BUMP] SL moved from {sl:.{self.spec.digits}f} to "
+                  f"{new_sl:.{self.spec.digits}f} (min_dist={min_dist:.{self.spec.digits}f} "
+                  f"broker_stop_level={self._stop_level_pts}pts)")
+            return new_sl
+        return sl
 
     @staticmethod
     def _parse_broker_time(raw: Any, fallback: datetime | None = None) -> datetime:
@@ -583,13 +922,24 @@ class LiveTrader:
             self._vlog(f"{side} {setup} blocked by accept_shorts=False"); self._signals_fired.add(key); return
         if sig.direction == 1 and not self.cfg.confluence.accept_longs:
             self._vlog(f"{side} {setup} blocked by accept_longs=False"); self._signals_fired.add(key); return
-        # Single source of truth for open count: _our_open_positions() queries
-        # MT5 directly for all positions with our magic number. v0.9.7 double-
-        # counted by adding len(_trades) on top — _trades tracks LiveTrade
-        # metadata for positions we opened THIS run, all of which are already
-        # in the MT5 query. Orphan positions from prior bot runs that are not
-        # in _trades ARE still in the MT5 query, so this correctly caps total
-        # exposure (orphans count against max_open until they close broker-side).
+
+        # --- Netting mode: flip on direction change, scale into winners ---
+        # Close opposite-direction positions before opening new one.
+        # Allow same-direction positions up to max_open (scaling into winners).
+        our_positions = self._our_open_positions()
+        for tkt, pos in list(our_positions.items()):
+            pos_dir = 1 if int(pos.get("type", 0)) == 0 else -1
+            if pos_dir == -sig.direction:
+                # Opposite direction — close it to flip
+                lt = self._trades.get(tkt)
+                reason = "NETTING_FLIP"
+                print(f"    [NETTING] closing {'LONG' if pos_dir==1 else 'SHORT'} ticket={tkt} to open {side}")
+                self._close_position(tkt, reason)
+                if lt:
+                    lt.closed = True
+                    lt.close_reason = reason
+                our_positions.pop(tkt, None)
+        # Re-check after any flips — now enforce max_open for same-direction scaling
         open_n = len(self._our_open_positions())
         if open_n >= self.max_open:
             self._vlog(f"{side} {setup}/{sig.grade} rejected: max_open={self.max_open} reached (open={open_n})")
@@ -607,7 +957,26 @@ class LiveTrader:
         risk_pct = min(float(sig.risk_pct), self.risk_cap)
         risk_acct = risk_pct * equity
         risk_quote = risk_acct / self.acct.fx_to_account.get(self.spec.currency_profit, 1.0)
-        lots = self.spec.lots_for_risk(risk_per_unit, risk_quote)
+        risk_lots = self.spec.lots_for_risk(risk_per_unit, risk_quote)
+
+        # Dynamic working-lot sizing:
+        # working_lot is the USER's intended base trade size — treat it as
+        # the absolute MINIMUM lot floor.  Don't scale it down by risk_pct
+        # (that was the v0.9.15 bug: C-grade signals with 0.12% risk_pct
+        # scaled 0.04 working_lot → 0.001, floored to vol_min 0.01, making
+        # every trade a meaningless dust position).  risk_cap remains the
+        # hard UPPER ceiling that prevents oversizing on wide stops.
+        dynamic_target = float(np.clip(self.working_lot, self.spec.volume_min, self.spec.volume_max))
+        dynamic_target = np.floor(dynamic_target / self.spec.volume_step) * self.spec.volume_step
+        dynamic_target = float(dynamic_target)
+
+        lots = max(risk_lots, dynamic_target) if risk_lots >= self.spec.volume_min else dynamic_target
+        lots = np.floor(lots / self.spec.volume_step) * self.spec.volume_step
+        lots = float(np.clip(lots, self.spec.volume_min, self.spec.volume_max))
+        # v0.9.15.23: C grades always use minimum lot (0.01). Lower confidence
+        # = smaller position. Trail profits instead of fixed TP targets.
+        if sig.grade == 'C' and lots > self.spec.volume_min:
+            lots = self.spec.volume_min
         # Compute the *actual* risk the broker will enforce for the chosen lots
         # (vol_min floors lots, which can oversize risk on tiny accounts/grades).
         actual_risk_quote = self.spec.profit_per_lot(risk_per_unit) * lots
@@ -632,6 +1001,20 @@ class LiveTrader:
             risk_pct = actual_risk_pct
         tp = fill + sig.direction * self.cfg.exits.tp1_r * risk_per_unit
         sl = float(sig.stop)
+        # v0.9.15.1: enforce broker minimum stop distance (prevents 10016 rejects)
+        sl = self._enforce_min_sl(fill, sl, sig.direction, sig.atr_at_entry, bid, ask)
+        risk_per_unit = abs(fill - sl)
+        if risk_per_unit <= 0:
+            self._vlog(f"{side} {setup}/{sig.grade} rejected: invalid risk_per_unit after SL bump")
+            return
+        tp = fill + sig.direction * self.cfg.exits.tp1_r * risk_per_unit
+        # v0.9.15.1: enforce minimum TP distance too — broker rejects TP too close
+        point = self.spec.point
+        tp_market_dist = abs(tp - (ask if sig.direction == 1 else bid))
+        tp_min = max(point * 500, 0.75 * sig.atr_at_entry) if sig.atr_at_entry > 0 else point * 500
+        if tp_market_dist < tp_min:
+            tp = (ask if sig.direction == 1 else bid) + sig.direction * tp_min
+            print(f"    [TP-BUMP] TP moved to {tp:.{self.spec.digits}f} (min_dist={tp_min:.{self.spec.digits}f})")
         margin_quote = (lots * self.spec.contract_size * fill) / max(self.acct.leverage, 1)
         margin_acct = self.acct.to_account_ccy(margin_quote, self.spec.currency_profit)
         if margin_acct > equity * 0.95:
@@ -641,14 +1024,22 @@ class LiveTrader:
         self._vlog(f"{side} {setup}/{sig.grade} {zone_label} kz={sig.killzone} fill={fill:.{self.spec.digits}f} "
                    f"sl={sl:.{self.spec.digits}f} tp={tp:.{self.spec.digits}f} lots={lots:.2f} risk={risk_pct*100:.2f}%")
         comment = f"L5 {sig.grade} {setup} {sig.killzone}"
-        ticket = self._place_market(sig.direction, lots, sl, tp, comment)
+        # v0.9.15.23: ALL grades use broker_tp=0.0 — TP managed in code.
+        # C grades: trailing stop locks profits once price moves into gain.
+        # A/B grades: hybrid ladder (TP1→BE→TP2→runner).
+        broker_tp = 0.0
+        ticket = self._place_market(sig.direction, lots, sl, tp, comment, broker_tp=broker_tp)
         if ticket is None:
             self._vlog(f"{side} {setup}/{sig.grade} ORDER REJECTED by broker")
             return
         self._signals_fired.add(key)
+        # v0.9.15: compute TP2 price for hybrid ladder
+        tp2_price = fill + sig.direction * self.cfg.exits.tp2_r * risk_per_unit
         self._trades[ticket] = LiveTrade(
             ticket=ticket, direction=sig.direction, entry=fill, sl=sl, tp=tp,
             lots=lots, open_time=datetime.now(UTC), grade=sig.grade, risk_pct=risk_pct,
+            tp2_price=tp2_price, remaining_lots=lots, original_lots=lots,
+            best_price=fill, risk_per_unit=risk_per_unit,
         )
         # One-shot arm for BOS_CONT: after a successful fill, mark this leg
         # as "entered" so subsequent consecutive BOS bars in the same leg
@@ -667,23 +1058,112 @@ class LiveTrader:
     def _monitor_positions(self, latest_m1_row: pd.Series | None, *, new_bar: bool = False) -> None:
         """Check SL/TP/emergency/time-stop for open positions.
 
+        v0.9.15 hybrid ladder: TP1 1.0R @ 50% → BE; TP2 2.5R @ 25%;
+        runner 25% with ATR trail + M5 CHoCH kill.
+
         new_bar=True means this call corresponds to a fresh closed M1 bar —
         that's where bars_held increments and CHoCH/time-stop checks run.
         Intra-bar poll calls (new_bar=False) only check broker-side SL/TP.
         """
         bid, ask = self.quote()
+        atr = 0.0
+        if latest_m1_row is not None:
+            atr = float(latest_m1_row.get('atr_14', 0.0)) if pd.notna(latest_m1_row.get('atr_14')) else 0.0
+            if atr > 0:
+                self._last_atr = atr
+        else:
+            atr = self._last_atr  # use cached ATR for intra-bar polls
 
-        # ---------- SL / TP ---------- #
+        # ---------- SL / TP (hybrid ladder) ---------- #
         if not self.live:
             to_close: list[tuple[int, str]] = []
             for ticket, lt in list(self._trades.items()):
                 if lt.closed:
                     continue
                 price = bid if lt.direction == 1 else ask
+                # Check SL hit
                 hit_sl = (lt.direction == 1 and price <= lt.sl) or (lt.direction == -1 and price >= lt.sl)
-                hit_tp = (lt.direction == 1 and price >= lt.tp) or (lt.direction == -1 and price <= lt.tp)
-                if hit_sl:   to_close.append((ticket, "SL"))
-                elif hit_tp: to_close.append((ticket, "TP1"))
+                if hit_sl:
+                    to_close.append((ticket, "SL"))
+                    continue
+                # v0.9.15.23: C-grade trailing stop (dry-run)
+                if lt.grade == 'C':
+                    # Track best price
+                    if lt.direction == 1:
+                        lt.best_price = max(lt.best_price, price)
+                    else:
+                        lt.best_price = min(lt.best_price, price) if lt.best_price > 0 else price
+                    r_unit = lt.risk_per_unit if lt.risk_per_unit > 0 else abs(lt.tp - lt.entry)
+                    if r_unit <= 0:
+                        r_unit = 1.0
+                    cur_r = (price - lt.entry) / r_unit if lt.direction == 1 else (lt.entry - price) / r_unit
+                    # TP hit at 1.0R → close full position
+                    if cur_r >= 1.0:
+                        to_close.append((ticket, "C_TP"))
+                        continue
+                    # Activate trailing at 0.3R profit
+                    if not lt.trail_active and cur_r >= 0.3:
+                        lt.trail_active = True
+                        # Move SL to breakeven + small buffer
+                        lt.sl = lt.entry + lt.direction * 0.1 * r_unit
+                        print(f"    [C-TRAIL-ACTIVE] ticket={ticket} r={cur_r:.2f} SL locked at {lt.sl:.{self.spec.digits}f}")
+                    # Trail: move SL to lock profits behind best price
+                    if lt.trail_active and atr > 0:
+                        trail_dist = max(0.5 * atr, 0.3 * r_unit)
+                        if lt.direction == 1:
+                            new_trail = lt.best_price - trail_dist
+                            if new_trail > lt.sl:
+                                lt.sl = new_trail
+                        else:
+                            new_trail = lt.best_price + trail_dist
+                            if new_trail < lt.sl:
+                                lt.sl = new_trail
+                    continue
+                # Hybrid ladder: TP1 → partial close + BE
+                if not lt.tp1_hit:
+                    hit_tp1 = (lt.direction == 1 and price >= lt.tp) or (lt.direction == -1 and price <= lt.tp)
+                    if hit_tp1:
+                        lt.tp1_hit = True
+                        # Close 50% at TP1
+                        close_lots = lt.original_lots * self.cfg.exits.tp1_pct
+                        close_lots = max(round(close_lots, 2), self.spec.volume_min)
+                        lt.remaining_lots = max(round(lt.original_lots - close_lots, 2), self.spec.volume_min)
+                        # Move SL to breakeven
+                        lt.sl = lt.entry
+                        print(f"    [TP1] ticket={ticket} closed {close_lots} lots @ {price:.{self.spec.digits}f} "
+                              f"→ BE SL={lt.sl:.{self.spec.digits}f} remaining={lt.remaining_lots}")
+                # TP2 → partial close + trail
+                elif not lt.tp2_hit:
+                    hit_tp2 = (lt.direction == 1 and price >= lt.tp2_price) or (lt.direction == -1 and price <= lt.tp2_price)
+                    if hit_tp2:
+                        lt.tp2_hit = True
+                        close_lots = lt.original_lots * self.cfg.exits.tp2_pct
+                        close_lots = max(round(close_lots, 2), self.spec.volume_min)
+                        lt.remaining_lots = max(round(lt.remaining_lots - close_lots, 2), self.spec.volume_min)
+                        print(f"    [TP2] ticket={ticket} closed {close_lots} lots @ {price:.{self.spec.digits}f} "
+                              f"remaining={lt.remaining_lots}")
+                # Runner: ATR trail + M5 CHoCH kill (A/B grades)
+                else:
+                    # M5 CHoCH kill for runner
+                    if latest_m1_row is not None:
+                        m5_choch_against = (
+                            (lt.direction == 1 and bool(latest_m1_row.get("M5_minor_choch_dn", False))) or
+                            (lt.direction == -1 and bool(latest_m1_row.get("M5_minor_choch_up", False)))
+                        )
+                        if m5_choch_against:
+                            to_close.append((ticket, "M5_CHOCH_RUNNER"))
+                            continue
+                    # ATR trailing stop for runner
+                    if atr > 0:
+                        trail_dist = self.cfg.exits.runner_trail_atr_mult * atr
+                        if lt.direction == 1:
+                            new_trail = price - trail_dist
+                            if new_trail > lt.sl:
+                                lt.sl = new_trail
+                        else:
+                            new_trail = price + trail_dist
+                            if new_trail < lt.sl:
+                                lt.sl = new_trail
                 # rough running P&L for status line
                 r_mult = (price - lt.entry) / max(abs(lt.tp - lt.entry), 1e-9)
                 if lt.direction == -1:
@@ -695,24 +1175,159 @@ class LiveTrader:
                 lt.close_price = price; lt.closed = True; lt.close_reason = reason
                 if self._close_position(ticket, reason):
                     print(f"    [EXIT] ticket={ticket} reason={reason}")
+                # v0.9.15: one-shot re-arm when flat after TP
+                if reason in ("TP1", "M5_CHOCH_RUNNER"):
+                    # Re-arm BOS_CONT one-shot so next leg can fire
+                    self._state[f"_bos_entered_{lt.direction:+d}"] = False
             broker_pos: dict[int, dict] = {}
         else:
+            # v0.9.15.2: Hybrid ladder in LIVE mode.
+            # TP is NOT set on the broker (tp=0), so the broker never
+            # auto-closes. We detect TP1/TP2/runner/SL in code, send
+            # partial close orders and SL modifications via MT5.
             broker_pos = self._our_open_positions()
             broker_tickets = set(broker_pos.keys())
-            # Detect positions that closed between polls by comparing snapshot
-            # to previous open positions. The last-known profit from the
-            # previous poll is the best estimate we have (broker has removed
-            # the position by now so we can't query it post-close).
             prev = getattr(self, "_last_broker_pos", {}) or {}
+            to_close: list[tuple[int, str]] = []
             for ticket, lt in list(self._trades.items()):
-                if ticket not in broker_tickets and not lt.closed:
-                    last_profit = float(prev.get(ticket, {}).get("profit", 0.0)) if prev else 0.0
+                if lt.closed:
+                    continue
+                # Position gone from broker → SL hit or broker-managed close
+                if ticket not in broker_tickets:
+                    realized = self._deal_profit(int(ticket))
+                    if realized is not None:
+                        last_profit = realized
+                    else:
+                        last_profit = float(prev.get(ticket, {}).get("profit", 0.0)) if prev else 0.0
+                        print(f"    [WARN] ticket={ticket} no deal in MT5 history — using last-poll estimate "
+                              f"{last_profit:+.2f}{self.acct.currency}")
                     lt.closed = True
                     lt.close_reason = "BROKER"
                     lt.pnl = last_profit
                     if last_profit > 0:
                         self._wins_count += 1
-                    print(f"    [EXIT] ticket={ticket} reason=BROKER (SL/TP hit) pnl={last_profit:+.2f}{self.acct.currency}")
+                    print(f"    [EXIT] ticket={ticket} reason=BROKER pnl={last_profit:+.2f}{self.acct.currency}")
+                    self._state[f"_bos_entered_{lt.direction:+d}"] = False
+                    continue
+
+                # Position still open — check hybrid ladder levels
+                price = bid if lt.direction == 1 else ask
+
+                # Check SL hit (intra-bar, before bar close)
+                hit_sl = (lt.direction == 1 and price <= lt.sl) or (lt.direction == -1 and price >= lt.sl)
+                if hit_sl:
+                    to_close.append((ticket, "SL"))
+                    continue
+
+                # v0.9.15.23: C-grade trailing stop (live mode)
+                if lt.grade == 'C':
+                    # Track best price
+                    if lt.direction == 1:
+                        lt.best_price = max(lt.best_price, price)
+                    else:
+                        lt.best_price = min(lt.best_price, price) if lt.best_price > 0 else price
+                    r_unit = lt.risk_per_unit if lt.risk_per_unit > 0 else abs(lt.tp - lt.entry)
+                    if r_unit <= 0:
+                        r_unit = 1.0
+                    cur_r = (price - lt.entry) / r_unit if lt.direction == 1 else (lt.entry - price) / r_unit
+                    # TP hit at 1.0R → close full position at market
+                    if cur_r >= 1.0:
+                        to_close.append((ticket, "C_TP"))
+                        continue
+                    # Activate trailing at 0.3R profit — lock SL to breakeven+
+                    if not lt.trail_active and cur_r >= 0.3:
+                        lt.trail_active = True
+                        lt.sl = lt.entry + lt.direction * 0.1 * r_unit
+                        self._modify_sl(ticket, lt.sl)
+                        print(f"    [C-TRAIL-ACTIVE] ticket={ticket} r={cur_r:.2f} SL locked at {lt.sl:.{self.spec.digits}f}")
+                    # Trail: move SL to lock profits behind best price
+                    if lt.trail_active and atr > 0:
+                        trail_dist = max(0.5 * atr, 0.3 * r_unit)
+                        if lt.direction == 1:
+                            new_trail = lt.best_price - trail_dist
+                            if new_trail > lt.sl:
+                                lt.sl = new_trail
+                                self._modify_sl(ticket, lt.sl)
+                        else:
+                            new_trail = lt.best_price + trail_dist
+                            if new_trail < lt.sl:
+                                lt.sl = new_trail
+                                self._modify_sl(ticket, lt.sl)
+                    continue
+                # TP1 → partial close 50% + move SL to BE
+                if not lt.tp1_hit:
+                    hit_tp1 = (lt.direction == 1 and price >= lt.tp) or (lt.direction == -1 and price <= lt.tp)
+                    if hit_tp1:
+                        lt.tp1_hit = True
+                        close_lots = lt.original_lots * self.cfg.exits.tp1_pct
+                        close_lots = max(round(close_lots, 2), self.spec.volume_min)
+                        ok = self._partial_close(ticket, close_lots, "TP1")
+                        if ok:
+                            lt.remaining_lots = max(round(lt.original_lots - close_lots, 2), self.spec.volume_min)
+                            lt.sl = lt.entry  # move to breakeven
+                            self._modify_sl(ticket, lt.sl)
+                            print(f"    [TP1] ticket={ticket} closed {close_lots} lots @ {price:.{self.spec.digits}f} "
+                                  f"→ BE SL={lt.sl:.{self.spec.digits}f} remaining={lt.remaining_lots}")
+                        else:
+                            print(f"    [TP1-FAIL] ticket={ticket} partial close failed, will retry next poll")
+                            lt.tp1_hit = False  # retry next cycle
+
+                # TP2 → partial close 25%
+                elif not lt.tp2_hit:
+                    hit_tp2 = (lt.direction == 1 and price >= lt.tp2_price) or (lt.direction == -1 and price <= lt.tp2_price)
+                    if hit_tp2:
+                        lt.tp2_hit = True
+                        close_lots = lt.original_lots * self.cfg.exits.tp2_pct
+                        close_lots = max(round(close_lots, 2), self.spec.volume_min)
+                        ok = self._partial_close(ticket, close_lots, "TP2")
+                        if ok:
+                            lt.remaining_lots = max(round(lt.remaining_lots - close_lots, 2), self.spec.volume_min)
+                            print(f"    [TP2] ticket={ticket} closed {close_lots} lots @ {price:.{self.spec.digits}f} "
+                                  f"remaining={lt.remaining_lots}")
+                        else:
+                            print(f"    [TP2-FAIL] ticket={ticket} partial close failed, will retry next poll")
+                            lt.tp2_hit = False  # retry next cycle
+
+                # Runner: ATR trail + M5 CHoCH kill (A/B grades)
+                else:
+                    # M5 CHoCH kill for runner
+                    if latest_m1_row is not None:
+                        m5_choch_against = (
+                            (lt.direction == 1 and bool(latest_m1_row.get("M5_minor_choch_dn", False))) or
+                            (lt.direction == -1 and bool(latest_m1_row.get("M5_minor_choch_up", False)))
+                        )
+                        if m5_choch_against:
+                            to_close.append((ticket, "M5_CHOCH_RUNNER"))
+                            continue
+                    # ATR trailing stop for runner — update SL on broker
+                    if atr > 0:
+                        trail_dist = self.cfg.exits.runner_trail_atr_mult * atr
+                        if lt.direction == 1:
+                            new_trail = price - trail_dist
+                            if new_trail > lt.sl:
+                                lt.sl = new_trail
+                                self._modify_sl(ticket, lt.sl)
+                        else:
+                            new_trail = price + trail_dist
+                            if new_trail < lt.sl:
+                                lt.sl = new_trail
+                                self._modify_sl(ticket, lt.sl)
+
+                # rough running P&L for status line
+                r_mult = (price - lt.entry) / max(abs(lt.tp - lt.entry), 1e-9)
+                if lt.direction == -1:
+                    r_mult = -r_mult
+                lt.pnl = r_mult * lt.risk_pct * self.equity()
+
+            # Execute any market closes (SL, M5 CHoCH kill)
+            for ticket, reason in to_close:
+                lt = self._trades[ticket]
+                if self._close_position(ticket, reason):
+                    price = bid if lt.direction == 1 else ask
+                    lt.close_price = price; lt.closed = True; lt.close_reason = reason
+                    print(f"    [EXIT] ticket={ticket} reason={reason}")
+                if reason in ("TP1", "M5_CHOCH_RUNNER"):
+                    self._state[f"_bos_entered_{lt.direction:+d}"] = False
             self._last_broker_pos = dict(broker_pos)
 
         # ---------- Per-bar checks (CHoCH emergency + time stop) ---------- #
@@ -860,7 +1475,7 @@ class LiveTrader:
                         break
             return n, last_t
 
-        for tf, lookback in [("M1", 30), ("M5", 60), ("M15", 240), ("M30", 480), ("H1", 600)]:
+        for tf, lookback in [("M1", 60), ("M5", 120), ("M15", 480), ("M30", 960), ("H1", 1200)]:
             tail_start = max(0, len(aligned) - lookback)
             tail_idx = np.arange(tail_start, len(aligned))
             counts: dict[str, int] = {}
@@ -887,9 +1502,32 @@ class LiveTrader:
         if m1_raw.empty or len(m1_raw) < 300:
             print(f"[cycle {self._cycle}] not enough M1 data yet ({len(m1_raw)} bars)")
             return
+
+        # v0.9.15.16: Cache HTF frames — only re-fetch when a new HTF bar
+        # closes.  HTF bars change slowly (M5 every 5min, H1 every hour).
+        # Re-fetching 80k M5 bars every 10 seconds was the main warmup bottleneck.
+        if not hasattr(self, '_htf_cache'):
+            self._htf_cache: dict[str, pd.DataFrame] = {}
+            self._htf_last_bar: dict[str, datetime | None] = {}
         htf_processed: dict[str, pd.DataFrame] = {}
         for tf in HTFS:
-            htf_processed[tf] = fetch_and_process_tf(self.mt5, self.symbol, tf, WARMUP_BARS[tf])
+            # Check if we need to re-fetch: first cycle, or new HTF bar closed
+            need_fetch = tf not in self._htf_cache
+            if not need_fetch:
+                cached = self._htf_cache[tf]
+                if not cached.empty:
+                    last_cached = cached.iloc[-1]["time"]
+                    prev = self._htf_last_bar.get(tf)
+                    if prev is None or last_cached != prev:
+                        need_fetch = True
+            if need_fetch:
+                htf_processed[tf] = fetch_and_process_tf(self.mt5, self.symbol, tf, WARMUP_BARS[tf])
+                self._htf_cache[tf] = htf_processed[tf]
+                if not htf_processed[tf].empty:
+                    self._htf_last_bar[tf] = htf_processed[tf].iloc[-1]["time"]
+            else:
+                htf_processed[tf] = self._htf_cache[tf]
+
         m1 = process_bars(m1_raw, "M1", DEFAULT_CONFIG)
         aligned = align_live(m1, htf_processed)
         if aligned.empty:
@@ -982,10 +1620,53 @@ class LiveTrader:
                     flags.append(col.replace("M5_", "").replace("M15_", "M15:"))
             if flags:
                 print(f"  [latest M1 bar flags] {', '.join(flags)}")
+            # v0.9.15.13: M1 structure alignment diagnostic
+            m1_struct: list[str] = []
+            for col in ("bull_disp", "bear_disp",
+                        "minor_bos_up", "minor_bos_dn",
+                        "minor_choch_up", "minor_choch_dn",
+                        "major_bos_up", "major_bos_dn",
+                        "major_choch_up", "major_choch_dn",
+                        "bull_liq_sweep", "bear_liq_sweep"):
+                if col in aligned.columns and bool(lb.get(col, False)):
+                    m1_struct.append(col)
+            if m1_struct:
+                print(f"  [M1 structure] {', '.join(m1_struct)}")
+            # Show trigger timestamps for MSS alignment check
+            for trig, label in [('_last_bull_trigger', 'bull_trig'), ('_last_bear_trigger', 'bear_trig'),
+                                ('_last_bull_sweep_ts', 'bull_sweep'), ('_last_bear_sweep_ts', 'bear_sweep')]:
+                ts = self._state.get(trig)
+                if ts is not None:
+                    try:
+                        age_s = (pd.Timestamp.now(tz=UTC) - pd.Timestamp(ts, tz=UTC)).total_seconds()
+                        print(f"  [state] {label}={pd.Timestamp(ts).strftime('%H:%M:%S')} age={age_s/60:.0f}m")
+                    except Exception:
+                        pass
 
         latest = aligned.iloc[-1]
         self._monitor_positions(latest, new_bar=True)
         self._print_status(latest)
+
+    def _print_floating(self) -> None:
+        """Lightweight real-time floating P&L — printed every 2s poll."""
+        bid, ask = self.quote()
+        positions = self._our_open_positions()
+        if not positions:
+            return
+        for tkt, pos in positions.items():
+            lt = self._trades.get(tkt)
+            profit = float(pos.get("profit", 0.0))
+            price = bid if int(pos.get("type", 0)) == 0 else ask
+            entry = float(pos.get("price_open", 0.0))
+            trail_tag = ""
+            if lt and lt.grade == 'C':
+                r_unit = lt.risk_per_unit if lt.risk_per_unit > 0 else abs(lt.tp - lt.entry)
+                cur_r = (price - lt.entry) / r_unit if lt.direction == 1 else (lt.entry - price) / r_unit
+                trail_tag = f" r={cur_r:+.2f}{' TRL' if lt.trail_active else ''}"
+            print(f"  >> ticket={tkt} {'LONG' if int(pos.get('type',0))==0 else 'SHORT'} "
+                  f"@ {entry:.{self.spec.digits}f} now={price:.{self.spec.digits}f} "
+                  f"floating={profit:+.2f}{self.acct.currency}{trail_tag}",
+                  flush=True)
 
     def _print_status(self, latest: pd.Series) -> None:
         bid, ask = self.quote()
@@ -1021,13 +1702,59 @@ class LiveTrader:
         )
 
     # ------------------------------------------------------------------ #
+    # Sleep hardening
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _clamp_sleep(seconds: float, *, max_seconds: float | None = None) -> float:
+        """Clamp a computed sleep duration so ``time.sleep`` NEVER gets a negative value.
+
+        Python raises ``ValueError: sleep length must be non-negative`` for
+        negative durations, and an uncaught ValueError inside the run loop
+        kills the whole trader. The bar-boundary poller races the wall clock::
+
+            while running["v"] and time.time() < end_wait:
+                ...monitor...
+                time.sleep(min(self.poll_interval, end_wait - time.time()))
+
+        If the monitor call (or scheduler jitter) crosses ``end_wait`` between
+        the loop check and the sleep computation, ``end_wait - time.time()``
+        goes negative and ``min()`` hands a negative value straight to
+        ``time.sleep`` — that is the 13:14 crash. v0.9.13.1+ routes every
+        ``time.sleep`` through this guard.
+
+        Returns a safe, non-negative duration, optionally capped at
+        ``max_seconds`` (cap itself is clamped to >= 0). NaN / +/-inf /
+        non-numeric garbage collapse to 0.0 so erratic inputs can never crash
+        the loop either.
+        """
+        try:
+            seconds = float(seconds)
+        except (TypeError, ValueError):
+            return 0.0
+        if seconds != seconds or seconds in (float("inf"), float("-inf")):
+            seconds = 0.0
+        if max_seconds is not None:
+            try:
+                cap = float(max_seconds)
+            except (TypeError, ValueError):
+                cap = 0.0
+            if cap != cap:  # NaN
+                cap = 0.0
+            # cap=+inf means "no cap"; cap=-inf clamps to 0
+            seconds = min(seconds, max(0.0, cap))
+        return max(0.0, seconds)
+
+    # ------------------------------------------------------------------ #
     def run(self) -> None:
-        persona_label = "v0.9.13 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.13 champion (long-only A+/A/B RETEST_OB)"
-        print(f"SlyTrade LIVE v0.9.13  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  max_open={self.max_open}")
+        persona_label = "v0.9.15.23 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.15.23 champion (long-only A+/A/B hybrid ladder)"
+        print(f"SlyTrade LIVE v0.9.15.23  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  working_lot={self.working_lot}  max_open={self.max_open}")
         print(f"persona: {persona_label}")
-        print("setups : RETEST_OB RETEST_FVG LIQ_SWEEP BOS_CONT  (champion gates apply unless --all)")
+        print("setups : RETEST_OB RETEST_FVG LIQ_SWEEP BOS_CONT DISP_TRAP BREAKER  (champion gates apply unless --all)")
         print(f"Magic={MAGIC}")
         print("-"*80)
+
+        # v0.9.15.16: Smoke test removed — was placing real orders on startup
+        # and wasting time. Bridge health is verified by the first real trade.
         running = {"v": True}
         def _stop(signum, frame):
             running["v"] = False
@@ -1041,25 +1768,31 @@ class LiveTrader:
             print(f"[ERROR] initial cycle: {e}")
             traceback.print_exc()
         while running["v"]:
-            now = datetime.now(UTC)
-            next_min = (now + timedelta(minutes=1)).replace(second=5, microsecond=0)
-            sleep_s = (next_min - datetime.now(UTC)).total_seconds()
-            if sleep_s < 0: sleep_s = 1.0
+            # v0.9.15.23: Real-time polling — 5s cycle, 2s poll interval.
+            # Positions monitored + floating P&L printed every 2s in live
+            # mode so trailing stops react within seconds, not 15-20s.
+            sleep_s = 5.0
             end_wait = time.time() + sleep_s
             while running["v"] and time.time() < end_wait:
-                if self._cycle % 6 == 0:
+                # In live mode: monitor positions + print floating every 2s
+                # In dry-run: every 6th iteration (12s) to reduce noise
+                if self.live or self._cycle % 6 == 0:
                     try:
                         self._monitor_positions(None)
+                        # Real-time floating P&L stream
+                        if self.live:
+                            self._print_floating()
                     except Exception:
                         pass
-                time.sleep(min(self.poll_interval, end_wait - time.time()))
+                # v0.9.13.1: clamp BEFORE sleep
+                time.sleep(self._clamp_sleep(end_wait - time.time(), max_seconds=self.poll_interval))
             if not running["v"]: break
             try:
                 self._cycle_fn()
             except Exception as e:
                 print(f"[ERROR] cycle: {e}")
                 traceback.print_exc()
-                time.sleep(10)
+                time.sleep(self._clamp_sleep(5.0))
 
 
 # --------------------------------------------------------------------------- #
@@ -1067,12 +1800,13 @@ class LiveTrader:
 # --------------------------------------------------------------------------- #
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="SlyTrade v0.9.13 SCALPER LIVE trader (OB/FVG retests + liq sweeps + BOS continuation)")
+    ap = argparse.ArgumentParser(description="SlyTrade v0.9.15.23 SCALPER LIVE trader (10s real-time polling + 5s bar lag + massive lookback windows + ATR-adaptive proximity gate + ATR-adaptive retest window + bridge diagnostics + hardcoded MT5 constants + dynamic BOS_CONT freshness + hybrid ladder + all filling modes + C-grade trailing)")
     ap.add_argument("--symbol", default="XAUUSDm")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=18812)
     ap.add_argument("--live", action="store_true", help="Actually send orders (default: dry-run)")
     ap.add_argument("--risk-cap", type=float, default=0.01, help="Max risk per trade as fraction of equity (default 1%%)")
+    ap.add_argument("--working-lot", type=float, default=0.04, help="Working lot size for dynamic sizing (default 0.04)")
     ap.add_argument("--max-open", type=int, default=3)
     ap.add_argument("--usd-zar", type=float, default=18.5)
     ap.add_argument("--leverage", type=int, default=2000)
@@ -1090,9 +1824,10 @@ def main() -> None:
     print(f"  login={acc.get('login')} server={acc.get('server')} balance={acc.get('balance')} "
           f"equity={acc.get('equity')} {acc.get('currency')} leverage={acc.get('leverage',args.leverage)}")
 
-    resolved, spec = resolve_symbol_spec(mt5, args.symbol, str(acc.get("currency","ZAR")), args.usd_zar)
+    resolved, spec, stop_level_pts = resolve_symbol_spec(mt5, args.symbol, str(acc.get("currency","ZAR")), args.usd_zar)
     print(f"  symbol resolved: {resolved} (point={spec.point} digits={spec.digits} "
-          f"contract={spec.contract_size} vol_min={spec.volume_min} vol_step={spec.volume_step})")
+          f"contract={spec.contract_size} vol_min={spec.volume_min} vol_step={spec.volume_step} "
+          f"stop_level={stop_level_pts}pts)")
 
     acct_spec = AccountSpec(
         starting_equity=float(acc.get("equity", 1000)),
@@ -1101,14 +1836,18 @@ def main() -> None:
         fx_to_account={"USD": args.usd_zar} if str(acc.get("currency","ZAR")) != "USD" else {"USD": 1.0},
     )
     cfg = rl_training_persona() if args.unrestricted else champion_persona()
-    max_open_eff = args.max_open if not args.unrestricted else max(args.max_open, 10)
+    max_open_eff = args.max_open  # v0.9.15.16: respect user's --max-open even in unrestricted mode
     print(f"  verbose       : {args.verbose}")
     print(f"  risk_cap      : {args.risk_cap*100:.1f}% per trade")
+    print(f"  working_lot   : {args.working_lot}")
     print(f"  max_open      : {max_open_eff}")
+
+    # v0.9.15.16: Smoke test removed — was placing real orders on startup.
+
     trader = LiveTrader(
         mt5=mt5, symbol=resolved, spec=spec, cfg=cfg, acct=acct_spec,
-        live=args.live, risk_cap=args.risk_cap, max_open=max_open_eff,
-        verbose=args.verbose,
+        live=args.live, risk_cap=args.risk_cap, working_lot=args.working_lot, max_open=max_open_eff,
+        verbose=args.verbose, stop_level_pts=stop_level_pts,
     )
     try:
         trader.run()
