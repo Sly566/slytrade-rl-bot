@@ -1,4 +1,4 @@
-"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.15.16 hybrid-ladder persona.
+"""Layer 6-ready LIVE trading loop for SlyTrade v0.9.15.17 hybrid-ladder persona.
 
 Connects to MT5 via the mt5linux RPyC bridge (run `bash start_mt5_bridge.sh`
 in another terminal first), pulls multi-timeframe bars, computes Layer 2
@@ -640,11 +640,37 @@ class LiveTrader:
         return False
 
     def _modify_sl(self, ticket: int, new_sl: float) -> bool:
-        """Modify the SL on an open position (keep TP=0). Returns True on success."""
+        """Modify the SL on an open position (keep TP=0). Returns True on success.
+
+        v0.9.15.17: Enforce minimum stop distance before sending to broker.
+        The old code sent raw SL values which caused retcode=10013 (Invalid
+        request) when the trailing SL was too close to current price.
+        """
         pos = self._get_position(ticket)
         if pos is None:
             return False
         DONE = {MT5_RETCODE_DONE, MT5_RETCODE_DONE_PARTIAL}
+        # Enforce minimum stop distance
+        point = self.spec.point
+        bid, ask = self.quote()
+        ptype = int(pos.get("type", 0))
+        direction = 1 if ptype == 0 else -1
+        market = bid if direction == 1 else ask
+        broker_min = self._stop_level_pts * point
+        fallback_min = point * 500
+        min_dist = max(broker_min, fallback_min)
+        atr = self._last_atr
+        if atr > 0:
+            min_dist = max(min_dist, 0.75 * atr)
+        if direction == 1:
+            dist = market - new_sl
+            if dist < min_dist:
+                new_sl = market - min_dist
+        else:
+            dist = new_sl - market
+            if dist < min_dist:
+                new_sl = market + min_dist
+        new_sl = round(float(new_sl), self.spec.digits)
         if not self.live:
             print(f"    [DRY-RUN] MODIFY SL ticket={ticket} → {new_sl:.{self.spec.digits}f}")
             return True
@@ -652,12 +678,13 @@ class LiveTrader:
             "action": MT5_TRADE_ACTION_SLTP,
             "symbol": self.symbol,
             "position": int(ticket),
-            "sl": round(float(new_sl), self.spec.digits),
+            "sl": new_sl,
             "tp": 0.0,
         }
         res = _to_dict(self.mt5.order_send(req))
         retcode = int(res.get("retcode", -1))
         if retcode in DONE:
+            print(f"    [TRAIL] ticket={ticket} SL moved to {new_sl:.{self.spec.digits}f} (market={market:.{self.spec.digits}f})")
             return True
         print(f"    [MODIFY-REJECT] ticket={ticket} sl={new_sl:.{self.spec.digits}f} retcode={retcode}")
         return False
@@ -930,6 +957,10 @@ class LiveTrader:
         lots = max(risk_lots, dynamic_target) if risk_lots >= self.spec.volume_min else dynamic_target
         lots = np.floor(lots / self.spec.volume_step) * self.spec.volume_step
         lots = float(np.clip(lots, self.spec.volume_min, self.spec.volume_max))
+        # v0.9.15.17: C grades always use minimum lot (0.01). Lower confidence
+        # = smaller position. Trail profits instead of fixed TP targets.
+        if sig.grade == 'C' and lots > self.spec.volume_min:
+            lots = self.spec.volume_min
         # Compute the *actual* risk the broker will enforce for the chosen lots
         # (vol_min floors lots, which can oversize risk on tiny accounts/grades).
         actual_risk_quote = self.spec.profit_per_lot(risk_per_unit) * lots
@@ -1035,7 +1066,10 @@ class LiveTrader:
                     to_close.append((ticket, "SL"))
                     continue
                 # Hybrid ladder: TP1 → partial close + BE
-                if not lt.tp1_hit:
+                # v0.9.15.17: C grades skip TP1/TP2 — trail from start
+                if lt.grade == 'C':
+                    pass  # trail handled below
+                elif not lt.tp1_hit:
                     hit_tp1 = (lt.direction == 1 and price >= lt.tp) or (lt.direction == -1 and price <= lt.tp)
                     if hit_tp1:
                         lt.tp1_hit = True
@@ -1057,7 +1091,28 @@ class LiveTrader:
                         lt.remaining_lots = max(round(lt.remaining_lots - close_lots, 2), self.spec.volume_min)
                         print(f"    [TP2] ticket={ticket} closed {close_lots} lots @ {price:.{self.spec.digits}f} "
                               f"remaining={lt.remaining_lots}")
-                # Runner: ATR trail + M5 CHoCH kill
+                # v0.9.15.17: C-grade trailing in dry-run (0.5 ATR trail)
+                elif lt.grade == 'C':
+                    if atr > 0:
+                        trail_dist = 0.5 * atr
+                        if lt.direction == 1:
+                            new_trail = price - trail_dist
+                            if new_trail > lt.sl:
+                                lt.sl = new_trail
+                        else:
+                            new_trail = price + trail_dist
+                            if new_trail < lt.sl:
+                                lt.sl = new_trail
+                    if latest_m1_row is not None:
+                        m5_choch = (
+                            (lt.direction == 1 and bool(latest_m1_row.get("M5_minor_choch_dn", False))) or
+                            (lt.direction == -1 and bool(latest_m1_row.get("M5_minor_choch_up", False)))
+                        )
+                        if m5_choch:
+                            to_close.append((ticket, "M5_CHOCH_C"))
+                            continue
+
+                # Runner: ATR trail + M5 CHoCH kill (A/B grades)
                 else:
                     # M5 CHoCH kill for runner
                     if latest_m1_row is not None:
@@ -1135,7 +1190,10 @@ class LiveTrader:
                     continue
 
                 # TP1 → partial close 50% + move SL to BE
-                if not lt.tp1_hit:
+                # v0.9.15.17: C grades skip TP1/TP2 — trail from start
+                if lt.grade == 'C':
+                    pass  # trail handled below
+                elif not lt.tp1_hit:
                     hit_tp1 = (lt.direction == 1 and price >= lt.tp) or (lt.direction == -1 and price <= lt.tp)
                     if hit_tp1:
                         lt.tp1_hit = True
@@ -1168,7 +1226,30 @@ class LiveTrader:
                             print(f"    [TP2-FAIL] ticket={ticket} partial close failed, will retry next poll")
                             lt.tp2_hit = False  # retry next cycle
 
-                # Runner: ATR trail + M5 CHoCH kill
+                # v0.9.15.17: C-grade trailing in live mode (0.5 ATR trail)
+                elif lt.grade == 'C':
+                    if atr > 0:
+                        trail_dist = 0.5 * atr
+                        if lt.direction == 1:
+                            new_trail = price - trail_dist
+                            if new_trail > lt.sl:
+                                lt.sl = new_trail
+                                self._modify_sl(ticket, lt.sl)
+                        else:
+                            new_trail = price + trail_dist
+                            if new_trail < lt.sl:
+                                lt.sl = new_trail
+                                self._modify_sl(ticket, lt.sl)
+                    if latest_m1_row is not None:
+                        m5_choch = (
+                            (lt.direction == 1 and bool(latest_m1_row.get("M5_minor_choch_dn", False))) or
+                            (lt.direction == -1 and bool(latest_m1_row.get("M5_minor_choch_up", False)))
+                        )
+                        if m5_choch:
+                            to_close.append((ticket, "M5_CHOCH_C"))
+                            continue
+
+                # Runner: ATR trail + M5 CHoCH kill (A/B grades)
                 else:
                     # M5 CHoCH kill for runner
                     if latest_m1_row is not None:
@@ -1605,8 +1686,8 @@ class LiveTrader:
 
     # ------------------------------------------------------------------ #
     def run(self) -> None:
-        persona_label = "v0.9.15.16 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.15.16 champion (long-only A+/A/B hybrid ladder)"
-        print(f"SlyTrade LIVE v0.9.15.16  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  working_lot={self.working_lot}  max_open={self.max_open}")
+        persona_label = "v0.9.15.17 SCALPER (all setups, RL-unrestricted)" if not self.cfg.confluence.persona_gating else "v0.9.15.17 champion (long-only A+/A/B hybrid ladder)"
+        print(f"SlyTrade LIVE v0.9.15.17  symbol={self.symbol}  live={self.live}  risk_cap={self.risk_cap*100:.1f}%  working_lot={self.working_lot}  max_open={self.max_open}")
         print(f"persona: {persona_label}")
         print("setups : RETEST_OB RETEST_FVG LIQ_SWEEP BOS_CONT DISP_TRAP BREAKER  (champion gates apply unless --all)")
         print(f"Magic={MAGIC}")
@@ -1662,7 +1743,7 @@ class LiveTrader:
 # --------------------------------------------------------------------------- #
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="SlyTrade v0.9.15.16 SCALPER LIVE trader (10s real-time polling + 5s bar lag + massive lookback windows + ATR-adaptive proximity gate + ATR-adaptive retest window + bridge diagnostics + smoke test + hardcoded MT5 constants + dynamic BOS_CONT freshness + hybrid ladder + all filling modes)")
+    ap = argparse.ArgumentParser(description="SlyTrade v0.9.15.17 SCALPER LIVE trader (10s real-time polling + 5s bar lag + massive lookback windows + ATR-adaptive proximity gate + ATR-adaptive retest window + bridge diagnostics + hardcoded MT5 constants + dynamic BOS_CONT freshness + hybrid ladder + all filling modes + C-grade trailing)")
     ap.add_argument("--symbol", default="XAUUSDm")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=18812)
