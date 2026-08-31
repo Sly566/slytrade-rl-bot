@@ -32,7 +32,7 @@ VERSION = "1.0.0"
 def collect(
     symbol: str = typer.Option("XAUUSDm", "--symbol", "-s", help="Trading symbol"),
     years: float = typer.Option(5.0, "--years", "-y", help="Years of history to collect"),
-    timeframes: str = typer.Option("M1,M5,M15,M30,H1,H4,D1", "--timeframes", "-t"),
+    timeframes: str = typer.Option("M1,M5,M15,M30,H1,H4,D1,W1", "--timeframes", "-t"),
     output: str = typer.Option("data/raw", "--output", "-o", help="Output directory"),
     host: str = typer.Option("127.0.0.1", "--host", help="MT5 bridge host"),
     port: int = typer.Option(18812, "--port", help="MT5 bridge port"),
@@ -68,7 +68,7 @@ def collect(
     start = end - timedelta(days=int(years * 365.25))
     console.print(f"  Period: {start.strftime('%Y-%m-%d')} to {end.strftime('%Y-%m-%d')}")
 
-    storage = MarketDataStorage(raw_root=out_dir)
+    storage = MarketDataStorage(root=out_dir)
     total_rows = 0
 
     # Phase 1: MT5 bars (current year, fast)
@@ -122,7 +122,7 @@ def collect(
 @app.command()
 def process(
     symbol: str = typer.Option("XAUUSDm", "--symbol", "-s"),
-    timeframes: str = typer.Option("M1,M5,M15,M30,H1,H4,D1", "--timeframes", "-t",
+    timeframes: str = typer.Option("M1,M5,M15,M30,H1,H4,D1,W1", "--timeframes", "-t",
                                     help="Comma-separated timeframes"),
     raw_root: str = typer.Option("data/raw", "--raw-root"),
     output: str = typer.Option("data/processed", "--output", "-o"),
@@ -234,7 +234,7 @@ def align(
     console.print(f"  M1: {len(m1):,} bars, {len(m1.columns)} columns")
 
     # Load and align HTFs
-    htf_tfs = ["M5", "M15", "M30", "H1", "H4", "D1"]
+    htf_tfs = ["M5", "M15", "M30", "H1", "H4", "D1", "W1"]
     df = m1.copy().sort_values("time").reset_index(drop=True)
 
     for tf in htf_tfs:
@@ -266,7 +266,7 @@ def align(
     structure_cols = [c for c in df.columns if any(x in c for x in ['disp', 'bos', 'choch', 'sweep', 'ob_', 'fvg_'])]
     console.print(f"\n[green]Aligned: {len(df):,} M1 bars × {len(df.columns)} columns[/green]")
     console.print(f"  Structure features: {len(structure_cols)}")
-    for prefix in ["M1_", "M5_", "M15_", "M30_", "H1_", "H4_", "D1_"]:
+    for prefix in ["M1_", "M5_", "M15_", "M30_", "H1_", "H4_", "D1_", "W1_"]:
         n = len([c for c in structure_cols if c.startswith(prefix)])
         if n > 0:
             console.print(f"    {prefix.rstrip('_')}: {n}")
