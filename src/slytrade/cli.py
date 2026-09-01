@@ -450,17 +450,11 @@ def train(
         "policy": "MlpPolicy", "env": train_env,
         "learning_rate": 3e-4, "gamma": 0.99, "gae_lambda": 0.95,
         "clip_range": 0.2, "ent_coef": 0.01, "vf_coef": 0.5,
-        "max_grad_norm": 0.5, "n_steps": 2048, "batch_size": 256, "n_epochs": 10,
+        "max_grad_norm": 0.5, "n_steps": 4096, "batch_size": 512, "n_epochs": 10,
         "policy_kwargs": dict(net_arch=dict(pi=[256, 128, 64], vf=[256, 128, 64])),
         "verbose": 1, "seed": 42,
+        "tensorboard_log": tb_dir,
     }
-    # TensorBoard optional — only if installed
-    try:
-        from torch.utils.tensorboard import SummaryWriter  # noqa: F401
-        model_kwargs["tensorboard_log"] = tb_dir
-    except ImportError:
-        console.print("  [yellow]TensorBoard not installed — console logging only[/yellow]")
-        console.print("  [yellow]Install: pip install tensorboard[/yellow]")
     if best_params:
         model_kwargs.update(best_params)
         if "net_arch" in best_params:
@@ -478,7 +472,7 @@ def train(
 
     # Custom callback for rich console logging + eval
     class TrainProgressCallback(BaseCallback):
-        def __init__(self, eval_df, eval_freq=50_000, verbose=1):
+        def __init__(self, eval_df, eval_freq=100_000, verbose=1):
             super().__init__(verbose)
             self.eval_df = eval_df
             self.eval_freq = eval_freq
