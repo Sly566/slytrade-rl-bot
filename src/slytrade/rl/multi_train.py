@@ -293,16 +293,24 @@ class MultiAgentTrainer:
                     f"    reward: mean={stats['mean_reward']:.3f} std={stats['std_reward']:.3f} "
                     f"max={stats['max_reward']:.2f} min={stats['min_reward']:.2f}"
                 )
-                # Sub-agent output summary (top signals)
+                # Sub-agent output summary
                 sub = stats['sub_agent_sums']
-                regime_avg = sub.get("regime", np.zeros(4))
-                dd_avg = sub.get("drawdown", np.zeros(3))
-                entry_avg = sub.get("entry", np.zeros(4))
-                progress_fn(
-                    f"    agents: regime={np.argmax(regime_avg)} "
-                    f"drawdown=[{dd_avg[0]:.1f},{dd_avg[1]:.1f},{dd_avg[2]:.1f}] "
-                    f"entry=[long={entry_avg[0]:.1f},short={entry_avg[1]:.1f},conf={entry_avg[2]:.1f}]"
-                )
+                n = max(stats.get('n_trades', 1), 1)
+                regime_avg = sub.get("regime", np.zeros(4)) / max(self.n_steps, 1)
+                dd_avg = sub.get("drawdown", np.zeros(3)) / max(self.n_steps, 1)
+                entry_avg = sub.get("entry", np.zeros(4)) / max(self.n_steps, 1)
+                exit_avg = sub.get("exit", np.zeros(3)) / max(self.n_steps, 1)
+                risk_avg = sub.get("risk", np.zeros(3)) / max(self.n_steps, 1)
+                setup_avg = sub.get("setup", np.zeros(3)) / max(self.n_steps, 1)
+                ict_avg = sub.get("ict", np.zeros(4)) / max(self.n_steps, 1)
+
+                regime_names = ["trend_up", "trend_dn", "ranging", "volatile"]
+                progress_fn(f"    regime: {regime_names[np.argmax(regime_avg)]} ({regime_avg[np.argmax(regime_avg)]:.2f})")
+                progress_fn(f"    drawdown: normal={dd_avg[0]:.2f} warn={dd_avg[1]:.2f} critical={dd_avg[2]:.2f}")
+                progress_fn(f"    entry: long={entry_avg[0]:.2f} short={entry_avg[1]:.2f} conf={entry_avg[2]:.2f}")
+                progress_fn(f"    exit: hold={exit_avg[0]:.2f} tp={exit_avg[1]:.2f} cut={exit_avg[2]:.2f}")
+                progress_fn(f"    risk: {risk_avg} setup: A={setup_avg[0]:.2f} B={setup_avg[1]:.2f} C={setup_avg[2]:.2f}")
+                progress_fn(f"    ict: kz={ict_avg[0]:.2f} sweep={ict_avg[1]:.2f} disp={ict_avg[2]:.2f} fvg={ict_avg[3]:.2f}")
 
             # Evaluation
             if eval_env and timesteps_done % eval_freq < self.n_steps:
