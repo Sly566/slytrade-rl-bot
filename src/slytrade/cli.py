@@ -162,12 +162,6 @@ def process(
         shutil.rmtree(out_dir, ignore_errors=True)
 
     for tf in tfs:
-        # Skip already-processed TFs (unless --clean)
-        tf_out_path = out_dir / f"timeframe={tf}" / "data.parquet"
-        if tf_out_path.exists() and not clean:
-            console.print(f"  {tf}: already processed, skipping")
-            continue
-
         console.print(f"\n  Processing {tf}...")
         t0 = time.time()
 
@@ -222,7 +216,7 @@ def process(
     console.print(f"Next: [bold]slytrade align --symbol {symbol}[/bold]")
 
 # ---------------------------------------------------------------------------
-# align — Causal MTF alignment onto M1 (memory-efficient streaming)
+# align — Causal MTF alignment onto M1
 # ---------------------------------------------------------------------------
 @app.command()
 def align(
@@ -233,46 +227,74 @@ def align(
 ):
     """Causally align HTF features onto M1 execution TF.
 
-    Streams M1 month-by-month to avoid OOM. Each M1 bar at time T sees
-    only HTF information from bars that closed BEFORE T.
+    M1 bar at time T sees only HTF information from bars that closed BEFORE T.
+    This is the same alignment used by the live trader.
 
     Example:
         slytrade align --symbol XAUUSDm
     """
-    from .config import DataConfig
-    from .data.mtf_align import align_all
+    from .data.mtf_align import _asof_merge, _prep_htf_frame
+    from .data.time import timeframe_timedelta
 
     console.print(f"[bold]SlyTrade ALIGN v{VERSION}[/bold] symbol={symbol}")
 
-    data_cfg = DataConfig(
-        processed_root=Path(processed_root),
-    )
-
-    def progress(msg: str):
-        console.print(f"  {msg}")
-
-    result = align_all(
-        data_cfg=data_cfg,
-        symbol=symbol,
-        raw_symbol=symbol,
-        clean=clean,
-        progress=progress,
-    )
-
-    if result.rows == 0:
-        console.print("[red]No aligned data produced. Check processed data exists.[/red]")
+    proc_dir = Path(processed_root) / "bars" / f"symbol={symbol}"
+    if not proc_dir.exists():
+        console.print(f"[red]No processed data at {proc_dir}. Run 'slytrade process' first.[/red]")
         raise typer.Exit(1)
 
-    console.print(f"\n[green]Aligned: {result.rows:,} M1 bars × {result.columns} columns[/green]")
-    console.print(f"  Files: {result.files}")
-    for tf, n in result.per_tf_cols.items():
+    # Load M1
+    m1_path = proc_dir / "timeframe=M1" / "data.parquet"
+    if not m1_path.exists():
+        console.print(f"[red]M1 data not found at {m1_path}[/red]")
+        raise typer.Exit(1)
+
+    m1 = pd.read_parquet(m1_path)
+    console.print(f"  M1: {len(m1):,} bars, {len(m1.columns)} columns")
+
+    # Load and align HTFs
+    htf_tfs = ["M5", "M15", "M30", "H1", "H4", "D1", "W1"]
+    df = m1.copy().sort_values("time").reset_index(drop=True)
+
+    for tf in htf_tfs:
+        htf_path = proc_dir / f"timeframe={tf}" / "data.parquet"
+        if not htf_path.exists():
+            console.print(f"  [yellow]{tf}: not found, skipping[/yellow]")
+            continue
+
+        htf = pd.read_parquet(htf_path)
+        console.print(f"  {tf}: {len(htf):,} bars → aligning...")
+
+        dur = timeframe_timedelta(tf)
+        htf = htf.copy()
+        htf["decision_time"] = htf["time"] + dur
+        prepped = _prep_htf_frame(htf, tf)
+        df = _asof_merge(df, prepped, tf)
+        console.print(f"    → {len(df):,} rows, {len(df.columns)} columns")
+
+    # Save
+    out_dir = Path(output) / f"symbol={symbol}"
+    if clean:
+        import shutil
+        shutil.rmtree(out_dir, ignore_errors=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "aligned.parquet"
+    df.to_parquet(out_path, index=False)
+
+    # Summary
+    structure_cols = [c for c in df.columns if any(x in c for x in ['disp', 'bos', 'choch', 'sweep', 'ob_', 'fvg_'])]
+    console.print(f"\n[green]Aligned: {len(df):,} M1 bars × {len(df.columns)} columns[/green]")
+    console.print(f"  Structure features: {len(structure_cols)}")
+    for prefix in ["M1_", "M5_", "M15_", "M30_", "H1_", "H4_", "D1_", "W1_"]:
+        n = len([c for c in structure_cols if c.startswith(prefix)])
         if n > 0:
-            console.print(f"  {tf}: {n} feature columns")
-    console.print(f"\nNext: [bold]slytrade train --symbol {symbol}[/bold]")
+            console.print(f"    {prefix.rstrip('_')}: {n}")
+    console.print(f"  Saved: {out_path} ({out_path.stat().st_size / 1e6:.1f} MB)")
+    console.print(f"\nNext: [bold]slytrade train --symbol {symbol}[/bold] or [bold]slytrade backtest --symbol {symbol}[/bold]")
 
 
 # ---------------------------------------------------------------------------
-# train — Train RL agent
+# train — Train RL agent with logging + TensorBoard
 # ---------------------------------------------------------------------------
 @app.command()
 def train(
@@ -283,14 +305,13 @@ def train(
     output: str = typer.Option("models", "--output", "-o"),
     max_bars: int = typer.Option(5000, "--max-bars", help="Max bars per episode"),
     tune: bool = typer.Option(False, "--tune", help="Run Optuna hyperparameter search first"),
+    log_interval: int = typer.Option(10, "--log-interval", help="Log every N rollouts"),
+    tb_log: str = typer.Option("logs/tb", "--tb-log", help="TensorBoard log directory"),
 ):
     """Train RL agent on aligned data. Agent learns entries AND exits.
 
-    The agent observes M1+M5+M15 structure and decides:
-    - ENTER_LONG, ENTER_SHORT, CLOSE, or HOLD
-    - Position size (0.01, 0.04, 0.08 lots)
-    - SL distance (1.0x, 1.5x, 2.0x, 2.5x ATR)
-    - TP distance (0.5R, 1.0R, 1.5R, 2.0R, 2.5R)
+    Logs training progress to console and TensorBoard. View live:
+        tensorboard --logdir logs/tb
 
     Example:
         slytrade train --symbol XAUUSDm --timesteps 500000 --algo ppo
@@ -299,6 +320,7 @@ def train(
         from stable_baselines3 import PPO, SAC, A2C
         from stable_baselines3.common.vec_env import DummyVecEnv
         from stable_baselines3.common.monitor import Monitor
+        from stable_baselines3.common.callbacks import BaseCallback
     except ImportError:
         console.print("[red]stable-baselines3 not installed. Run: pip install 'slytrade-rl-bot[rl]'[/red]")
         raise typer.Exit(1)
@@ -347,6 +369,7 @@ def train(
     split_idx = int(len(df) * 0.8)
     train_df = df.iloc[:split_idx].reset_index(drop=True)
     test_df = df.iloc[split_idx:].reset_index(drop=True)
+    del df  # free memory
     console.print(f"  Train: {len(train_df):,} bars ({train_df['time'].min()} to {train_df['time'].max()})")
     console.print(f"  Test:  {len(test_df):,} bars ({test_df['time'].min()} to {test_df['time'].max()})")
 
@@ -404,13 +427,19 @@ def train(
 
     # Create model
     algo_cls = {"ppo": PPO, "sac": SAC, "a2c": A2C}[algo.lower()]
+
+    # TensorBoard log dir
+    tb_dir = str(Path(tb_log) / f"{algo}_{symbol}")
+    os.makedirs(tb_dir, exist_ok=True)
+
     model_kwargs = {
         "policy": "MlpPolicy", "env": train_env,
         "learning_rate": 3e-4, "gamma": 0.99, "gae_lambda": 0.95,
         "clip_range": 0.2, "ent_coef": 0.01, "vf_coef": 0.5,
         "max_grad_norm": 0.5, "n_steps": 2048, "batch_size": 256, "n_epochs": 10,
         "policy_kwargs": dict(net_arch=dict(pi=[256, 128, 64], vf=[256, 128, 64])),
-        "verbose": 0, "seed": 42,
+        "verbose": 1, "seed": 42,
+        "tensorboard_log": tb_dir,
     }
     if best_params:
         model_kwargs.update(best_params)
@@ -423,36 +452,74 @@ def train(
     model = algo_cls(**model_kwargs)
     n_params = sum(p.numel() for p in model.policy.parameters())
     console.print(f"\n  Model: {algo.upper()} ({n_params:,} parameters)")
-    console.print(f"  Training...")
+    console.print(f"  TensorBoard: {tb_dir}")
+    console.print(f"  Log interval: every {log_interval} rollouts")
+    console.print(f"  Training...\n")
 
-    # Train with periodic evaluation
+    # Custom callback for rich console logging + eval
+    class TrainProgressCallback(BaseCallback):
+        def __init__(self, eval_df, eval_freq=50_000, verbose=1):
+            super().__init__(verbose)
+            self.eval_df = eval_df
+            self.eval_freq = eval_freq
+            self.best_sharpe = -999
+            self.start_time = time.time()
+            self.last_eval = 0
+
+        def _on_step(self):
+            return True
+
+        def _on_rollout_end(self):
+            # Log training metrics from SB3 logger
+            if self.num_timesteps - self.last_eval >= self.eval_freq:
+                self.last_eval = self.num_timesteps
+                self._run_eval()
+
+        def _run_eval(self):
+            eval_env = SlyTradeEnv(self.eval_df, max_bars=len(self.eval_df))
+            obs, _ = eval_env.reset()
+            while True:
+                action, _ = self.model.predict(obs, deterministic=True)
+                obs, _, term, trunc, _ = eval_env.step(action)
+                if term or trunc:
+                    break
+            m = eval_env.get_metrics()
+            elapsed = time.time() - self.start_time
+
+            # Log to SB3/TensorBoard
+            self.logger.record("eval/sharpe", m.get("sharpe_ratio", 0))
+            self.logger.record("eval/win_rate", m.get("win_rate", 0))
+            self.logger.record("eval/total_pnl", m.get("total_pnl", 0))
+            self.logger.record("eval/max_drawdown", m.get("max_drawdown", 0))
+            self.logger.record("eval/profit_factor", m.get("profit_factor", 0))
+            self.logger.record("eval/n_trades", m.get("n_trades", 0))
+
+            console.print(f"    [{self.num_timesteps:,}/{timesteps:,}] "
+                          f"trades={m['n_trades']} wr={m['win_rate']:.0%} "
+                          f"pnl={m['total_pnl']:+.0f} sharpe={m['sharpe_ratio']:.2f} "
+                          f"dd={m['max_drawdown']:.0%} pf={m['profit_factor']:.2f} "
+                          f"({elapsed:.0f}s)")
+
+            if m['sharpe_ratio'] > self.best_sharpe and m['n_trades'] > 10:
+                self.best_sharpe = m['sharpe_ratio']
+                self.model.save(f"{output}/{algo}_{symbol}_best")
+                console.print(f"      [green]New best! Saved.[/green]")
+
+    # Train
     os.makedirs(output, exist_ok=True)
-    best_sharpe = -999
     start_time = time.time()
-    n_iters = max(1, timesteps // 50_000)
 
-    for iteration in range(n_iters):
-        model.learn(total_timesteps=50_000, reset_num_timesteps=False)
+    callback = TrainProgressCallback(
+        eval_df=test_df,
+        eval_freq=50_000,
+    )
 
-        # Evaluate
-        eval_env = SlyTradeEnv(test_df, max_bars=len(test_df))
-        obs, _ = eval_env.reset()
-        while True:
-            action, _ = model.predict(obs, deterministic=True)
-            obs, _, term, trunc, _ = eval_env.step(action)
-            if term or trunc:
-                break
-        metrics = eval_env.get_metrics()
-        elapsed = time.time() - start_time
-
-        console.print(f"    [{iteration+1}/{n_iters}] trades={metrics['n_trades']} "
-                      f"wr={metrics['win_rate']:.0%} pnl={metrics['total_pnl']:+.0f} "
-                      f"sharpe={metrics['sharpe_ratio']:.2f} dd={metrics['max_drawdown']:.0%} "
-                      f"pf={metrics['profit_factor']:.2f} ({elapsed:.0f}s)")
-
-        if metrics['sharpe_ratio'] > best_sharpe and metrics['n_trades'] > 10:
-            best_sharpe = metrics['sharpe_ratio']
-            model.save(f"{output}/{algo}_{symbol}_best")
+    model.learn(
+        total_timesteps=timesteps,
+        callback=callback,
+        log_interval=log_interval,
+        progress_bar=True,
+    )
 
     # Save final
     model.save(f"{output}/{algo}_{symbol}_final")
@@ -481,6 +548,7 @@ def train(
         json.dump(m, f, indent=2, default=str)
     console.print(f"\n  Model: {output}/{algo}_{symbol}_best.zip")
     console.print(f"  Metrics: {output}/metrics.json")
+    console.print(f"  TensorBoard: {tb_dir}")
     console.print(f"  Total time: {time.time()-start_time:.0f}s")
     console.print(f"\nNext: [bold]slytrade backtest --symbol {symbol}[/bold] or [bold]slytrade live --symbol {symbol}[/bold]")
 
@@ -515,7 +583,6 @@ def backtest(
     console.print(f"[bold]SlyTrade BACKTEST v{VERSION}[/bold] symbol={symbol}")
 
     # Find aligned data
-    partition_files = []
     if not aligned_path:
         candidates = [
             Path("data/processed/aligned") / f"symbol={symbol}" / "aligned.parquet",
@@ -526,26 +593,12 @@ def backtest(
             if c.exists():
                 aligned_path = str(c)
                 break
-
-        # Also check for monthly partitions from align_all()
         if not aligned_path:
-            part_dir = Path("data/processed/aligned") / f"symbol={symbol}"
-            if part_dir.exists():
-                partition_files = sorted(part_dir.rglob("part-*.parquet"))
-
-        if not aligned_path and not partition_files:
             console.print(f"[red]No aligned data found. Run 'slytrade align' first.[/red]")
             raise typer.Exit(1)
 
-    if partition_files:
-        console.print(f"  Data: {len(partition_files)} monthly partitions")
-        frames = [pd.read_parquet(f) for f in partition_files]
-        df = pd.concat(frames, ignore_index=True).sort_values("time").reset_index(drop=True)
-        del frames
-    else:
-        console.print(f"  Data: {aligned_path}")
-        df = pd.read_parquet(aligned_path)
-
+    df = pd.read_parquet(aligned_path)
+    console.print(f"  Data: {aligned_path}")
     console.print(f"  {len(df):,} bars, {len(df.columns)} columns")
     console.print(f"  Date: {df['time'].min()} to {df['time'].max()}")
 
