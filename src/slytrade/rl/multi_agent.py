@@ -413,7 +413,7 @@ class MultiAgentEnv:
         for name, output in sub_outputs.items():
             info[name] = output.squeeze(0).numpy()
 
-        return action.squeeze(0).numpy(), info
+        return action.squeeze(0).cpu().numpy().astype(np.int64), info
 
 
 # ---------------------------------------------------------------------------

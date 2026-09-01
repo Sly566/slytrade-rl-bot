@@ -91,7 +91,7 @@ class MultiAgentTrainer:
             with torch.no_grad():
                 action, log_prob, sub_outputs = self.ensemble.get_action(obs_tensor)
 
-            action_np = action.squeeze(0).cpu().numpy()
+            action_np = action.squeeze(0).cpu().numpy().astype(np.int64)
             next_obs, reward, terminated, truncated, info = self.env.step(action_np)
             done = terminated or truncated
 
