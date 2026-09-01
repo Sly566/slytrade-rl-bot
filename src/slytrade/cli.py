@@ -352,34 +352,28 @@ def train(
 
     console.print(f"[bold]SlyTrade TRAIN v{VERSION}[/bold] symbol={symbol} algo={algo}")
 
-    # Load aligned data — all columns, sorted by time
+    # Load aligned data — subsample DURING loading to avoid OOM
+    # 62 partitions × 535 cols × 30K rows = ~7.5GB if loaded all at once.
+    # Subsample every 5th bar during loading → ~1.5GB peak.
+    subsample = 5
     if partition_files:
-        console.print(f"  Data: {len(partition_files)} monthly partitions")
+        console.print(f"  Data: {len(partition_files)} monthly partitions (subsample={subsample})")
         frames = []
         for i, pf in enumerate(partition_files):
             chunk = pd.read_parquet(pf)
+            if subsample > 1 and len(chunk) > subsample:
+                chunk = chunk.iloc[::subsample].reset_index(drop=True)
             frames.append(chunk)
             if (i + 1) % 12 == 0:
                 console.print(f"    Loaded {i+1}/{len(partition_files)} partitions...")
             del chunk
-        df = pd.concat(frames, ignore_index=True)
+        df = pd.concat(frames, ignore_index=True).sort_values("time").reset_index(drop=True)
         del frames
     else:
         console.print(f"  Data: {aligned_path}")
         df = pd.read_parquet(aligned_path)
-
-    # Sort by whatever time column exists
-    time_col = None
-    for candidate in ["time", "time_msc", "datetime", "timestamp"]:
-        if candidate in df.columns:
-            time_col = candidate
-            break
-    if time_col:
-        df = df.sort_values(time_col).reset_index(drop=True)
-        if time_col != "time":
-            df = df.rename(columns={time_col: "time"})
-    else:
-        df = df.reset_index(drop=True)
+        if subsample > 1 and len(df) > subsample:
+            df = df.iloc[::subsample].reset_index(drop=True)
 
     console.print(f"  Timesteps: {timesteps:,}")
     console.print(f"  Observation space: {OBS_DIM} dimensions (M1+M5+M15 structure)")
@@ -446,6 +440,44 @@ def train(
     train_env = DummyVecEnv([make_env])
 
     # Create model
+    # Multi-agent mode
+    if algo.lower() == "multi":
+        from .rl.multi_agent import MultiAgentEnsemble
+        from .rl.multi_train import MultiAgentTrainer
+
+        console.print(f"  Mode: Multi-Agent (9 sub-agents + meta-agent)")
+        ensemble = MultiAgentEnsemble()
+        console.print(f"  Parameters: {ensemble.total_parameters:,}")
+
+        trainer = MultiAgentTrainer(
+            env=SlyTradeEnv(train_df, max_bars=max_bars),
+            lr=3e-4, gamma=0.99, n_steps=4096, batch_size=512, n_epochs=10,
+        )
+
+        def progress(msg):
+            console.print(msg)
+
+        eval_env = SlyTradeEnv(test_df, max_bars=len(test_df))
+        metrics = trainer.train(
+            total_timesteps=timesteps,
+            eval_env=eval_env,
+            eval_freq=100_000,
+            output_dir=output,
+            symbol=symbol,
+            progress_fn=progress,
+        )
+
+        console.print(f"\n{'='*60}")
+        console.print("[bold green]MULTI-AGENT TRAINING COMPLETE[/bold green]")
+        if metrics:
+            console.print(f"  Trades:      {metrics.get('n_trades', 0)}")
+            console.print(f"  Win Rate:    {metrics.get('win_rate', 0):.1%}")
+            console.print(f"  Sharpe:      {metrics.get('sharpe_ratio', 0):.2f}")
+            console.print(f"  Max DD:      {metrics.get('max_drawdown', 0):.1%}")
+        console.print(f"  Model: {output}/multi_{symbol}_best.pt")
+        console.print(f"\nNext: [bold]slytrade backtest --symbol {symbol}[/bold]")
+        return
+
     algo_cls = {"ppo": PPO, "sac": SAC, "a2c": A2C}[algo.lower()]
 
     # TensorBoard log dir
