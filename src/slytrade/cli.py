@@ -352,17 +352,30 @@ def train(
 
     console.print(f"[bold]SlyTrade TRAIN v{VERSION}[/bold] symbol={symbol} algo={algo}")
 
-    # Load aligned data — subsample DURING loading to avoid OOM
-    # 62 partitions × 535 cols × 30K rows = ~7.5GB if loaded all at once.
-    # Subsample every 5th bar during loading → ~1.5GB peak.
-    subsample = 5
+    # Load aligned data — only columns the RL env actually uses (22 out of 703)
+    # This drops memory from ~7.5GB to ~250MB, no subsampling needed.
+    RL_COLUMNS = [
+        "time", "close", "atr_14",
+        # M1 structure
+        "bull_disp", "bear_disp",
+        "minor_bos_up", "minor_bos_dn", "minor_choch_up", "minor_choch_dn",
+        # M5 structure
+        "M5_bull_disp", "M5_bear_disp",
+        "M5_minor_bos_up", "M5_minor_bos_dn", "M5_minor_choch_up", "M5_minor_choch_dn",
+        # M15 structure
+        "M15_bull_disp", "M15_bear_disp",
+        "M15_minor_bos_up", "M15_minor_bos_dn", "M15_minor_choch_up", "M15_minor_choch_dn",
+        "M15_major_choch_up", "M15_major_choch_dn",
+    ]
+
     if partition_files:
-        console.print(f"  Data: {len(partition_files)} monthly partitions (subsample={subsample})")
+        console.print(f"  Data: {len(partition_files)} monthly partitions")
+        # Read first file to discover available columns
+        sample_cols = pd.read_parquet(partition_files[0], columns=[]).columns.tolist()
+        use_cols = [c for c in RL_COLUMNS if c in sample_cols]
         frames = []
         for i, pf in enumerate(partition_files):
-            chunk = pd.read_parquet(pf)
-            if subsample > 1 and len(chunk) > subsample:
-                chunk = chunk.iloc[::subsample].reset_index(drop=True)
+            chunk = pd.read_parquet(pf, columns=use_cols)
             frames.append(chunk)
             if (i + 1) % 12 == 0:
                 console.print(f"    Loaded {i+1}/{len(partition_files)} partitions...")
@@ -371,13 +384,13 @@ def train(
         del frames
     else:
         console.print(f"  Data: {aligned_path}")
-        df = pd.read_parquet(aligned_path)
-        if subsample > 1 and len(df) > subsample:
-            df = df.iloc[::subsample].reset_index(drop=True)
+        sample_cols = pd.read_parquet(aligned_path, columns=[]).columns.tolist()
+        use_cols = [c for c in RL_COLUMNS if c in sample_cols]
+        df = pd.read_parquet(aligned_path, columns=use_cols)
 
     console.print(f"  Timesteps: {timesteps:,}")
     console.print(f"  Observation space: {OBS_DIM} dimensions (M1+M5+M15 structure)")
-    console.print(f"  {len(df):,} bars, {len(df.columns)} columns")
+    console.print(f"  {len(df):,} bars, {len(df.columns)} columns (loaded {len(RL_COLUMNS)} of 703)")
 
     # Train/test split (80/20, chronological — no lookahead)
     split_idx = int(len(df) * 0.8)
