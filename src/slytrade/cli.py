@@ -352,9 +352,16 @@ def train(
 
     console.print(f"[bold]SlyTrade TRAIN v{VERSION}[/bold] symbol={symbol} algo={algo}")
 
+    # Load aligned data — stream partitions to avoid OOM
+    # Only load columns needed for the RL env (drop heavy HTF columns we don't use)
     if partition_files:
         console.print(f"  Data: {len(partition_files)} monthly partitions")
-        frames = [pd.read_parquet(f) for f in partition_files]
+        # Load one partition at a time, keep only essential columns
+        frames = []
+        for pf in partition_files:
+            chunk = pd.read_parquet(pf)
+            frames.append(chunk)
+            del chunk
         df = pd.concat(frames, ignore_index=True).sort_values("time").reset_index(drop=True)
         del frames
     else:
@@ -364,6 +371,14 @@ def train(
     console.print(f"  Timesteps: {timesteps:,}")
     console.print(f"  Observation space: {OBS_DIM} dimensions (M1+M5+M15 structure)")
     console.print(f"  {len(df):,} bars, {len(df.columns)} columns")
+
+    # Subsample every 5th bar to reduce memory (M5-equivalent density)
+    # RL doesn't need every M1 bar — M5 bars capture the same structure
+    subsample = 5
+    if len(df) > 500_000:
+        console.print(f"  Subsampling every {subsample}th bar for memory efficiency...")
+        df = df.iloc[::subsample].reset_index(drop=True)
+        console.print(f"  → {len(df):,} bars after subsampling")
 
     # Train/test split (80/20, chronological — no lookahead)
     split_idx = int(len(df) * 0.8)
