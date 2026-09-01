@@ -222,7 +222,7 @@ def process(
     console.print(f"Next: [bold]slytrade align --symbol {symbol}[/bold]")
 
 # ---------------------------------------------------------------------------
-# align — Causal MTF alignment onto M1
+# align — Causal MTF alignment onto M1 (memory-efficient streaming)
 # ---------------------------------------------------------------------------
 @app.command()
 def align(
@@ -233,70 +233,42 @@ def align(
 ):
     """Causally align HTF features onto M1 execution TF.
 
-    M1 bar at time T sees only HTF information from bars that closed BEFORE T.
-    This is the same alignment used by the live trader.
+    Streams M1 month-by-month to avoid OOM. Each M1 bar at time T sees
+    only HTF information from bars that closed BEFORE T.
 
     Example:
         slytrade align --symbol XAUUSDm
     """
-    from .data.mtf_align import _asof_merge, _prep_htf_frame
-    from .data.time import timeframe_timedelta
+    from .config import DataConfig
+    from .data.mtf_align import align_all
 
     console.print(f"[bold]SlyTrade ALIGN v{VERSION}[/bold] symbol={symbol}")
 
-    proc_dir = Path(processed_root) / "bars" / f"symbol={symbol}"
-    if not proc_dir.exists():
-        console.print(f"[red]No processed data at {proc_dir}. Run 'slytrade process' first.[/red]")
+    data_cfg = DataConfig(
+        processed_root=Path(processed_root),
+    )
+
+    def progress(msg: str):
+        console.print(f"  {msg}")
+
+    result = align_all(
+        data_cfg=data_cfg,
+        symbol=symbol,
+        raw_symbol=symbol,
+        clean=clean,
+        progress=progress,
+    )
+
+    if result.rows == 0:
+        console.print("[red]No aligned data produced. Check processed data exists.[/red]")
         raise typer.Exit(1)
 
-    # Load M1
-    m1_path = proc_dir / "timeframe=M1" / "data.parquet"
-    if not m1_path.exists():
-        console.print(f"[red]M1 data not found at {m1_path}[/red]")
-        raise typer.Exit(1)
-
-    m1 = pd.read_parquet(m1_path)
-    console.print(f"  M1: {len(m1):,} bars, {len(m1.columns)} columns")
-
-    # Load and align HTFs
-    htf_tfs = ["M5", "M15", "M30", "H1", "H4", "D1", "W1"]
-    df = m1.copy().sort_values("time").reset_index(drop=True)
-
-    for tf in htf_tfs:
-        htf_path = proc_dir / f"timeframe={tf}" / "data.parquet"
-        if not htf_path.exists():
-            console.print(f"  [yellow]{tf}: not found, skipping[/yellow]")
-            continue
-
-        htf = pd.read_parquet(htf_path)
-        console.print(f"  {tf}: {len(htf):,} bars → aligning...")
-
-        dur = timeframe_timedelta(tf)
-        htf = htf.copy()
-        htf["decision_time"] = htf["time"] + dur
-        prepped = _prep_htf_frame(htf, tf)
-        df = _asof_merge(df, prepped, tf)
-        console.print(f"    → {len(df):,} rows, {len(df.columns)} columns")
-
-    # Save
-    out_dir = Path(output) / f"symbol={symbol}"
-    if clean:
-        import shutil
-        shutil.rmtree(out_dir, ignore_errors=True)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "aligned.parquet"
-    df.to_parquet(out_path, index=False)
-
-    # Summary
-    structure_cols = [c for c in df.columns if any(x in c for x in ['disp', 'bos', 'choch', 'sweep', 'ob_', 'fvg_'])]
-    console.print(f"\n[green]Aligned: {len(df):,} M1 bars × {len(df.columns)} columns[/green]")
-    console.print(f"  Structure features: {len(structure_cols)}")
-    for prefix in ["M1_", "M5_", "M15_", "M30_", "H1_", "H4_", "D1_", "W1_"]:
-        n = len([c for c in structure_cols if c.startswith(prefix)])
+    console.print(f"\n[green]Aligned: {result.rows:,} M1 bars × {result.columns} columns[/green]")
+    console.print(f"  Files: {result.files}")
+    for tf, n in result.per_tf_cols.items():
         if n > 0:
-            console.print(f"    {prefix.rstrip('_')}: {n}")
-    console.print(f"  Saved: {out_path} ({out_path.stat().st_size / 1e6:.1f} MB)")
-    console.print(f"\nNext: [bold]slytrade train --symbol {symbol}[/bold] or [bold]slytrade backtest --symbol {symbol}[/bold]")
+            console.print(f"  {tf}: {n} feature columns")
+    console.print(f"\nNext: [bold]slytrade train --symbol {symbol}[/bold]")
 
 
 # ---------------------------------------------------------------------------
@@ -334,6 +306,7 @@ def train(
     from .rl.env import SlyTradeEnv, OBS_DIM
 
     # Find aligned data
+    partition_files = []
     if not aligned_path:
         candidates = [
             Path("data/processed/aligned") / f"symbol={symbol}" / "aligned.parquet",
@@ -344,16 +317,30 @@ def train(
             if c.exists():
                 aligned_path = str(c)
                 break
+
+        # Also check for monthly partitions from align_all()
         if not aligned_path:
+            part_dir = Path("data/processed/aligned") / f"symbol={symbol}"
+            if part_dir.exists():
+                partition_files = sorted(part_dir.rglob("part-*.parquet"))
+
+        if not aligned_path and not partition_files:
             console.print(f"[red]No aligned data found. Run 'slytrade align' first.[/red]")
             raise typer.Exit(1)
 
     console.print(f"[bold]SlyTrade TRAIN v{VERSION}[/bold] symbol={symbol} algo={algo}")
-    console.print(f"  Data: {aligned_path}")
+
+    if partition_files:
+        console.print(f"  Data: {len(partition_files)} monthly partitions")
+        frames = [pd.read_parquet(f) for f in partition_files]
+        df = pd.concat(frames, ignore_index=True).sort_values("time").reset_index(drop=True)
+        del frames
+    else:
+        console.print(f"  Data: {aligned_path}")
+        df = pd.read_parquet(aligned_path)
+
     console.print(f"  Timesteps: {timesteps:,}")
     console.print(f"  Observation space: {OBS_DIM} dimensions (M1+M5+M15 structure)")
-
-    df = pd.read_parquet(aligned_path)
     console.print(f"  {len(df):,} bars, {len(df.columns)} columns")
 
     # Train/test split (80/20, chronological — no lookahead)
@@ -528,6 +515,7 @@ def backtest(
     console.print(f"[bold]SlyTrade BACKTEST v{VERSION}[/bold] symbol={symbol}")
 
     # Find aligned data
+    partition_files = []
     if not aligned_path:
         candidates = [
             Path("data/processed/aligned") / f"symbol={symbol}" / "aligned.parquet",
@@ -538,12 +526,26 @@ def backtest(
             if c.exists():
                 aligned_path = str(c)
                 break
+
+        # Also check for monthly partitions from align_all()
         if not aligned_path:
+            part_dir = Path("data/processed/aligned") / f"symbol={symbol}"
+            if part_dir.exists():
+                partition_files = sorted(part_dir.rglob("part-*.parquet"))
+
+        if not aligned_path and not partition_files:
             console.print(f"[red]No aligned data found. Run 'slytrade align' first.[/red]")
             raise typer.Exit(1)
 
-    df = pd.read_parquet(aligned_path)
-    console.print(f"  Data: {aligned_path}")
+    if partition_files:
+        console.print(f"  Data: {len(partition_files)} monthly partitions")
+        frames = [pd.read_parquet(f) for f in partition_files]
+        df = pd.concat(frames, ignore_index=True).sort_values("time").reset_index(drop=True)
+        del frames
+    else:
+        console.print(f"  Data: {aligned_path}")
+        df = pd.read_parquet(aligned_path)
+
     console.print(f"  {len(df):,} bars, {len(df.columns)} columns")
     console.print(f"  Date: {df['time'].min()} to {df['time'].max()}")
 
