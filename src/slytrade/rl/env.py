@@ -448,29 +448,45 @@ class SlyTradeEnv(gym.Env):
                 self._pos_dir = 0; self._pos_bars = 0; trade_closed = True
 
         # --- Compute reward ---
-        # Reward = log return + drawdown penalty + trade bonus
+        # Goal: teach sustainable profitability, not "bet the farm"
+        # Components: risk-adjusted PnL + drawdown penalty + overtrade penalty
         equity_frac = self._equity / max(self._starting_equity, 1.0)
         drawdown = (self._peak_equity - self._equity) / max(self._peak_equity, 1.0)
 
-        # Log return component (per-step equity change)
+        reward = 0.0
+
         if len(self._trades) > 0 and trade_closed:
             last_pnl = self._trades[-1]["pnl"]
-            reward = last_pnl / max(self._starting_equity, 1.0) * 100  # scale up
-            # Bonus for wins, penalty for losses
+            # Risk-adjusted PnL: normalize by equity, not starting equity
+            pnl_frac = last_pnl / max(self._equity, 1.0)
+            reward = pnl_frac * 10.0  # moderate scale
+
+            # Win/loss asymmetry: penalize losses 2x more than reward wins
             if last_pnl > 0:
-                reward += 0.1
+                reward += 0.05
             else:
-                reward -= 0.1
+                reward -= 0.15  # loss penalty > win bonus → agent learns to avoid losses
+
+            # Overtrade penalty: penalize if too many recent trades
+            n_recent = min(len(self._trades), 50)
+            if n_recent > 20:
+                reward -= 0.01 * (n_recent - 20)  # escalating penalty
         else:
-            # Small holding reward/penalty based on unrealized P&L
+            # Small holding reward for being in profit (R-multiple based)
             if self._pos_dir != 0 and self._pos_risk_per_unit > 0:
                 r_dist = (price - self._pos_entry) if self._pos_dir == 1 else (self._pos_entry - price)
                 cur_r = r_dist / self._pos_risk_per_unit
-                reward = cur_r * 0.01  # small per-step reward for being in profit
+                reward = cur_r * 0.005  # tiny per-step signal
 
-        # Drawdown penalty
-        if drawdown > 0.05:  # >5% drawdown
-            reward -= drawdown * 0.5
+        # Drawdown penalty — EXPONENTIAL, kicks in at 2%
+        # This is the key: 85% DD should be massively penalized
+        if drawdown > 0.02:
+            dd_penalty = (drawdown ** 2) * 50.0  # exponential: 5%→1.25, 20%→20, 50%→125, 85%→361
+            reward -= dd_penalty
+
+        # Equity wipeout — hard penalty
+        if self._equity <= self._starting_equity * 0.5:
+            reward -= 10.0
 
         # Advance to next bar
         self._bar_idx += 1
