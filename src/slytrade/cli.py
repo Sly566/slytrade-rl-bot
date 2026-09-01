@@ -141,42 +141,22 @@ def process(
 ):
     """Process per-TF features (ATR, structure, OBs, FVGs, sweeps, etc.).
 
-    Reads raw M1 bars, resamples to each TF, computes all ICT/SMC features,
-    and writes processed parquet files.
+    Loads raw bar files per-TF from MT5 collection, computes all ICT/SMC
+    features, and writes processed parquet files. Memory-efficient: loads
+    one TF at a time.
 
     Example:
         slytrade process --symbol XAUUSDm --timeframes M1,M5,M15,M30,H1
     """
     from .data.features import DEFAULT_CONFIG, process_bars
-    from .data.resample import resample_bars_to_timeframe
 
     console.print(f"[bold]SlyTrade PROCESS v{VERSION}[/bold] symbol={symbol}")
     tfs = [t.strip() for t in timeframes.split(",") if t.strip()]
     console.print(f"  Timeframes: {tfs}")
 
-    # Find raw M1 data
-    raw_dir = Path(raw_root) / symbol
-    m1_files = sorted(raw_dir.rglob("*M1*.parquet")) + sorted(raw_dir.rglob("*1m*.parquet"))
-    if not m1_files:
-        # Try any parquet
-        m1_files = sorted(raw_dir.rglob("*.parquet"))
-    if not m1_files:
-        console.print(f"[red]No raw data found in {raw_dir}. Run 'slytrade collect' first.[/red]")
-        raise typer.Exit(1)
-
-    console.print(f"  Loading {len(m1_files)} raw files...")
-    m1_raw = pd.concat([pd.read_parquet(f) for f in m1_files], ignore_index=True)
-    m1_raw = m1_raw.sort_values("time").drop_duplicates(subset=["time"]).reset_index(drop=True)
-
-    # Ensure required columns
-    for col in ["tick_volume", "real_volume"]:
-        if col not in m1_raw.columns:
-            m1_raw[col] = m1_raw.get("volume", 0.0)
-
-    console.print(f"  {len(m1_raw):,} raw M1 bars ({m1_raw['time'].min()} to {m1_raw['time'].max()})")
-
-    # Process each TF
+    raw_dir = Path(raw_root)
     out_dir = Path(output) / "bars" / f"symbol={symbol}"
+
     if clean:
         import shutil
         shutil.rmtree(out_dir, ignore_errors=True)
@@ -185,14 +165,42 @@ def process(
         console.print(f"\n  Processing {tf}...")
         t0 = time.time()
 
-        if tf == "M1":
-            df = m1_raw.copy()
-        else:
-            console.print(f"    Resampling M1 → {tf}...")
-            df = resample_bars_to_timeframe(m1_raw, tf)
+        # Load per-TF bar files from mt5_bars/symbol=X/timeframe=Y/
+        tf_bar_dir = raw_dir / "mt5_bars" / f"symbol={symbol}" / f"timeframe={tf}"
+        tf_files = sorted(tf_bar_dir.rglob("*.parquet"))
 
-        console.print(f"    Computing features on {len(df):,} bars...")
+        if not tf_files:
+            console.print(f"    [yellow]No raw {tf} bars found in {tf_bar_dir}[/yellow]")
+            continue
+
+        # Load in chunks to avoid OOM — concat with explicit dtypes
+        frames = []
+        for f in tf_files:
+            try:
+                frames.append(pd.read_parquet(f))
+            except Exception as e:
+                console.print(f"    [yellow]Skipping {f.name}: {e}[/yellow]")
+        if not frames:
+            console.print(f"    [yellow]No valid {tf} data[/yellow]")
+            continue
+
+        df = pd.concat(frames, ignore_index=True)
+        del frames  # free memory
+
+        df = df.sort_values("time").drop_duplicates(subset=["time"]).reset_index(drop=True)
+
+        # Ensure required columns
+        for col in ["tick_volume", "real_volume"]:
+            if col not in df.columns:
+                df[col] = df.get("volume", 0.0)
+
+        console.print(f"    {len(df):,} raw {tf} bars ({df['time'].min()} to {df['time'].max()})")
+
+        # Compute features
+        console.print(f"    Computing features...")
         processed = process_bars(df, tf, DEFAULT_CONFIG)
+        del df  # free memory
+
         elapsed = time.time() - t0
 
         # Save
@@ -202,10 +210,10 @@ def process(
         processed.to_parquet(out_path, index=False)
         console.print(f"    {tf}: {len(processed):,} bars, {len(processed.columns)} cols, "
                       f"{elapsed:.1f}s → {out_path}")
+        del processed  # free memory
 
     console.print(f"\n[green]Processing complete![/green]")
     console.print(f"Next: [bold]slytrade align --symbol {symbol}[/bold]")
-
 
 # ---------------------------------------------------------------------------
 # align — Causal MTF alignment onto M1
