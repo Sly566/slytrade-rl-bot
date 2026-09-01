@@ -352,21 +352,27 @@ def train(
 
     console.print(f"[bold]SlyTrade TRAIN v{VERSION}[/bold] symbol={symbol} algo={algo}")
 
-    # Load aligned data — all columns, sorted by time
+    # Load aligned data — subsample every 5th bar DURING loading to avoid OOM
+    # Peak memory: one full partition (~170MB) + accumulated subsampled frames
+    subsample = 5
     if partition_files:
-        console.print(f"  Data: {len(partition_files)} monthly partitions")
+        console.print(f"  Data: {len(partition_files)} monthly partitions (subsample={subsample})")
         frames = []
         for i, pf in enumerate(partition_files):
             chunk = pd.read_parquet(pf)
+            if subsample > 1 and len(chunk) > subsample:
+                chunk = chunk.iloc[::subsample].reset_index(drop=True)
             frames.append(chunk)
+            del chunk
             if (i + 1) % 12 == 0:
                 console.print(f"    Loaded {i+1}/{len(partition_files)} partitions...")
-            del chunk
         df = pd.concat(frames, ignore_index=True)
         del frames
     else:
         console.print(f"  Data: {aligned_path}")
         df = pd.read_parquet(aligned_path)
+        if subsample > 1 and len(df) > subsample:
+            df = df.iloc[::subsample].reset_index(drop=True)
 
     # Sort by whatever time column exists
     time_col = None
