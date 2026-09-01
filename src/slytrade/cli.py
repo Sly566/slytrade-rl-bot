@@ -352,40 +352,63 @@ def train(
 
     console.print(f"[bold]SlyTrade TRAIN v{VERSION}[/bold] symbol={symbol} algo={algo}")
 
-    # Load aligned data — subsample every 5th bar DURING loading to avoid OOM
-    # Peak memory: one full partition (~170MB) + accumulated subsampled frames
-    subsample = 5
+    # Load aligned data — full dataset, only RL-needed columns
+    # Load each partition, immediately filter to needed columns, delete full chunk.
+    # Peak memory: one full partition (~170MB) + accumulated filtered frames (~250MB total).
+    RL_COLS = [
+        "close", "atr_14",
+        "bull_disp", "bear_disp",
+        "minor_bos_up", "minor_bos_dn", "minor_choch_up", "minor_choch_dn",
+        "M5_bull_disp", "M5_bear_disp",
+        "M5_minor_bos_up", "M5_minor_bos_dn", "M5_minor_choch_up", "M5_minor_choch_dn",
+        "M15_bull_disp", "M15_bear_disp",
+        "M15_minor_bos_up", "M15_minor_bos_dn", "M15_minor_choch_up", "M15_minor_choch_dn",
+        "M15_major_choch_up", "M15_major_choch_dn",
+    ]
+
     if partition_files:
-        console.print(f"  Data: {len(partition_files)} monthly partitions (subsample={subsample})")
-        frames = []
-        for i, pf in enumerate(partition_files):
-            chunk = pd.read_parquet(pf)
-            if subsample > 1 and len(chunk) > subsample:
-                chunk = chunk.iloc[::subsample].reset_index(drop=True)
+        console.print(f"  Data: {len(partition_files)} monthly partitions (full dataset, {len(RL_COLS)} columns)")
+        # Discover columns + time column from first partition
+        first = pd.read_parquet(partition_files[0])
+        time_col = None
+        for candidate in ["time", "time_msc", "datetime", "timestamp"]:
+            if candidate in first.columns:
+                time_col = candidate
+                break
+        available = [c for c in RL_COLS if c in first.columns]
+        keep_cols = ([time_col] if time_col else []) + available
+        # Filter first partition immediately
+        first = first[keep_cols].copy()
+        frames = [first]
+        del first
+        # Load remaining partitions with column filter
+        for i, pf in enumerate(partition_files[1:], 2):
+            chunk = pd.read_parquet(pf, columns=keep_cols)
             frames.append(chunk)
             del chunk
-            if (i + 1) % 12 == 0:
-                console.print(f"    Loaded {i+1}/{len(partition_files)} partitions...")
+            if i % 12 == 0:
+                console.print(f"    Loaded {i}/{len(partition_files)} partitions...")
         df = pd.concat(frames, ignore_index=True)
         del frames
+        if time_col:
+            df = df.sort_values(time_col).reset_index(drop=True)
+            if time_col != "time":
+                df = df.rename(columns={time_col: "time"})
     else:
         console.print(f"  Data: {aligned_path}")
         df = pd.read_parquet(aligned_path)
-        if subsample > 1 and len(df) > subsample:
-            df = df.iloc[::subsample].reset_index(drop=True)
-
-    # Sort by whatever time column exists
-    time_col = None
-    for candidate in ["time", "time_msc", "datetime", "timestamp"]:
-        if candidate in df.columns:
-            time_col = candidate
-            break
-    if time_col:
-        df = df.sort_values(time_col).reset_index(drop=True)
-        if time_col != "time":
-            df = df.rename(columns={time_col: "time"})
-    else:
-        df = df.reset_index(drop=True)
+        time_col = None
+        for candidate in ["time", "time_msc", "datetime", "timestamp"]:
+            if candidate in df.columns:
+                time_col = candidate
+                break
+        available = [c for c in RL_COLS if c in df.columns]
+        keep_cols = ([time_col] if time_col else []) + available
+        df = df[keep_cols].copy()
+        if time_col:
+            df = df.sort_values(time_col).reset_index(drop=True)
+            if time_col != "time":
+                df = df.rename(columns={time_col: "time"})
 
     console.print(f"  Timesteps: {timesteps:,}")
     console.print(f"  Observation space: {OBS_DIM} dimensions (M1+M5+M15 structure)")
