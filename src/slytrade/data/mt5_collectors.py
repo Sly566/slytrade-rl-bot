@@ -62,6 +62,13 @@ class MT5TickCollector:
 
         for chunk_start, chunk_end in iter_time_chunks(start, end, chunk_size):
             chunks_attempted += 1
+
+            # Skip if chunk already exists on disk
+            chunk_path = self.storage.tick_path(actual_symbol, chunk_start)
+            if chunk_path.exists() or chunk_path.with_suffix(".csv").exists():
+                empty_chunks += 1
+                continue
+
             raw = self.mt5.copy_ticks_range(actual_symbol, chunk_start, chunk_end, copy_flag)
             normalized = normalize_tick_frame(raw, actual_symbol)
             clean, report = validate_tick_frame(normalized)
@@ -116,6 +123,13 @@ class MT5BarCollector:
 
         for chunk_start, chunk_end in iter_time_chunks(start, end, chunk_size):
             chunks_attempted += 1
+
+            # Skip if chunk already exists on disk
+            chunk_path = self.storage.bar_path(actual_symbol, timeframe, chunk_start)
+            if chunk_path.exists() or chunk_path.with_suffix(".csv").exists():
+                empty_chunks += 1
+                continue
+
             raw = self.mt5.copy_rates_range(actual_symbol, tf_const, chunk_start, chunk_end)
             normalized = normalize_bar_frame(raw, actual_symbol, timeframe)
             clean, report = validate_bar_frame(normalized)
