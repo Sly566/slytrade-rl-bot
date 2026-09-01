@@ -97,7 +97,15 @@ def _list_processed_partitions(root: Path, symbol: str, tf: str) -> list[tuple[i
     if not base.exists():
         return out
 
-    # Layout 1: partitioned year/month dirs
+    # Layout 2: single data.parquet (from slytrade process) — PREFERRED
+    # If a single data.parquet exists, it's the most recent output and
+    # covers the full date range. Old year/month partitions are stale.
+    single = base / "data.parquet"
+    if single.exists() and single.stat().st_size > 0:
+        out.append((0, 0, single))
+        return out
+
+    # Layout 1: partitioned year/month dirs (legacy)
     for y_dir in sorted(base.glob("year=*")):
         try:
             y = int(y_dir.name.split("=", 1)[1])
@@ -111,14 +119,6 @@ def _list_processed_partitions(root: Path, symbol: str, tf: str) -> list[tuple[i
             part_file = m_dir / "part-0.parquet"
             if part_file.exists() and part_file.stat().st_size > 0:
                 out.append((y, m, part_file))
-
-    # Layout 2: single data.parquet (from slytrade process)
-    if not out:
-        single = base / "data.parquet"
-        if single.exists() and single.stat().st_size > 0:
-            # Return as a single "partition" with year=0, month=0
-            # _read_processed_tf will handle it as one chunk
-            out.append((0, 0, single))
 
     return out
 
