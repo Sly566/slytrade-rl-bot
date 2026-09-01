@@ -352,28 +352,59 @@ def train(
 
     console.print(f"[bold]SlyTrade TRAIN v{VERSION}[/bold] symbol={symbol} algo={algo}")
 
-    # Load aligned data — subsample DURING loading to avoid OOM
-    # 62 partitions × 535 cols × 30K rows = ~7.5GB if loaded all at once.
-    # Subsample every 5th bar during loading → ~1.5GB peak.
-    subsample = 5
+    # Load aligned data — only columns the RL env uses (22 of 703)
+    # This drops memory from ~7.5GB to ~250MB. Full dataset, no subsampling.
+    RL_COLUMNS = [
+        "time", "close", "atr_14",
+        "bull_disp", "bear_disp",
+        "minor_bos_up", "minor_bos_dn", "minor_choch_up", "minor_choch_dn",
+        "M5_bull_disp", "M5_bear_disp",
+        "M5_minor_bos_up", "M5_minor_bos_dn", "M5_minor_choch_up", "M5_minor_choch_dn",
+        "M15_bull_disp", "M15_bear_disp",
+        "M15_minor_bos_up", "M15_minor_bos_dn", "M15_minor_choch_up", "M15_minor_choch_dn",
+        "M15_major_choch_up", "M15_major_choch_dn",
+    ]
+
     if partition_files:
-        console.print(f"  Data: {len(partition_files)} monthly partitions (subsample={subsample})")
+        console.print(f"  Data: {len(partition_files)} monthly partitions")
+        # Discover columns from first file
+        sample_cols = pd.read_parquet(partition_files[0], columns=[]).columns.tolist()
+        # Find time column (could be time, time_msc, datetime, etc.)
+        time_col = None
+        for candidate in ["time", "time_msc", "datetime", "timestamp"]:
+            if candidate in sample_cols:
+                time_col = candidate
+                break
+        use_cols = [c for c in RL_COLUMNS if c in sample_cols]
+        if time_col and time_col not in use_cols:
+            use_cols.insert(0, time_col)
         frames = []
         for i, pf in enumerate(partition_files):
-            chunk = pd.read_parquet(pf)
-            if subsample > 1 and len(chunk) > subsample:
-                chunk = chunk.iloc[::subsample].reset_index(drop=True)
+            chunk = pd.read_parquet(pf, columns=use_cols)
             frames.append(chunk)
             if (i + 1) % 12 == 0:
                 console.print(f"    Loaded {i+1}/{len(partition_files)} partitions...")
             del chunk
-        df = pd.concat(frames, ignore_index=True).sort_values("time").reset_index(drop=True)
+        df = pd.concat(frames, ignore_index=True)
+        if time_col:
+            df = df.sort_values(time_col).reset_index(drop=True)
+            if time_col != "time":
+                df = df.rename(columns={time_col: "time"})
         del frames
     else:
         console.print(f"  Data: {aligned_path}")
-        df = pd.read_parquet(aligned_path)
-        if subsample > 1 and len(df) > subsample:
-            df = df.iloc[::subsample].reset_index(drop=True)
+        sample_cols = pd.read_parquet(aligned_path, columns=[]).columns.tolist()
+        time_col = None
+        for candidate in ["time", "time_msc", "datetime", "timestamp"]:
+            if candidate in sample_cols:
+                time_col = candidate
+                break
+        use_cols = [c for c in RL_COLUMNS if c in sample_cols]
+        if time_col and time_col not in use_cols:
+            use_cols.insert(0, time_col)
+        df = pd.read_parquet(aligned_path, columns=use_cols)
+        if time_col and time_col != "time":
+            df = df.rename(columns={time_col: "time"})
 
     console.print(f"  Timesteps: {timesteps:,}")
     console.print(f"  Observation space: {OBS_DIM} dimensions (M1+M5+M15 structure)")
