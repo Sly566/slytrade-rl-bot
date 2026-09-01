@@ -308,6 +308,13 @@ class ExnessArchiveDownloader:
 
         for month_start in iter_month_starts(start, end):
             months_attempted += 1
+
+            # Skip months already on disk — Exness data is historical, never changes
+            month_file = self.month_path(archive_symbol, month_start)
+            if month_file.exists() or month_file.with_suffix(".csv").exists():
+                empty_months += 1
+                continue
+
             try:
                 if parquet_available():
                     # Memory-bounded: stream the CSV from the zip in chunks and
