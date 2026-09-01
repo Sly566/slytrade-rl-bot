@@ -886,7 +886,8 @@ def process_bars(
     _add_silver_bullet(out)
     _add_power_of_3(out)
     _add_judas_swing(out)
-    _add_consequent_encroachment(out)
+    ce_cols = _add_consequent_encroachment(out)
+    out = pd.concat([out, ce_cols], axis=1)
     if progress:
         progress(f"    {timeframe}: done ({len(out):,} rows, {len(out.columns)} cols)")
     return out
@@ -1030,7 +1031,7 @@ def _add_judas_swing(df: pd.DataFrame) -> None:
     df["in_judas_swing"] = (judas_bull | judas_bear).astype(bool)
 
 
-def _add_consequent_encroachment(df: pd.DataFrame) -> None:
+def _add_consequent_encroachment(df: pd.DataFrame) -> pd.DataFrame:
     """Add Consequent Encroachment (CE) — 50% midpoint of FVGs.
 
     ICT says the 50% level of a Fair Value Gap is a high-probability
@@ -1060,19 +1061,19 @@ def _add_consequent_encroachment(df: pd.DataFrame) -> None:
         np.nan,
     )
 
-    df["bull_ce"] = bull_ce
-    df["bear_ce"] = bear_ce
-
     # Distance to nearest CE (normalized by ATR)
     atr = df.get("atr_14", pd.Series(1.0, index=df.index)).values
     atr = np.where(np.isnan(atr) | (atr <= 0), 1.0, atr)
-
     dist_bull_ce = np.abs(close - bull_ce) / atr
     dist_bear_ce = np.abs(close - bear_ce) / atr
 
-    df["dist_to_bull_ce"] = dist_bull_ce
-    df["dist_to_bear_ce"] = dist_bear_ce
-
-    # Price is at CE if within 0.3 ATR
-    df["at_bull_ce"] = (dist_bull_ce < 0.3).astype(bool)
-    df["at_bear_ce"] = (dist_bear_ce < 0.3).astype(bool)
+    # Batch all new columns at once to avoid DataFrame fragmentation
+    new_cols = pd.DataFrame({
+        "bull_ce": bull_ce,
+        "bear_ce": bear_ce,
+        "dist_to_bull_ce": dist_bull_ce,
+        "dist_to_bear_ce": dist_bear_ce,
+        "at_bull_ce": (dist_bull_ce < 0.3).astype(bool),
+        "at_bear_ce": (dist_bear_ce < 0.3).astype(bool),
+    }, index=df.index)
+    return new_cols

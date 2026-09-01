@@ -162,6 +162,12 @@ def process(
         shutil.rmtree(out_dir, ignore_errors=True)
 
     for tf in tfs:
+        # Skip already-processed TFs (unless --clean)
+        tf_out_path = out_dir / f"timeframe={tf}" / "data.parquet"
+        if tf_out_path.exists() and not clean:
+            console.print(f"  {tf}: already processed, skipping")
+            continue
+
         console.print(f"\n  Processing {tf}...")
         t0 = time.time()
 
