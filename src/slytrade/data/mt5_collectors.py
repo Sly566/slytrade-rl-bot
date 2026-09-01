@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from slytrade.brokers.symbols import resolve_symbol
@@ -38,6 +38,15 @@ class CollectionResult:
         return len(self.files)
 
 
+def _chunk_is_complete(chunk_end: datetime) -> bool:
+    """A chunk is complete if its end is in the past (no more bars will appear)."""
+    now = datetime.now(UTC)
+    # Ensure chunk_end is timezone-aware
+    if chunk_end.tzinfo is None:
+        chunk_end = chunk_end.replace(tzinfo=UTC)
+    return chunk_end <= now
+
+
 class MT5TickCollector:
     def __init__(self, mt5: Any, storage: MarketDataStorage | None = None):
         self.mt5 = mt5
@@ -63,9 +72,11 @@ class MT5TickCollector:
         for chunk_start, chunk_end in iter_time_chunks(start, end, chunk_size):
             chunks_attempted += 1
 
-            # Skip if chunk already exists on disk
+            # Skip completed chunks that already exist on disk.
+            # Always re-fetch the current/live chunk (storage merges + deduplicates).
             chunk_path = self.storage.tick_path(actual_symbol, chunk_start)
-            if chunk_path.exists() or chunk_path.with_suffix(".csv").exists():
+            already_on_disk = chunk_path.exists() or chunk_path.with_suffix(".csv").exists()
+            if already_on_disk and _chunk_is_complete(chunk_end):
                 empty_chunks += 1
                 continue
 
@@ -124,9 +135,11 @@ class MT5BarCollector:
         for chunk_start, chunk_end in iter_time_chunks(start, end, chunk_size):
             chunks_attempted += 1
 
-            # Skip if chunk already exists on disk
+            # Skip completed chunks that already exist on disk.
+            # Always re-fetch the current/live chunk (storage merges + deduplicates).
             chunk_path = self.storage.bar_path(actual_symbol, timeframe, chunk_start)
-            if chunk_path.exists() or chunk_path.with_suffix(".csv").exists():
+            already_on_disk = chunk_path.exists() or chunk_path.with_suffix(".csv").exists()
+            if already_on_disk and _chunk_is_complete(chunk_end):
                 empty_chunks += 1
                 continue
 
