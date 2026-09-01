@@ -80,16 +80,30 @@ class MultiAgentTrainer:
         log_probs = []
         rewards = []
         dones = []
-        values = []
 
         obs, _ = self.env.reset()
         done = False
+        episode_reward = 0.0
+        episode_length = 0
+        episode_rewards = []
+        episode_lengths = []
+        n_trades = 0
+        wins = 0
+        total_pnl = 0.0
+        max_dd = 0.0
+        sub_agent_sums = {}  # running sum of sub-agent outputs
 
-        for _ in range(self.n_steps):
+        for step in range(self.n_steps):
             obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
 
             with torch.no_grad():
                 action, log_prob, sub_outputs = self.ensemble.get_action(obs_tensor)
+
+            # Track sub-agent output magnitudes
+            for name, out in sub_outputs.items():
+                if name not in sub_agent_sums:
+                    sub_agent_sums[name] = np.zeros(out.shape[-1])
+                sub_agent_sums[name] += out.squeeze(0).cpu().numpy()
 
             action_np = action.squeeze(0).cpu().numpy().astype(np.int64)
             next_obs, reward, terminated, truncated, info = self.env.step(action_np)
@@ -101,9 +115,38 @@ class MultiAgentTrainer:
             rewards.append(reward)
             dones.append(done)
 
+            episode_reward += reward
+            episode_length += 1
+
+            # Track trade metrics from info
+            if info.get("trade_closed"):
+                n_trades += 1
+                pnl = info.get("close_pnl", 0.0)
+                total_pnl += pnl
+                if pnl > 0:
+                    wins += 1
+
             obs = next_obs
             if done:
+                episode_rewards.append(episode_reward)
+                episode_lengths.append(episode_length)
+                episode_reward = 0.0
+                episode_length = 0
                 obs, _ = self.env.reset()
+
+        # Compute rollout stats
+        self._last_rollout_stats = {
+            "mean_ep_reward": np.mean(episode_rewards) if episode_rewards else 0.0,
+            "mean_ep_length": np.mean(episode_lengths) if episode_lengths else 0.0,
+            "n_trades": n_trades,
+            "win_rate": wins / max(n_trades, 1),
+            "total_pnl": total_pnl,
+            "mean_reward": np.mean(rewards),
+            "std_reward": np.std(rewards),
+            "max_reward": np.max(rewards),
+            "min_reward": np.min(rewards),
+            "sub_agent_sums": sub_agent_sums,
+        }
 
         return {
             "observations": np.array(observations),
@@ -227,13 +270,39 @@ class MultiAgentTrainer:
             # Update
             update_info = self.update(rollout)
 
-            # Progress
+            # Progress — detailed stats
             elapsed = time.time() - start_time
             fps = timesteps_done / max(elapsed, 1)
+            stats = self._last_rollout_stats
 
             if progress_fn:
-                progress_fn(f"  [{timesteps_done:,}/{total_timesteps:,}] "
-                           f"loss={update_info['loss']:.4f} fps={fps:.0f} ({elapsed:.0f}s)")
+                # Main metrics
+                progress_fn(
+                    f"  [{timesteps_done:,}/{total_timesteps:,}] "
+                    f"loss={update_info['loss']:.4f} fps={fps:.0f} ({elapsed:.0f}s)"
+                )
+                # Trade metrics
+                progress_fn(
+                    f"    trades={stats['n_trades']} wr={stats['win_rate']:.0%} "
+                    f"pnl={stats['total_pnl']:+.0f} "
+                    f"ep_reward={stats['mean_ep_reward']:.1f} "
+                    f"ep_len={stats['mean_ep_length']:.0f}"
+                )
+                # Reward distribution
+                progress_fn(
+                    f"    reward: mean={stats['mean_reward']:.3f} std={stats['std_reward']:.3f} "
+                    f"max={stats['max_reward']:.2f} min={stats['min_reward']:.2f}"
+                )
+                # Sub-agent output summary (top signals)
+                sub = stats['sub_agent_sums']
+                regime_avg = sub.get("regime", np.zeros(4))
+                dd_avg = sub.get("drawdown", np.zeros(3))
+                entry_avg = sub.get("entry", np.zeros(4))
+                progress_fn(
+                    f"    agents: regime={np.argmax(regime_avg)} "
+                    f"drawdown=[{dd_avg[0]:.1f},{dd_avg[1]:.1f},{dd_avg[2]:.1f}] "
+                    f"entry=[long={entry_avg[0]:.1f},short={entry_avg[1]:.1f},conf={entry_avg[2]:.1f}]"
+                )
 
             # Evaluation
             if eval_env and timesteps_done % eval_freq < self.n_steps:
