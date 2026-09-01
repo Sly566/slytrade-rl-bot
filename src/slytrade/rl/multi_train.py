@@ -115,6 +115,8 @@ class MultiAgentTrainer:
 
     def compute_gae(self, rewards: np.ndarray, dones: np.ndarray) -> np.ndarray:
         """Compute Generalized Advantage Estimation."""
+        # Clip rewards to prevent overflow
+        rewards = np.clip(rewards, -10.0, 10.0)
         advantages = np.zeros_like(rewards)
         last_gae = 0.0
 
@@ -125,7 +127,9 @@ class MultiAgentTrainer:
                 next_value = advantages[t + 1] if not dones[t] else 0.0
 
             delta = rewards[t] + self.gamma * next_value * (1 - dones[t]) - 0.0
-            advantages[t] = last_gae = delta + self.gamma * 0.95 * (1 - dones[t]) * last_gae
+            last_gae = delta + self.gamma * 0.95 * (1 - dones[t]) * last_gae
+            last_gae = np.clip(last_gae, -100.0, 100.0)  # prevent explosion
+            advantages[t] = last_gae
 
         return advantages
 
@@ -185,16 +189,12 @@ class MultiAgentTrainer:
 
                 loss = policy_loss - 0.01 * entropy
 
-                # Update meta-agent
+                # Single backward pass, update all parameters together
                 self.meta_optimizer.zero_grad()
-                loss.backward(retain_graph=True)
-                torch.nn.utils.clip_grad_norm_(self.ensemble.meta.parameters(), 0.5)
-                self.meta_optimizer.step()
-
-                # Update sub-agents (with smaller learning rate)
                 self.sub_optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.ensemble.parameters(), 0.5)
+                self.meta_optimizer.step()
                 self.sub_optimizer.step()
 
                 total_loss += loss.item()
