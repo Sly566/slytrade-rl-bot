@@ -86,11 +86,18 @@ class AlignResult:
 
 
 def _list_processed_partitions(root: Path, symbol: str, tf: str) -> list[tuple[int, int, Path]]:
-    """Return [(year, month, path)] of existing processed-bar partitions."""
+    """Return [(year, month, path)] of existing processed-bar partitions.
+
+    Supports two layouts:
+    1. Partitioned: symbol=X/timeframe=Y/year=YYYY/month=MM/part-0.parquet
+    2. Single file: symbol=X/timeframe=Y/data.parquet (from slytrade process)
+    """
     base = root / f"symbol={symbol}" / f"timeframe={tf}"
     out: list[tuple[int, int, Path]] = []
     if not base.exists():
         return out
+
+    # Layout 1: partitioned year/month dirs
     for y_dir in sorted(base.glob("year=*")):
         try:
             y = int(y_dir.name.split("=", 1)[1])
@@ -104,6 +111,15 @@ def _list_processed_partitions(root: Path, symbol: str, tf: str) -> list[tuple[i
             part_file = m_dir / "part-0.parquet"
             if part_file.exists() and part_file.stat().st_size > 0:
                 out.append((y, m, part_file))
+
+    # Layout 2: single data.parquet (from slytrade process)
+    if not out:
+        single = base / "data.parquet"
+        if single.exists() and single.stat().st_size > 0:
+            # Return as a single "partition" with year=0, month=0
+            # _read_processed_tf will handle it as one chunk
+            out.append((0, 0, single))
+
     return out
 
 
@@ -247,6 +263,38 @@ def align_all(
     out_col_count = 0
 
     for (y, m, part_path) in m1_parts:
+        # If single-file layout (y=0, m=0), chunk by month to avoid OOM
+        if y == 0 and m == 0:
+            progress(f"  Single M1 file found — chunking by month ...")
+            full_m1 = pd.read_parquet(part_path)
+            full_m1["time"] = pd.to_datetime(full_m1["time"], utc=True, errors="coerce")
+            full_m1 = full_m1.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
+            full_m1["_ym"] = full_m1["time"].dt.to_period("M")
+            for period, chunk in full_m1.groupby("_ym", sort=True):
+                chunk = chunk.drop(columns=["_ym"]).reset_index(drop=True)
+                if chunk.empty:
+                    continue
+                py, pm = int(period.year), int(period.month)
+                aligned = chunk
+                for tf in HTFS:
+                    aligned = _asof_merge(aligned, htf_frames[tf], tf)
+                drop_cols = [c for c in aligned.columns if c == "decision_time" or c.startswith("decision_time_")]
+                if drop_cols:
+                    aligned = aligned.drop(columns=drop_cols)
+                aligned = aligned.sort_values("time", kind="mergesort").reset_index(drop=True)
+                part_dir = bar_partition(aligned_root, "", raw_symbol, EXECUTION_TF, py, pm)
+                target = part_dir / "part-0.parquet"
+                out_df = _normalize_for_parquet(aligned, time_col="time")
+                _atomic_write_parquet(out_df, target)
+                n = len(out_df)
+                total_rows += n
+                total_files += 1
+                out_col_count = len(out_df.columns)
+                progress(f"    M1 {py}-{pm:02d}: {n:,} rows x {out_col_count} cols written.")
+                del aligned, out_df, chunk
+            del full_m1
+            continue
+
         m1_df = pd.read_parquet(part_path)
         m1_df["time"] = pd.to_datetime(m1_df["time"], utc=True, errors="coerce")
         m1_df = m1_df.dropna(subset=["time"]).sort_values("time", kind="mergesort").reset_index(drop=True)
