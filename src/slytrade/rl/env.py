@@ -309,6 +309,8 @@ class SlyTradeEnv(gym.Env):
         Returns:
             obs, reward, terminated, truncated, info
         """
+        # Handle both torch tensors and numpy arrays
+        action = np.asarray(action).flatten()
         action_type = int(action[0])
         size_level = int(action[1])
         sl_mult_idx = int(action[2])

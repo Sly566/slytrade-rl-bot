@@ -352,28 +352,34 @@ def train(
 
     console.print(f"[bold]SlyTrade TRAIN v{VERSION}[/bold] symbol={symbol} algo={algo}")
 
-    # Load aligned data — subsample DURING loading to avoid OOM
-    # 62 partitions × 535 cols × 30K rows = ~7.5GB if loaded all at once.
-    # Subsample every 5th bar during loading → ~1.5GB peak.
-    subsample = 5
+    # Load aligned data — all columns, sorted by time
     if partition_files:
-        console.print(f"  Data: {len(partition_files)} monthly partitions (subsample={subsample})")
+        console.print(f"  Data: {len(partition_files)} monthly partitions")
         frames = []
         for i, pf in enumerate(partition_files):
             chunk = pd.read_parquet(pf)
-            if subsample > 1 and len(chunk) > subsample:
-                chunk = chunk.iloc[::subsample].reset_index(drop=True)
             frames.append(chunk)
             if (i + 1) % 12 == 0:
                 console.print(f"    Loaded {i+1}/{len(partition_files)} partitions...")
             del chunk
-        df = pd.concat(frames, ignore_index=True).sort_values("time").reset_index(drop=True)
+        df = pd.concat(frames, ignore_index=True)
         del frames
     else:
         console.print(f"  Data: {aligned_path}")
         df = pd.read_parquet(aligned_path)
-        if subsample > 1 and len(df) > subsample:
-            df = df.iloc[::subsample].reset_index(drop=True)
+
+    # Sort by whatever time column exists
+    time_col = None
+    for candidate in ["time", "time_msc", "datetime", "timestamp"]:
+        if candidate in df.columns:
+            time_col = candidate
+            break
+    if time_col:
+        df = df.sort_values(time_col).reset_index(drop=True)
+        if time_col != "time":
+            df = df.rename(columns={time_col: "time"})
+    else:
+        df = df.reset_index(drop=True)
 
     console.print(f"  Timesteps: {timesteps:,}")
     console.print(f"  Observation space: {OBS_DIM} dimensions (M1+M5+M15 structure)")
