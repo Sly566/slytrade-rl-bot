@@ -670,6 +670,7 @@ def backtest(
     console.print(f"[bold]SlyTrade BACKTEST v{VERSION}[/bold] symbol={symbol}")
 
     # Find aligned data
+    partition_files = []
     if not aligned_path:
         candidates = [
             Path("data/processed/aligned") / f"symbol={symbol}" / "aligned.parquet",
@@ -680,12 +681,26 @@ def backtest(
             if c.exists():
                 aligned_path = str(c)
                 break
+
+        # Also check for monthly partitions from align_all()
         if not aligned_path:
+            part_dir = Path("data/processed/aligned") / f"symbol={symbol}"
+            if part_dir.exists():
+                partition_files = sorted(part_dir.rglob("part-*.parquet"))
+
+        if not aligned_path and not partition_files:
             console.print(f"[red]No aligned data found. Run 'slytrade align' first.[/red]")
             raise typer.Exit(1)
 
-    df = pd.read_parquet(aligned_path)
-    console.print(f"  Data: {aligned_path}")
+    if partition_files:
+        console.print(f"  Data: {len(partition_files)} monthly partitions")
+        frames = [pd.read_parquet(f) for f in partition_files]
+        df = pd.concat(frames, ignore_index=True).sort_values("time").reset_index(drop=True)
+        del frames
+    else:
+        console.print(f"  Data: {aligned_path}")
+        df = pd.read_parquet(aligned_path)
+
     console.print(f"  {len(df):,} bars, {len(df.columns)} columns")
     console.print(f"  Date: {df['time'].min()} to {df['time'].max()}")
 
