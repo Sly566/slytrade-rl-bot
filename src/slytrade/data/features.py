@@ -921,6 +921,7 @@ def process_bars(
     cfg: FeatureConfig | None = None,
     *,
     progress: Callable[[str], None] | None = None,
+    tick_dir: Path | None = None,
 ) -> pd.DataFrame:
     """Enrich a single-TF OHLCV dataframe with all Layer-2 features.
 
@@ -966,6 +967,18 @@ def process_bars(
     if progress:
         progress(f"    {timeframe}: zone proximity ...")
     _add_zone_proximity(out)
+
+    # Tick-derived features (M1 only — ticks don't exist for HTFs)
+    if timeframe == "M1" and tick_dir is not None:
+        if progress:
+            progress(f"    {timeframe}: tick features ...")
+        from .tick_features import compute_tick_features
+        tick_cols = compute_tick_features(out, tick_dir)
+        out = pd.concat([out, tick_cols], axis=1)
+        if progress:
+            n_nonzero = (tick_cols["tick_count"] > 0).sum()
+            progress(f"    {timeframe}: tick features ({n_nonzero:,}/{len(out):,} bars with ticks)")
+
     if progress:
         progress(f"    {timeframe}: done ({len(out):,} rows, {len(out.columns)} cols)")
     return out

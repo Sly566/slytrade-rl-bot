@@ -83,7 +83,18 @@ _OBS_KZ_NY = 36
 _OBS_HOUR_SIN = 37    # hour encoded as sin
 _OBS_HOUR_COS = 38    # hour encoded as cos
 
-OBS_DIM = 39
+# Tick microstructure features (from raw tick data)
+_OBS_TICK_BUY_RATIO = 39       # buy-initiated tick ratio
+_OBS_TICK_SELL_RATIO = 40      # sell-initiated tick ratio
+_OBS_TICK_SPREAD_MEAN = 41     # mean bid-ask spread
+_OBS_TICK_SPREAD_MAX = 42      # max spread (liquidity events)
+_OBS_TICK_PRICE_VELOCITY = 43  # price range / tick count (ATR-normalized)
+_OBS_TICK_VOLUME_IMBALANCE = 44 # (buy_vol - sell_vol) / total_vol
+_OBS_TICK_ABSORPTION = 45      # log(vol) / price_range
+_OBS_TICK_LARGE_TRADE = 46     # fraction from large trades
+_OBS_TICK_COUNT = 47           # number of ticks (normalized)
+
+OBS_DIM = 48
 
 # Action space
 ACT_HOLD = 0
@@ -154,6 +165,16 @@ class SlyTradeEnv(gym.Env):
             "ob_proximity": "ob_proximity",
             "fvg_proximity": "fvg_proximity",
             "sweep_proximity": "sweep_proximity",
+            # Tick microstructure features
+            "tick_buy_ratio": "tick_buy_ratio",
+            "tick_sell_ratio": "tick_sell_ratio",
+            "tick_spread_mean": "tick_spread_mean",
+            "tick_spread_max": "tick_spread_max",
+            "tick_price_velocity": "tick_price_velocity",
+            "tick_volume_imbalance": "tick_volume_imbalance",
+            "tick_absorption": "tick_absorption",
+            "tick_large_trade_ratio": "tick_large_trade_ratio",
+            "tick_count": "tick_count",
         }
         self._col_arrays = {}
         for key, col in _COL_MAP.items():
@@ -266,6 +287,19 @@ class SlyTradeEnv(gym.Env):
             obs[_OBS_SWEEP_PROX] = ca["sweep_proximity"][i]
         else:
             obs[_OBS_SWEEP_PROX] = 0.5
+
+        # Tick microstructure features
+        ca = self._col_arrays
+        obs[_OBS_TICK_BUY_RATIO] = ca.get("tick_buy_ratio", np.zeros(self.n_bars))[i] if "tick_buy_ratio" in ca else 0.0
+        obs[_OBS_TICK_SELL_RATIO] = ca.get("tick_sell_ratio", np.zeros(self.n_bars))[i] if "tick_sell_ratio" in ca else 0.0
+        obs[_OBS_TICK_SPREAD_MEAN] = ca.get("tick_spread_mean", np.zeros(self.n_bars))[i] if "tick_spread_mean" in ca else 0.0
+        obs[_OBS_TICK_SPREAD_MAX] = ca.get("tick_spread_max", np.zeros(self.n_bars))[i] if "tick_spread_max" in ca else 0.0
+        obs[_OBS_TICK_PRICE_VELOCITY] = ca.get("tick_price_velocity", np.zeros(self.n_bars))[i] if "tick_price_velocity" in ca else 0.0
+        obs[_OBS_TICK_VOLUME_IMBALANCE] = ca.get("tick_volume_imbalance", np.zeros(self.n_bars))[i] if "tick_volume_imbalance" in ca else 0.0
+        obs[_OBS_TICK_ABSORPTION] = ca.get("tick_absorption", np.zeros(self.n_bars))[i] if "tick_absorption" in ca else 0.0
+        obs[_OBS_TICK_LARGE_TRADE] = ca.get("tick_large_trade_ratio", np.zeros(self.n_bars))[i] if "tick_large_trade_ratio" in ca else 0.0
+        tick_ct = ca.get("tick_count", np.zeros(self.n_bars))[i] if "tick_count" in ca else 0.0
+        obs[_OBS_TICK_COUNT] = min(tick_ct / 1000.0, 1.0)  # normalize: 1000 ticks = 1.0
 
         # Position state
         obs[_OBS_POS_DIR] = float(self._pos_dir)

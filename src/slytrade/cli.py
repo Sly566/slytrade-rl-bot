@@ -196,9 +196,10 @@ def process(
 
         console.print(f"    {len(df):,} raw {tf} bars ({df['time'].min()} to {df['time'].max()})")
 
-        # Compute features
+        # Compute features (with tick data for M1)
         console.print(f"    Computing features...")
-        processed = process_bars(df, tf, DEFAULT_CONFIG)
+        tick_dir = Path(raw_root) / "mt5_ticks" / f"symbol={symbol}" if tf == "M1" else None
+        processed = process_bars(df, tf, DEFAULT_CONFIG, tick_dir=tick_dir)
         del df  # free memory
 
         elapsed = time.time() - t0
@@ -366,6 +367,11 @@ def train(
         "M15_major_choch_up", "M15_major_choch_dn",
         # Zone proximity (computed dynamically from OB/FVG/sweep data)
         "ob_proximity", "fvg_proximity", "sweep_proximity",
+        # Tick microstructure features (from raw tick data)
+        "tick_buy_ratio", "tick_sell_ratio", "tick_spread_mean",
+        "tick_spread_max", "tick_spread_std", "tick_price_velocity",
+        "tick_volume_imbalance", "tick_absorption", "tick_count",
+        "tick_buy_volume", "tick_sell_volume", "tick_large_trade_ratio",
     ]
 
     if partition_files:
