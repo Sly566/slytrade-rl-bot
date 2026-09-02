@@ -238,6 +238,8 @@ class MetaAgent(nn.Module):
         self.size_head = nn.Linear(64, ACTION_DIMS[1])         # 3: 0.01, 0.04, 0.08
         self.sl_head = nn.Linear(64, ACTION_DIMS[2])           # 4: 1.0x, 1.5x, 2.0x, 2.5x
         self.tp_head = nn.Linear(64, ACTION_DIMS[3])           # 5: 0.5R, 1.0R, 1.5R, 2.0R, 2.5R
+        # Value head (critic) — required for proper GAE advantage estimation
+        self.value_head = nn.Linear(64, 1)
 
     def forward(self, sub_agent_features: torch.Tensor) -> tuple[torch.Tensor, ...]:
         """Forward pass.
@@ -246,7 +248,7 @@ class MetaAgent(nn.Module):
             sub_agent_features: concatenated sub-agent outputs [batch, META_INPUT_DIM]
 
         Returns:
-            (action_logits, size_logits, sl_logits, tp_logits)
+            (action_logits, size_logits, sl_logits, tp_logits, value)
         """
         h = self.net(sub_agent_features)
         return (
@@ -254,6 +256,7 @@ class MetaAgent(nn.Module):
             self.size_head(h),
             self.sl_head(h),
             self.tp_head(h),
+            self.value_head(h).squeeze(-1),
         )
 
     def get_action(self, sub_agent_features: torch.Tensor, deterministic: bool = False):
@@ -262,8 +265,9 @@ class MetaAgent(nn.Module):
         Returns:
             action: [action_type, size_level, sl_mult, tp_mult]
             log_prob: sum of log probabilities for all heads
+            value: state value estimate (for GAE)
         """
-        action_logits, size_logits, sl_logits, tp_logits = self.forward(sub_agent_features)
+        action_logits, size_logits, sl_logits, tp_logits, value = self.forward(sub_agent_features)
 
         if deterministic:
             action = torch.stack([
@@ -272,7 +276,7 @@ class MetaAgent(nn.Module):
                 sl_logits.argmax(-1),
                 tp_logits.argmax(-1),
             ])
-            return action, None
+            return action, None, value
 
         # Sample from categorical distributions
         action_dist = torch.distributions.Categorical(logits=action_logits)
@@ -291,7 +295,7 @@ class MetaAgent(nn.Module):
                     sl_dist.log_prob(action[2]) +
                     tp_dist.log_prob(action[3]))
 
-        return action, log_prob
+        return action, log_prob, value
 
 
 # ---------------------------------------------------------------------------
@@ -349,11 +353,12 @@ class MultiAgentEnsemble(nn.Module):
         Returns:
             action: [action_type, size_level, sl_mult, tp_mult]
             log_prob: sum log prob (for PPO)
+            value: state value estimate (for GAE)
             sub_outputs: dict of sub-agent outputs (for analysis)
         """
         meta_features, sub_outputs = self.forward(obs)
-        action, log_prob = self.meta.get_action(meta_features, deterministic)
-        return action, log_prob, sub_outputs
+        action, log_prob, value = self.meta.get_action(meta_features, deterministic)
+        return action, log_prob, value, sub_outputs
 
     def get_sub_agent_probs(self, obs: torch.Tensor) -> dict[str, np.ndarray]:
         """Get probability distributions from each sub-agent (for analysis)."""

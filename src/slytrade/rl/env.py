@@ -150,6 +150,10 @@ class SlyTradeEnv(gym.Env):
             "M15_minor_bos_up": "M15_minor_bos_up", "M15_minor_bos_dn": "M15_minor_bos_dn",
             "M15_minor_choch_up": "M15_minor_choch_up", "M15_minor_choch_dn": "M15_minor_choch_dn",
             "M15_major_choch_up": "M15_major_choch_up", "M15_major_choch_dn": "M15_major_choch_dn",
+            # Zone proximity (optional — from features.py)
+            "ob_proximity": "ob_proximity",
+            "fvg_proximity": "fvg_proximity",
+            "sweep_proximity": "sweep_proximity",
         }
         self._col_arrays = {}
         for key, col in _COL_MAP.items():
@@ -249,10 +253,19 @@ class SlyTradeEnv(gym.Env):
         obs[_OBS_M15_MAJOR_CHOCH_UP] = ca["M15_major_choch_up"][i]
         obs[_OBS_M15_MAJOR_CHOCH_DN] = ca["M15_major_choch_dn"][i]
 
-        # Zone proximity placeholders
-        obs[_OBS_OB_PROX] = 0.5
-        obs[_OBS_FVG_PROX] = 0.5
-        obs[_OBS_SWEEP_PROX] = 0.5
+        # Zone proximity — try to get from aligned data, fallback to neutral
+        if "ob_proximity" in self._col_arrays:
+            obs[_OBS_OB_PROX] = ca["ob_proximity"][i]
+        else:
+            obs[_OBS_OB_PROX] = 0.5
+        if "fvg_proximity" in self._col_arrays:
+            obs[_OBS_FVG_PROX] = ca["fvg_proximity"][i]
+        else:
+            obs[_OBS_FVG_PROX] = 0.5
+        if "sweep_proximity" in self._col_arrays:
+            obs[_OBS_SWEEP_PROX] = ca["sweep_proximity"][i]
+        else:
+            obs[_OBS_SWEEP_PROX] = 0.5
 
         # Position state
         obs[_OBS_POS_DIR] = float(self._pos_dir)
@@ -450,8 +463,8 @@ class SlyTradeEnv(gym.Env):
                 self._pos_dir = 0; self._pos_bars = 0; trade_closed = True
 
         # --- Compute reward ---
-        # Goal: teach sustainable profitability, not "bet the farm"
-        # Components: risk-adjusted PnL + drawdown penalty + overtrade penalty
+        # Balanced reward: encourage trading while controlling risk
+        # Key insight: if penalties are too harsh, agent learns to never trade (hold = 0 reward)
         equity_frac = self._equity / max(self._starting_equity, 1.0)
         drawdown = (self._peak_equity - self._equity) / max(self._peak_equity, 1.0)
 
@@ -459,36 +472,39 @@ class SlyTradeEnv(gym.Env):
 
         if len(self._trades) > 0 and trade_closed:
             last_pnl = self._trades[-1]["pnl"]
-            # Risk-adjusted PnL: normalize by equity, not starting equity
+            # Risk-adjusted PnL: normalize by equity
             pnl_frac = last_pnl / max(self._equity, 1.0)
-            reward = pnl_frac * 10.0  # moderate scale
+            reward = pnl_frac * 5.0  # moderate scale
 
-            # Win/loss asymmetry: penalize losses 2x more than reward wins
+            # Symmetric win/loss signal — let agent learn from outcomes
             if last_pnl > 0:
-                reward += 0.05
+                reward += 0.3  # win bonus
             else:
-                reward -= 0.15  # loss penalty > win bonus → agent learns to avoid losses
+                reward -= 0.3  # loss penalty (symmetric)
 
-            # Overtrade penalty: penalize if too many recent trades
-            n_recent = min(len(self._trades), 50)
-            if n_recent > 20:
-                reward -= 0.01 * (n_recent - 20)  # escalating penalty
+            # Reward for good R-multiple (TP hits are better than time-stops)
+            reason = self._trades[-1].get("reason", "")
+            if reason == "TP":
+                reward += 0.2  # bonus for hitting TP
+            elif reason == "TIME_STOP":
+                reward -= 0.1  # small penalty for time-stop (indecisive)
         else:
             # Small holding reward for being in profit (R-multiple based)
             if self._pos_dir != 0 and self._pos_risk_per_unit > 0:
                 r_dist = (price - self._pos_entry) if self._pos_dir == 1 else (self._pos_entry - price)
                 cur_r = r_dist / self._pos_risk_per_unit
-                reward = cur_r * 0.005  # tiny per-step signal
+                reward = cur_r * 0.01  # per-step signal for being in profit
 
-        # Drawdown penalty — EXPONENTIAL, kicks in at 2%
-        # This is the key: 85% DD should be massively penalized
-        if drawdown > 0.02:
-            dd_penalty = (drawdown ** 2) * 50.0  # exponential: 5%→1.25, 20%→20, 50%→125, 85%→361
+        # Drawdown penalty — LINEAR, kicks in at 5%, capped
+        # Old exponential was too harsh: 85% DD → 361 penalty per step
+        # New: gentle linear penalty that increases with DD
+        if drawdown > 0.05:
+            dd_penalty = min((drawdown - 0.05) * 5.0, 3.0)  # 5%→0, 10%→0.25, 20%→0.75, 50%→2.25, capped at 3.0
             reward -= dd_penalty
 
         # Equity wipeout — hard penalty
         if self._equity <= self._starting_equity * 0.5:
-            reward -= 10.0
+            reward -= 5.0
 
         # Advance to next bar
         self._bar_idx += 1

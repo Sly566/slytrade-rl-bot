@@ -78,6 +78,7 @@ class MultiAgentTrainer:
         observations = []
         actions = []
         log_probs = []
+        values = []
         rewards = []
         dones = []
 
@@ -90,14 +91,13 @@ class MultiAgentTrainer:
         n_trades = 0
         wins = 0
         total_pnl = 0.0
-        max_dd = 0.0
         sub_agent_sums = {}  # running sum of sub-agent outputs
 
         for step in range(self.n_steps):
             obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
 
             with torch.no_grad():
-                action, log_prob, sub_outputs = self.ensemble.get_action(obs_tensor)
+                action, log_prob, value, sub_outputs = self.ensemble.get_action(obs_tensor)
 
             # Track sub-agent output magnitudes
             for name, out in sub_outputs.items():
@@ -112,6 +112,7 @@ class MultiAgentTrainer:
             observations.append(obs)
             actions.append(action_np)
             log_probs.append(log_prob.item() if log_prob is not None else 0.0)
+            values.append(value.item() if value is not None else 0.0)
             rewards.append(reward)
             dones.append(done)
 
@@ -152,45 +153,58 @@ class MultiAgentTrainer:
             "observations": np.array(observations),
             "actions": np.array(actions),
             "log_probs": np.array(log_probs),
+            "values": np.array(values),
             "rewards": np.array(rewards),
             "dones": np.array(dones),
         }
 
-    def compute_gae(self, rewards: np.ndarray, dones: np.ndarray) -> np.ndarray:
-        """Compute Generalized Advantage Estimation."""
-        # Clip rewards to prevent overflow
+    def compute_gae(self, rewards: np.ndarray, dones: np.ndarray, values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Compute Generalized Advantage Estimation using value function.
+
+        Returns:
+            advantages: GAE advantages
+            returns: discounted returns (targets for value function)
+        """
         rewards = np.clip(rewards, -10.0, 10.0)
         advantages = np.zeros_like(rewards)
+        returns = np.zeros_like(rewards)
         last_gae = 0.0
 
         for t in reversed(range(len(rewards))):
             if t == len(rewards) - 1:
                 next_value = 0.0
             else:
-                next_value = advantages[t + 1] if not dones[t] else 0.0
+                next_value = values[t + 1] if not dones[t] else 0.0
 
-            delta = rewards[t] + self.gamma * next_value * (1 - dones[t]) - 0.0
+            # TD error: r + gamma * V(s') - V(s)
+            delta = rewards[t] + self.gamma * next_value * (1 - dones[t]) - values[t]
             last_gae = delta + self.gamma * 0.95 * (1 - dones[t]) * last_gae
-            last_gae = np.clip(last_gae, -100.0, 100.0)  # prevent explosion
+            last_gae = np.clip(last_gae, -50.0, 50.0)
             advantages[t] = last_gae
+            returns[t] = advantages[t] + values[t]  # GAE target
 
-        return advantages
+        return advantages, returns
 
     def update(self, rollout: dict) -> dict:
         """PPO update for both sub-agents and meta-agent."""
         observations = torch.FloatTensor(rollout["observations"]).to(self.device)
         actions = torch.LongTensor(rollout["actions"]).to(self.device)
         old_log_probs = torch.FloatTensor(rollout["log_probs"]).to(self.device)
-        advantages = torch.FloatTensor(self.compute_gae(rollout["rewards"], rollout["dones"])).to(self.device)
+        advantages_np, returns_np = self.compute_gae(
+            rollout["rewards"], rollout["dones"], rollout["values"]
+        )
+        advantages = torch.FloatTensor(advantages_np).to(self.device)
+        returns = torch.FloatTensor(returns_np).to(self.device)
 
         # Normalize advantages
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        total_loss = 0.0
+        total_policy_loss = 0.0
+        total_value_loss = 0.0
+        total_entropy = 0.0
         n_updates = 0
 
         for _ in range(self.n_epochs):
-            # Mini-batch updates
             indices = np.arange(len(observations))
             np.random.shuffle(indices)
 
@@ -202,10 +216,11 @@ class MultiAgentTrainer:
                 batch_actions = actions[batch_idx]
                 batch_old_log_probs = old_log_probs[batch_idx]
                 batch_advantages = advantages[batch_idx]
+                batch_returns = returns[batch_idx]
 
                 # Forward pass
                 meta_features, sub_outputs = self.ensemble(batch_obs)
-                action_logits, size_logits, sl_logits, tp_logits = self.ensemble.meta(meta_features)
+                action_logits, size_logits, sl_logits, tp_logits, values_pred = self.ensemble.meta(meta_features)
 
                 # Compute new log probs
                 action_dist = torch.distributions.Categorical(logits=action_logits)
@@ -226,11 +241,15 @@ class MultiAgentTrainer:
                 surr2 = torch.clamp(ratio, 1 - self.clip_range, 1 + self.clip_range) * batch_advantages
                 policy_loss = -torch.min(surr1, surr2).mean()
 
+                # Value loss (MSE)
+                value_loss = 0.5 * (values_pred - batch_returns).pow(2).mean()
+
                 # Entropy bonus
                 entropy = (action_dist.entropy() + size_dist.entropy() +
                           sl_dist.entropy() + tp_dist.entropy()).mean()
 
-                loss = policy_loss - 0.01 * entropy
+                # Combined loss: policy + 0.5 * value - 0.01 * entropy
+                loss = policy_loss + 0.5 * value_loss - 0.01 * entropy
 
                 # Single backward pass, update all parameters together
                 self.meta_optimizer.zero_grad()
@@ -240,10 +259,16 @@ class MultiAgentTrainer:
                 self.meta_optimizer.step()
                 self.sub_optimizer.step()
 
-                total_loss += loss.item()
+                total_policy_loss += policy_loss.item()
+                total_value_loss += value_loss.item()
+                total_entropy += entropy.item()
                 n_updates += 1
 
-        return {"loss": total_loss / max(n_updates, 1)}
+        return {
+            "policy_loss": total_policy_loss / max(n_updates, 1),
+            "value_loss": total_value_loss / max(n_updates, 1),
+            "entropy": total_entropy / max(n_updates, 1),
+        }
 
     def train(
         self,
@@ -279,7 +304,10 @@ class MultiAgentTrainer:
                 # Main metrics
                 progress_fn(
                     f"  [{timesteps_done:,}/{total_timesteps:,}] "
-                    f"loss={update_info['loss']:.4f} fps={fps:.0f} ({elapsed:.0f}s)"
+                    f"pi_loss={update_info['policy_loss']:.4f} "
+                    f"v_loss={update_info['value_loss']:.4f} "
+                    f"entropy={update_info['entropy']:.3f} "
+                    f"fps={fps:.0f} ({elapsed:.0f}s)"
                 )
                 # Trade metrics
                 progress_fn(
@@ -344,7 +372,7 @@ class MultiAgentTrainer:
         while not done:
             obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
             with torch.no_grad():
-                action, _, _ = self.ensemble.get_action(obs_tensor, deterministic=True)
+                action, _, _, _ = self.ensemble.get_action(obs_tensor, deterministic=True)
             action_np = action.squeeze(0).cpu().numpy()
             obs, _, terminated, truncated, _ = eval_env.step(action_np)
             done = terminated or truncated
