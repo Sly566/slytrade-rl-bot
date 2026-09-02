@@ -1,16 +1,16 @@
-"""Model serving — load trained RL model and use it in live trading.
+"""Model serving — load trained RL models and use them in live trading.
 
-The trained model acts as a signal filter: it observes market state and
-decides whether to take or skip each signal from the rule-based engine.
+Supports both SB3 models (PPO/SAC/A2C) and MultiAgentEnsemble.
 
 Usage in live trader:
-    from slytrade.rl.serve import RLFilter
+    from slytrade.rl.serve import RLFilter, MultiAgentFilter
 
+    # Single-agent (SB3)
     rl_filter = RLFilter("models/ppo_XAUUSDm_final.zip")
 
-    # In _handle_signal:
-    if rl_filter.should_skip(obs, signal):
-        return  # skip this signal
+    # Multi-agent
+    ma_filter = MultiAgentFilter("models/multi_XAUUSDm_best.pt")
+    explanation = ma_filter.explain(obs)
 """
 from __future__ import annotations
 
@@ -35,16 +35,7 @@ from .env import (
 
 
 class RLFilter:
-    """Load a trained RL model and use it to filter signals.
-
-    The model predicts: given current market state + proposed signal,
-    should we take it (ENTER) or skip it (HOLD)?
-
-    Args:
-        model_path: Path to trained model (.zip)
-        algo: Algorithm used (ppo, sac, a2c)
-        threshold: Confidence threshold for taking signals (0.0-1.0)
-    """
+    """Load a trained SB3 RL model and use it to filter signals."""
 
     def __init__(
         self,
@@ -82,131 +73,137 @@ class RLFilter:
     ) -> np.ndarray:
         """Build observation vector from current market state.
 
-        This mirrors the observation construction in SlyTradeEnv._get_obs().
+        Mirrors SlyTradeEnv._get_obs() — reads from aligned row dict/Series.
+        All 90 features populated.
         """
-        from .env import (
-            _OBS_BID, _OBS_ASK, _OBS_ATR, _OBS_SPREAD,
-            _OBS_BULL_DISP, _OBS_BEAR_DISP, _OBS_BOS_UP, _OBS_BOS_DN,
-            _OBS_CHOCH_UP, _OBS_CHOCH_DN,
-            _OBS_M5_BULL_DISP, _OBS_M5_BEAR_DISP,
-            _OBS_M5_BOS_UP, _OBS_M5_BOS_DN,
-            _OBS_M5_CHOCH_UP, _OBS_M5_CHOCH_DN,
-            _OBS_M15_BULL_DISP, _OBS_M15_BEAR_DISP,
-            _OBS_M15_BOS_UP, _OBS_M15_BOS_DN,
-            _OBS_M15_CHOCH_UP, _OBS_M15_CHOCH_DN,
-            _OBS_M15_MAJOR_CHOCH_UP, _OBS_M15_MAJOR_CHOCH_DN,
-            _OBS_OB_PROX, _OBS_FVG_PROX, _OBS_SWEEP_PROX,
-            _OBS_POS_DIR, _OBS_POS_R, _OBS_POS_BARS, _OBS_POS_AGE,
-            _OBS_EQUITY_CURVE, _OBS_DRAWDOWN, _OBS_WIN_RATE,
-            _OBS_KZ_ASIA, _OBS_KZ_LONDON, _OBS_KZ_NY,
-            _OBS_HOUR_SIN, _OBS_HOUR_COS,
-        )
-
-        obs = self._obs
-        obs[:] = 0.0
-
-        price = float(row.get("close", 0.0))
-        atr = float(row.get("atr_14", 0.0)) if hasattr(row, "get") else 0.0
-        if hasattr(row, "atr_14"):
-            atr = float(row.atr_14) if not np.isnan(row.atr_14) else 0.0
-
-        price_norm = price / 1000.0 if price > 0 else 0.0
-        obs[_OBS_BID] = price_norm
-        obs[_OBS_ASK] = price_norm + 0.0002
-        obs[_OBS_ATR] = atr / max(price, 1.0)
-        obs[_OBS_SPREAD] = 0.2 / max(atr, 0.001)
-
-        # Structure flags
-        for col, idx in [
-            ("bull_disp", _OBS_BULL_DISP), ("bear_disp", _OBS_BEAR_DISP),
-            ("minor_bos_up", _OBS_BOS_UP), ("minor_bos_dn", _OBS_BOS_DN),
-            ("minor_choch_up", _OBS_CHOCH_UP), ("minor_choch_dn", _OBS_CHOCH_DN),
-            ("M5_bull_disp", _OBS_M5_BULL_DISP), ("M5_bear_disp", _OBS_M5_BEAR_DISP),
-            ("M5_minor_bos_up", _OBS_M5_BOS_UP), ("M5_minor_bos_dn", _OBS_M5_BOS_DN),
-            ("M5_minor_choch_up", _OBS_M5_CHOCH_UP), ("M5_minor_choch_dn", _OBS_M5_CHOCH_DN),
-            # M15 structure
-            ("M15_bull_disp", _OBS_M15_BULL_DISP), ("M15_bear_disp", _OBS_M15_BEAR_DISP),
-            ("M15_minor_bos_up", _OBS_M15_BOS_UP), ("M15_minor_bos_dn", _OBS_M15_BOS_DN),
-            ("M15_minor_choch_up", _OBS_M15_CHOCH_UP), ("M15_minor_choch_dn", _OBS_M15_CHOCH_DN),
-            ("M15_major_choch_up", _OBS_M15_MAJOR_CHOCH_UP), ("M15_major_choch_dn", _OBS_M15_MAJOR_CHOCH_DN),
-        ]:
-            try:
-                obs[idx] = 1.0 if bool(row.get(col, False)) else 0.0
-            except Exception:
-                pass
-
-        # Position state
-        obs[_OBS_POS_DIR] = float(pos_dir)
-        if pos_dir != 0 and pos_risk > 0:
-            r_dist = (price - pos_entry) if pos_dir == 1 else (pos_entry - price)
-            obs[_OBS_POS_R] = r_dist / pos_risk
-        obs[_OBS_POS_BARS] = pos_bars / max(time_stop_bars, 1)
-        obs[_OBS_POS_AGE] = pos_bars / max(time_stop_bars, 1)
-
-        # Account state
-        obs[_OBS_EQUITY_CURVE] = equity / max(starting_equity, 1.0)
-        obs[_OBS_DRAWDOWN] = (peak_equity - equity) / max(peak_equity, 1.0)
-        if recent_wins:
-            obs[_OBS_WIN_RATE] = sum(recent_wins[-20:]) / len(recent_wins[-20:])
-
-        # Killzone
-        try:
-            ts = pd.Timestamp(row["time"])
-            hour = ts.hour
-            obs[_OBS_KZ_ASIA] = 1.0 if 0 <= hour < 8 else 0.0
-            obs[_OBS_KZ_LONDON] = 1.0 if 7 <= hour < 16 else 0.0
-            obs[_OBS_KZ_NY] = 1.0 if 12 <= hour < 21 else 0.0
-            obs[_OBS_HOUR_SIN] = np.sin(2 * np.pi * hour / 24.0)
-            obs[_OBS_HOUR_COS] = np.cos(2 * np.pi * hour / 24.0)
-        except Exception:
-            pass
-
+        from .env import _safe_from_row
+        obs = _safe_from_row(row, pos_dir, pos_entry, pos_risk, pos_bars,
+                             equity, peak_equity, starting_equity,
+                             recent_wins, time_stop_bars)
         return obs
 
     def predict_action(self, obs: np.ndarray) -> tuple[int, np.ndarray]:
-        """Predict action from observation.
-
-        Returns:
-            (action_type, full_action_array)
-        """
+        """Predict action from observation."""
         action, _ = self.model.predict(obs, deterministic=True)
         return int(action[0]), action
 
     def should_skip(self, obs: np.ndarray, signal_direction: int) -> bool:
-        """Decide whether to skip a signal based on RL model prediction.
-
-        Args:
-            obs: Current observation vector
-            signal_direction: +1 for long, -1 for short
-
-        Returns:
-            True if the signal should be SKIPPED (agent says HOLD/CLOSE)
-        """
+        """Decide whether to skip a signal based on RL model prediction."""
         action_type, _ = self.predict_action(obs)
-
-        # If agent says HOLD or CLOSE, skip the signal
         if action_type == ACT_HOLD or action_type == ACT_CLOSE:
             return True
-
-        # If agent says enter opposite direction, skip
         if signal_direction == 1 and action_type != ACT_ENTER_LONG:
             return True
         if signal_direction == -1 and action_type != ACT_ENTER_SHORT:
             return True
-
         return False
 
     def get_exit_action(self, obs: np.ndarray) -> int:
-        """Get exit action for an open position.
-
-        Returns:
-            ACT_HOLD (keep position) or ACT_CLOSE (close position)
-        """
+        """Get exit action for an open position."""
         action_type, _ = self.predict_action(obs)
         if action_type == ACT_CLOSE:
             return ACT_CLOSE
         return ACT_HOLD
 
 
-# Need pandas for timestamp parsing
-import pandas as pd
+class MultiAgentFilter:
+    """Load a trained MultiAgentEnsemble and use it in live trading.
+
+    Provides:
+    - Signal filtering (take/skip)
+    - Exit decisions
+    - Full explainability (why each decision was made)
+    - Sub-agent probability distributions
+    """
+
+    def __init__(self, model_path: str, device: str = "cpu"):
+        import torch
+        from .multi_agent import MultiAgentEnsemble
+
+        path = Path(model_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Model not found: {model_path}")
+
+        self.device = torch.device(device)
+        self.ensemble = MultiAgentEnsemble().to(self.device)
+        self.ensemble.load(str(path))
+        self.ensemble.eval()
+        self._obs = np.zeros(OBS_DIM, dtype=np.float32)
+
+    def build_obs(
+        self,
+        row: Any,
+        pos_dir: int = 0,
+        pos_entry: float = 0.0,
+        pos_risk: float = 0.0,
+        pos_bars: int = 0,
+        equity: float = 2000.0,
+        peak_equity: float = 2000.0,
+        starting_equity: float = 2000.0,
+        recent_wins: list[bool] | None = None,
+        time_stop_bars: int = 60,
+    ) -> np.ndarray:
+        """Build observation vector — mirrors env._get_obs()."""
+        from .env import _safe_from_row
+        return _safe_from_row(row, pos_dir, pos_entry, pos_risk, pos_bars,
+                              equity, peak_equity, starting_equity,
+                              recent_wins, time_stop_bars)
+
+    def predict_action(self, obs: np.ndarray) -> tuple[np.ndarray, dict]:
+        """Predict action and get explanation.
+
+        Returns:
+            action: [action_type, size_level, sl_mult, tp_mult]
+            explanation: dict with reasoning, labels, confidence scores
+        """
+        import torch
+        obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            action, _, _, _ = self.ensemble.get_action(obs_tensor, deterministic=True)
+            explanation = self.ensemble.explain(obs_tensor)
+        return action.squeeze(0).cpu().numpy(), explanation
+
+    def should_skip(self, obs: np.ndarray, signal_direction: int) -> tuple[bool, dict]:
+        """Decide whether to skip a signal.
+
+        Returns:
+            (should_skip, explanation)
+        """
+        action, explanation = self.predict_action(obs)
+        action_type = int(action[0])
+
+        skip = False
+        if action_type == ACT_HOLD or action_type == ACT_CLOSE:
+            skip = True
+        elif signal_direction == 1 and action_type != ACT_ENTER_LONG:
+            skip = True
+        elif signal_direction == -1 and action_type != ACT_ENTER_SHORT:
+            skip = True
+
+        return skip, explanation
+
+    def get_exit_action(self, obs: np.ndarray) -> tuple[int, dict]:
+        """Get exit action for an open position.
+
+        Returns:
+            (action, explanation)
+        """
+        action, explanation = self.predict_action(obs)
+        action_type = int(action[0])
+        if action_type == ACT_CLOSE:
+            return ACT_CLOSE, explanation
+        return ACT_HOLD, explanation
+
+    def explain(self, obs: np.ndarray) -> dict:
+        """Get human-readable explanation of current state."""
+        import torch
+        obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            return self.ensemble.explain(obs_tensor)
+
+    def get_sub_agent_probs(self, obs: np.ndarray) -> dict:
+        """Get probability distributions from all sub-agents."""
+        import torch
+        obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            return self.ensemble.get_sub_agent_probs(obs_tensor)

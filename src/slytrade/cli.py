@@ -204,6 +204,26 @@ def process(
 
         elapsed = time.time() - t0
 
+        # Wire news features for M1 (Gap 5)
+        if tf == "M1":
+            news_dir = Path("data/news")
+            news_cache_files = sorted(news_dir.glob("ff_calendar_*.json")) if news_dir.exists() else []
+            if news_cache_files:
+                console.print(f"    Merging news features...")
+                from .data.news import create_news_features
+                import json as _json
+                all_events = []
+                for nf in news_cache_files:
+                    try:
+                        with open(nf) as jf:
+                            all_events.extend(_json.load(jf))
+                    except Exception:
+                        continue
+                if all_events:
+                    news_df = pd.DataFrame(all_events)
+                    processed = create_news_features(processed, news_df)
+                    console.print(f"    News: {len(news_df)} events merged")
+
         # Save
         tf_dir = out_dir / f"timeframe={tf}"
         tf_dir.mkdir(parents=True, exist_ok=True)
@@ -358,20 +378,45 @@ def train(
     # Peak memory: one full partition (~170MB) + accumulated filtered frames (~250MB total).
     RL_COLS = [
         "close", "atr_14",
+        # M1 structure
         "bull_disp", "bear_disp",
         "minor_bos_up", "minor_bos_dn", "minor_choch_up", "minor_choch_dn",
+        # M5 structure
         "M5_bull_disp", "M5_bear_disp",
         "M5_minor_bos_up", "M5_minor_bos_dn", "M5_minor_choch_up", "M5_minor_choch_dn",
+        # M15 structure
         "M15_bull_disp", "M15_bear_disp",
         "M15_minor_bos_up", "M15_minor_bos_dn", "M15_minor_choch_up", "M15_minor_choch_dn",
         "M15_major_choch_up", "M15_major_choch_dn",
-        # Zone proximity (computed dynamically from OB/FVG/sweep data)
+        # HTF structure (Gap 6)
+        "H1_minor_bos_up", "H1_minor_bos_dn", "H1_minor_choch_up", "H1_minor_choch_dn",
+        "H4_minor_bos_up", "H4_minor_bos_dn", "H4_minor_choch_up", "H4_minor_choch_dn",
+        # Zone proximity
         "ob_proximity", "fvg_proximity", "sweep_proximity",
-        # Tick microstructure features (from raw tick data)
+        # S/R zones
+        "sr_support_dist", "sr_resistance_dist",
+        "sr_support_count", "sr_resistance_count",
+        "at_support", "at_resistance",
+        # Supply/Demand zones
+        "in_demand_zone", "in_supply_zone",
+        "demand_zone_strength", "supply_zone_strength",
+        "demand_zone_dist", "supply_zone_dist",
+        # Premium/Discount
+        "in_premium", "in_discount",
+        # ATR regime
+        "atr_pct_rank", "atr_expanding", "atr_contracting",
+        # Volume
+        "tick_vol_ratio", "vol_spike",
+        # Liquidity sweeps
+        "bull_liq_sweep", "bear_liq_sweep",
+        # Tick microstructure
         "tick_buy_ratio", "tick_sell_ratio", "tick_spread_mean",
-        "tick_spread_max", "tick_spread_std", "tick_price_velocity",
+        "tick_spread_max", "tick_price_velocity",
         "tick_volume_imbalance", "tick_absorption", "tick_count",
-        "tick_buy_volume", "tick_sell_volume", "tick_large_trade_ratio",
+        "tick_large_trade_ratio",
+        # News features
+        "minutes_to_next_high", "minutes_since_last_high",
+        "in_news_window", "news_impact_score",
     ]
 
     if partition_files:

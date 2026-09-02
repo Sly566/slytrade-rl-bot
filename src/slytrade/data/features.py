@@ -915,6 +915,219 @@ def _add_zone_proximity(df: pd.DataFrame) -> None:
     df["fvg_proximity"] = fvg_proximity
     df["sweep_proximity"] = sweep_proximity
 
+
+
+def _add_sr_zones(df: pd.DataFrame, cfg: FeatureConfig) -> None:
+    """Compute Support/Resistance zones from swing pivots.
+
+    Uses the minor and major swing highs/lows to identify key S/R levels.
+    - sr_support: nearest support level below current price (from swing lows)
+    - sr_resistance: nearest resistance level above current price (from swing highs)
+    - sr_support_dist: distance to support / ATR
+    - sr_resistance_dist: distance to resistance / ATR
+    - sr_count_support: number of support levels within 3 ATR (confluence)
+    - sr_count_resistance: number of resistance levels within 3 ATR
+    - at_support: bool — price is within 0.3 ATR of support
+    - at_resistance: bool — price is within 0.3 ATR of resistance
+    """
+    close = df["close"].values
+    n = len(df)
+    atr = df.get("atr_14", pd.Series(1.0, index=df.index)).values
+    atr = np.where(np.isnan(atr) | (atr <= 0), 1.0, atr)
+
+    # Collect swing low/high prices as support/resistance
+    sl_cols = [c for c in df.columns if "swing_low" in c and "idx" not in c and c.endswith("_price") or c == "swing_low"]
+    sh_cols = [c for c in df.columns if "swing_high" in c and "idx" not in c and c.endswith("_price") or c == "swing_high"]
+
+    # Also use generic swing columns if specific ones don't exist
+    if not sl_cols:
+        sl_cols = [c for c in df.columns if c in ("swing_low", "minor_swing_low", "major_swing_low")]
+    if not sh_cols:
+        sh_cols = [c for c in df.columns if c in ("swing_high", "minor_swing_high", "major_swing_high")]
+
+    # Fallback: use OB/FVG edges as S/R levels too
+    sr_support = np.full(n, np.nan)
+    sr_resistance = np.full(n, np.nan)
+    sr_support_dist = np.full(n, 10.0)
+    sr_resistance_dist = np.full(n, 10.0)
+    sr_count_support = np.zeros(n)
+    sr_count_resistance = np.zeros(n)
+
+    for i in range(n):
+        supports = []
+        resistances = []
+
+        # Swing lows = support
+        for col in sl_cols:
+            if col in df.columns:
+                val = df[col].iloc[i]
+                if not np.isnan(val) and val > 0:
+                    supports.append(val)
+
+        # Swing highs = resistance
+        for col in sh_cols:
+            if col in df.columns:
+                val = df[col].iloc[i]
+                if not np.isnan(val) and val > 0:
+                    resistances.append(val)
+
+        # OB edges as S/R
+        for col in ("bull_ob_bottom", "bear_ob_bottom"):
+            val = df.get(col, pd.Series(np.nan, index=df.index)).iloc[i]
+            if not np.isnan(val) and val > 0:
+                supports.append(val)
+        for col in ("bull_ob_top", "bear_ob_top"):
+            val = df.get(col, pd.Series(np.nan, index=df.index)).iloc[i]
+            if not np.isnan(val) and val > 0:
+                resistances.append(val)
+
+        # Nearest support below price
+        below = [s for s in supports if s < close[i]]
+        above = [r for r in resistances if r > close[i]]
+
+        if below:
+            sr_support[i] = max(below)  # nearest = highest below
+            sr_support_dist[i] = (close[i] - sr_support[i]) / atr[i]
+            sr_count_support[i] = sum(1 for s in below if (close[i] - s) / atr[i] < 3.0)
+
+        if above:
+            sr_resistance[i] = min(above)  # nearest = lowest above
+            sr_resistance_dist[i] = (sr_resistance[i] - close[i]) / atr[i]
+            sr_count_resistance[i] = sum(1 for r in above if (r - close[i]) / atr[i] < 3.0)
+
+    df["sr_support"] = sr_support
+    df["sr_resistance"] = sr_resistance
+    df["sr_support_dist"] = np.clip(sr_support_dist, 0.0, 10.0)
+    df["sr_resistance_dist"] = np.clip(sr_resistance_dist, 0.0, 10.0)
+    df["sr_support_count"] = sr_count_support
+    df["sr_resistance_count"] = sr_count_resistance
+    df["at_support"] = (sr_support_dist < 0.3).astype(bool)
+    df["at_resistance"] = (sr_resistance_dist < 0.3).astype(bool)
+
+
+def _add_supply_demand_zones(df: pd.DataFrame) -> None:
+    """Identify Supply/Demand zones from OB + FVG + sweep confluence.
+
+    A Demand zone = area where buyers stepped in strongly (bull OB + bull FVG + sweep)
+    A Supply zone = area where sellers stepped in strongly (bear OB + bear FVG + sweep)
+
+    Features:
+    - in_demand_zone: bool — price is in an active demand zone
+    - in_supply_zone: bool — price is in an active supply zone
+    - demand_zone_strength: 0-3 score (how many confirmations: OB+FVG+sweep)
+    - supply_zone_strength: 0-3 score
+    - demand_zone_dist: distance to nearest demand zone center / ATR
+    - supply_zone_dist: distance to nearest supply zone center / ATR
+    """
+    close = df["close"].values
+    n = len(df)
+    atr = df.get("atr_14", pd.Series(1.0, index=df.index)).values
+    atr = np.where(np.isnan(atr) | (atr <= 0), 1.0, atr)
+
+    # Demand zone: bull OB + bull FVG overlap + bull sweep nearby
+    bull_ob_top = df.get("bull_ob_top", pd.Series(np.nan, index=df.index)).values
+    bull_ob_bot = df.get("bull_ob_bottom", pd.Series(np.nan, index=df.index)).values
+    bull_ob_mit = df.get("bull_ob_mitigated", pd.Series(True, index=df.index)).values
+    bull_fvg_top = df.get("bull_fvg_top", pd.Series(np.nan, index=df.index)).values
+    bull_fvg_bot = df.get("bull_fvg_bottom", pd.Series(np.nan, index=df.index)).values
+    bull_fvg_mit = df.get("bull_fvg_mitigated", pd.Series(True, index=df.index)).values
+    bull_sweep = df.get("bull_liq_sweep", pd.Series(False, index=df.index)).values
+
+    bear_ob_top = df.get("bear_ob_top", pd.Series(np.nan, index=df.index)).values
+    bear_ob_bot = df.get("bear_ob_bottom", pd.Series(np.nan, index=df.index)).values
+    bear_ob_mit = df.get("bear_ob_mitigated", pd.Series(True, index=df.index)).values
+    bear_fvg_top = df.get("bear_fvg_top", pd.Series(np.nan, index=df.index)).values
+    bear_fvg_bot = df.get("bear_fvg_bottom", pd.Series(np.nan, index=df.index)).values
+    bear_fvg_mit = df.get("bear_fvg_mitigated", pd.Series(True, index=df.index)).values
+    bear_sweep = df.get("bear_liq_sweep", pd.Series(False, index=df.index)).values
+
+    in_demand = np.zeros(n, dtype=bool)
+    in_supply = np.zeros(n, dtype=bool)
+    demand_strength = np.zeros(n, dtype=np.float64)
+    supply_strength = np.zeros(n, dtype=np.float64)
+    demand_dist = np.full(n, 10.0)
+    supply_dist = np.full(n, 10.0)
+
+    for i in range(n):
+        price = close[i]
+
+        # Demand zone check
+        d_strength = 0
+        d_top, d_bot = np.nan, np.nan
+        if not bull_ob_mit[i] and not np.isnan(bull_ob_top[i]):
+            d_strength += 1
+            d_top, d_bot = bull_ob_top[i], bull_ob_bot[i]
+        if not bull_fvg_mit[i] and not np.isnan(bull_fvg_top[i]):
+            d_strength += 1
+            if np.isnan(d_top):
+                d_top, d_bot = bull_fvg_top[i], bull_fvg_bot[i]
+            else:
+                d_top = max(d_top, bull_fvg_top[i])
+                d_bot = min(d_bot, bull_fvg_bot[i])
+        if bull_sweep[i]:
+            d_strength += 1
+
+        demand_strength[i] = d_strength
+        if d_strength > 0 and not np.isnan(d_top):
+            if d_bot <= price <= d_top:
+                in_demand[i] = True
+            demand_dist[i] = abs(price - (d_top + d_bot) / 2.0) / atr[i]
+
+        # Supply zone check
+        s_strength = 0
+        s_top, s_bot = np.nan, np.nan
+        if not bear_ob_mit[i] and not np.isnan(bear_ob_top[i]):
+            s_strength += 1
+            s_top, s_bot = bear_ob_top[i], bear_ob_bot[i]
+        if not bear_fvg_mit[i] and not np.isnan(bear_fvg_top[i]):
+            s_strength += 1
+            if np.isnan(s_top):
+                s_top, s_bot = bear_fvg_top[i], bear_fvg_bot[i]
+            else:
+                s_top = max(s_top, bear_fvg_top[i])
+                s_bot = min(s_bot, bear_fvg_bot[i])
+        if bear_sweep[i]:
+            s_strength += 1
+
+        supply_strength[i] = s_strength
+        if s_strength > 0 and not np.isnan(s_top):
+            if s_bot <= price <= s_top:
+                in_supply[i] = True
+            supply_dist[i] = abs(price - (s_top + s_bot) / 2.0) / atr[i]
+
+    df["in_demand_zone"] = in_demand
+    df["in_supply_zone"] = in_supply
+    df["demand_zone_strength"] = demand_strength
+    df["supply_zone_strength"] = supply_strength
+    df["demand_zone_dist"] = np.clip(demand_dist, 0.0, 10.0)
+    df["supply_zone_dist"] = np.clip(supply_dist, 0.0, 10.0)
+
+
+def _add_atr_regime(df: pd.DataFrame, cfg: FeatureConfig) -> None:
+    """ATR percentile rank — is current volatility high or low relative to history?
+
+    Features:
+    - atr_pct_rank: 0-1 percentile rank of current ATR vs rolling 252-bar window
+    - atr_expanding: bool — ATR > 1.2x its 20-bar SMA (volatility expanding)
+    - atr_contracting: bool — ATR < 0.8x its 20-bar SMA (volatility contracting)
+    """
+    atr = df.get("atr_14", pd.Series(1.0, index=df.index)).values
+    atr = np.where(np.isnan(atr) | (atr <= 0), 1.0, atr)
+
+    atr_series = pd.Series(atr)
+    atr_sma20 = atr_series.rolling(20, min_periods=1).mean()
+
+    # Percentile rank over rolling window
+    window = min(252, len(atr))
+    pct_rank = atr_series.rolling(window, min_periods=1).apply(
+        lambda x: (x.iloc[-1] <= x).sum() / len(x), raw=False
+    ).fillna(0.5)
+
+    df["atr_pct_rank"] = pct_rank.values
+    df["atr_expanding"] = (atr_series > 1.2 * atr_sma20).values.astype(bool)
+    df["atr_contracting"] = (atr_series < 0.8 * atr_sma20).values.astype(bool)
+
+
 def process_bars(
     df: pd.DataFrame,
     timeframe: str,
@@ -964,6 +1177,12 @@ def process_bars(
     _add_judas_swing(out)
     ce_cols = _add_consequent_encroachment(out)
     out = pd.concat([out, ce_cols], axis=1)
+    if progress:
+        progress(f"    {timeframe}: S/R zones + S/D zones + ATR regime ...")
+    _add_sr_zones(out, cfg)
+    _add_supply_demand_zones(out)
+    _add_atr_regime(out, cfg)
+
     if progress:
         progress(f"    {timeframe}: zone proximity ...")
     _add_zone_proximity(out)

@@ -34,26 +34,32 @@ from ..strategy.signals import _evaluate_row
 # Constants
 # ---------------------------------------------------------------------------
 
-# Observation vector layout
+# ============================================================
+# Observation vector layout — comprehensive market state
+# ============================================================
 # Market features (normalized)
 _OBS_BID = 0          # current bid price (normalized)
 _OBS_ASK = 1          # current ask price (normalized)
 _OBS_ATR = 2          # ATR(14) normalized by price
-_OBS_SPREAD = 3       # spread normalized by ATR
-# Structure flags (0/1)
-_OBS_BULL_DISP = 4    # M1 bull displacement
-_OBS_BEAR_DISP = 5    # M1 bear displacement
-_OBS_BOS_UP = 6       # M1 minor BOS up
-_OBS_BOS_DN = 7       # M1 minor BOS down
-_OBS_CHOCH_UP = 8     # M1 minor CHoCH up
-_OBS_CHOCH_DN = 9     # M1 minor CHoCH down
+_OBS_SPREAD = 3       # ACTUAL spread from tick data (normalized by ATR)
+
+# M1 Structure flags (0/1)
+_OBS_BULL_DISP = 4
+_OBS_BEAR_DISP = 5
+_OBS_BOS_UP = 6
+_OBS_BOS_DN = 7
+_OBS_CHOCH_UP = 8
+_OBS_CHOCH_DN = 9
+
+# M5 Structure
 _OBS_M5_BULL_DISP = 10
 _OBS_M5_BEAR_DISP = 11
 _OBS_M5_BOS_UP = 12
 _OBS_M5_BOS_DN = 13
 _OBS_M5_CHOCH_UP = 14
 _OBS_M5_CHOCH_DN = 15
-# M15 structure (broader intraday blanket)
+
+# M15 Structure
 _OBS_M15_BULL_DISP = 16
 _OBS_M15_BEAR_DISP = 17
 _OBS_M15_BOS_UP = 18
@@ -62,39 +68,102 @@ _OBS_M15_CHOCH_UP = 20
 _OBS_M15_CHOCH_DN = 21
 _OBS_M15_MAJOR_CHOCH_UP = 22
 _OBS_M15_MAJOR_CHOCH_DN = 23
-# Zone proximity (distance to nearest OB/FVG normalized by ATR)
-_OBS_OB_PROX = 24     # distance to nearest unmitigated OB
-_OBS_FVG_PROX = 25    # distance to nearest unmitigated FVG
-_OBS_SWEEP_PROX = 26  # distance to nearest liquidity sweep level
-# Position state
-_OBS_POS_DIR = 27     # +1 long, -1 short, 0 flat
-_OBS_POS_R = 28       # current P&L in R-multiples
-_OBS_POS_BARS = 29    # bars held (normalized by time_stop)
-_OBS_POS_AGE = 30     # time since entry (normalized)
-# Account state
-_OBS_EQUITY_CURVE = 31  # equity / starting_equity
-_OBS_DRAWDOWN = 32      # current drawdown from peak
-_OBS_WIN_RATE = 33      # recent win rate (last 20 trades)
+
+# HTF Structure (Gap 6: broader market context)
+_OBS_H1_BOS_UP = 24
+_OBS_H1_BOS_DN = 25
+_OBS_H1_CHOCH_UP = 26
+_OBS_H1_CHOCH_DN = 27
+_OBS_H4_BOS_UP = 28
+_OBS_H4_BOS_DN = 29
+_OBS_H4_CHOCH_UP = 30
+_OBS_H4_CHOCH_DN = 31
+
+# Zone proximity
+_OBS_OB_PROX = 32
+_OBS_FVG_PROX = 33
+_OBS_SWEEP_PROX = 34
+
+# Support/Resistance zones (Gap 14)
+_OBS_SR_SUPPORT_DIST = 35
+_OBS_SR_RESISTANCE_DIST = 36
+_OBS_SR_SUPPORT_COUNT = 37    # confluence count
+_OBS_SR_RESISTANCE_COUNT = 38
+_OBS_AT_SUPPORT = 39
+_OBS_AT_RESISTANCE = 40
+
+# Supply/Demand zones
+_OBS_IN_DEMAND_ZONE = 41
+_OBS_IN_SUPPLY_ZONE = 42
+_OBS_DEMAND_STRENGTH = 43
+_OBS_SUPPLY_STRENGTH = 44
+_OBS_DEMAND_DIST = 45
+_OBS_SUPPLY_DIST = 46
+
+# Premium/Discount
+_OBS_IN_PREMIUM = 47
+_OBS_IN_DISCOUNT = 48
+
+# Position state (Gap 7: expanded)
+_OBS_POS_DIR = 49
+_OBS_POS_R = 50
+_OBS_POS_BARS = 51
+_OBS_POS_AGE = 52
+_OBS_POS_GRADE = 53        # setup grade encoded: A+=4, A=3, B=2, C=1, none=0
+_OBS_POS_TRAIL_ACTIVE = 54 # trailing stop active (0/1)
+_OBS_POS_PARTIAL_CLOSED = 55 # partial close taken (0/1)
+
+# Account state (Gap 10: expanded)
+_OBS_EQUITY_CURVE = 56
+_OBS_DRAWDOWN = 57
+_OBS_WIN_RATE = 58
+_OBS_EQUITY_MOMENTUM = 59  # equity change last 100 bars (rising/falling)
+_OBS_CONSEC_WINS = 60      # consecutive wins (normalized)
+_OBS_CONSEC_LOSSES = 61    # consecutive losses (normalized)
+
 # Killzone
-_OBS_KZ_ASIA = 34
-_OBS_KZ_LONDON = 35
-_OBS_KZ_NY = 36
-# Time features
-_OBS_HOUR_SIN = 37    # hour encoded as sin
-_OBS_HOUR_COS = 38    # hour encoded as cos
+_OBS_KZ_ASIA = 62
+_OBS_KZ_LONDON = 63
+_OBS_KZ_NY = 64
+_OBS_KZ_LONDON_NY_OVERLAP = 65  # power hour overlap
 
-# Tick microstructure features (from raw tick data)
-_OBS_TICK_BUY_RATIO = 39       # buy-initiated tick ratio
-_OBS_TICK_SELL_RATIO = 40      # sell-initiated tick ratio
-_OBS_TICK_SPREAD_MEAN = 41     # mean bid-ask spread
-_OBS_TICK_SPREAD_MAX = 42      # max spread (liquidity events)
-_OBS_TICK_PRICE_VELOCITY = 43  # price range / tick count (ATR-normalized)
-_OBS_TICK_VOLUME_IMBALANCE = 44 # (buy_vol - sell_vol) / total_vol
-_OBS_TICK_ABSORPTION = 45      # log(vol) / price_range
-_OBS_TICK_LARGE_TRADE = 46     # fraction from large trades
-_OBS_TICK_COUNT = 47           # number of ticks (normalized)
+# Time features (Gap 12)
+_OBS_HOUR_SIN = 66
+_OBS_HOUR_COS = 67
+_OBS_DOW_SIN = 68          # day of week encoded
+_OBS_DOW_COS = 69
 
-OBS_DIM = 48
+# ATR regime (Gap 11)
+_OBS_ATR_PCT_RANK = 70     # 0-1 percentile rank of current ATR
+_OBS_ATR_EXPANDING = 71    # bool: ATR > 1.2x SMA20
+_OBS_ATR_CONTRACTING = 72  # bool: ATR < 0.8x SMA20
+
+# Tick microstructure
+_OBS_TICK_BUY_RATIO = 73
+_OBS_TICK_SELL_RATIO = 74
+_OBS_TICK_SPREAD_MEAN = 75
+_OBS_TICK_SPREAD_MAX = 76
+_OBS_TICK_PRICE_VELOCITY = 77
+_OBS_TICK_VOLUME_IMBALANCE = 78
+_OBS_TICK_ABSORPTION = 79
+_OBS_TICK_LARGE_TRADE = 80
+_OBS_TICK_COUNT = 81
+
+# News features (Gap 5)
+_OBS_NEWS_MINUTES_TO = 82     # minutes to next high-impact event
+_OBS_NEWS_MINUTES_SINCE = 83  # minutes since last high-impact event
+_OBS_NEWS_IN_WINDOW = 84      # bool: within 15min of high-impact
+_OBS_NEWS_IMPACT_SCORE = 85   # 0-3 impact score
+
+# Volume features
+_OBS_VOL_RATIO = 86        # tick_volume / SMA20
+_OBS_VOL_SPIKE = 87        # bool: volume > 2x SMA
+
+# Premium/Discount already at 47-48, but let's add liquidity sweep signal
+_OBS_BULL_SWEEP = 88
+_OBS_BEAR_SWEEP = 89
+
+OBS_DIM = 90
 
 # Action space
 ACT_HOLD = 0
@@ -110,6 +179,144 @@ SIZE_DOUBLE = 2    # 0.08 lots
 # SL/TP multipliers
 SL_MULTS = [1.0, 1.5, 2.0, 2.5]   # × ATR
 TP_MULTS = [0.5, 1.0, 1.5, 2.0, 2.5]  # × R
+
+
+def _safe_from_row(
+    row: Any,
+    pos_dir: int = 0,
+    pos_entry: float = 0.0,
+    pos_risk: float = 0.0,
+    pos_bars: int = 0,
+    equity: float = 2000.0,
+    peak_equity: float = 2000.0,
+    starting_equity: float = 2000.0,
+    recent_wins: list[bool] | None = None,
+    time_stop_bars: int = 60,
+    pos_grade: str = "",
+    pos_trail_active: bool = False,
+    pos_partial_closed: bool = False,
+    equity_history: list[float] | None = None,
+) -> np.ndarray:
+    """Build observation vector from a bar row (dict or Series).
+
+    This is the LIVE/BACKTEST version of env._get_obs() — reads from
+    aligned DataFrame rows instead of pre-extracted numpy arrays.
+    Used by serve.py for real-time inference.
+    """
+    def _g(key, default=0.0):
+        try:
+            v = row.get(key, default) if hasattr(row, 'get') else getattr(row, key, default)
+            return float(v) if v is not None and not (isinstance(v, float) and np.isnan(v)) else default
+        except Exception:
+            return default
+
+    def _b(key):
+        return 1.0 if _g(key) else 0.0
+
+    obs = np.zeros(OBS_DIM, dtype=np.float32)
+    price = _g("close")
+    atr = max(_g("atr_14", 0.001), 0.001)
+
+    # Core price
+    price_norm = price / 1000.0 if price > 0 else 0.0
+    obs[_OBS_BID] = price_norm
+    obs[_OBS_ASK] = price_norm + 0.0002
+    obs[_OBS_ATR] = atr / max(price, 1.0)
+    actual_spread = _g("tick_spread_mean")
+    obs[_OBS_SPREAD] = (actual_spread / atr) if actual_spread > 0 else (0.2 / max(atr, 0.001))
+
+    # M1 structure
+    obs[_OBS_BULL_DISP] = _b("bull_disp"); obs[_OBS_BEAR_DISP] = _b("bear_disp")
+    obs[_OBS_BOS_UP] = _b("minor_bos_up"); obs[_OBS_BOS_DN] = _b("minor_bos_dn")
+    obs[_OBS_CHOCH_UP] = _b("minor_choch_up"); obs[_OBS_CHOCH_DN] = _b("minor_choch_dn")
+    # M5
+    obs[_OBS_M5_BULL_DISP] = _b("M5_bull_disp"); obs[_OBS_M5_BEAR_DISP] = _b("M5_bear_disp")
+    obs[_OBS_M5_BOS_UP] = _b("M5_minor_bos_up"); obs[_OBS_M5_BOS_DN] = _b("M5_minor_bos_dn")
+    obs[_OBS_M5_CHOCH_UP] = _b("M5_minor_choch_up"); obs[_OBS_M5_CHOCH_DN] = _b("M5_minor_choch_dn")
+    # M15
+    obs[_OBS_M15_BULL_DISP] = _b("M15_bull_disp"); obs[_OBS_M15_BEAR_DISP] = _b("M15_bear_disp")
+    obs[_OBS_M15_BOS_UP] = _b("M15_minor_bos_up"); obs[_OBS_M15_BOS_DN] = _b("M15_minor_bos_dn")
+    obs[_OBS_M15_CHOCH_UP] = _b("M15_minor_choch_up"); obs[_OBS_M15_CHOCH_DN] = _b("M15_minor_choch_dn")
+    obs[_OBS_M15_MAJOR_CHOCH_UP] = _b("M15_major_choch_up"); obs[_OBS_M15_MAJOR_CHOCH_DN] = _b("M15_major_choch_dn")
+    # HTF
+    obs[_OBS_H1_BOS_UP] = _b("H1_minor_bos_up"); obs[_OBS_H1_BOS_DN] = _b("H1_minor_bos_dn")
+    obs[_OBS_H1_CHOCH_UP] = _b("H1_minor_choch_up"); obs[_OBS_H1_CHOCH_DN] = _b("H1_minor_choch_dn")
+    obs[_OBS_H4_BOS_UP] = _b("H4_minor_bos_up"); obs[_OBS_H4_BOS_DN] = _b("H4_minor_bos_dn")
+    obs[_OBS_H4_CHOCH_UP] = _b("H4_minor_choch_up"); obs[_OBS_H4_CHOCH_DN] = _b("H4_minor_choch_dn")
+    # Zone proximity
+    obs[_OBS_OB_PROX] = min(_g("ob_proximity", 10.0), 10.0)
+    obs[_OBS_FVG_PROX] = min(_g("fvg_proximity", 10.0), 10.0)
+    obs[_OBS_SWEEP_PROX] = min(_g("sweep_proximity", 10.0), 10.0)
+    # S/R
+    obs[_OBS_SR_SUPPORT_DIST] = min(_g("sr_support_dist", 10.0), 10.0)
+    obs[_OBS_SR_RESISTANCE_DIST] = min(_g("sr_resistance_dist", 10.0), 10.0)
+    obs[_OBS_SR_SUPPORT_COUNT] = min(_g("sr_support_count"), 5.0) / 5.0
+    obs[_OBS_SR_RESISTANCE_COUNT] = min(_g("sr_resistance_count"), 5.0) / 5.0
+    obs[_OBS_AT_SUPPORT] = _b("at_support"); obs[_OBS_AT_RESISTANCE] = _b("at_resistance")
+    # S/D
+    obs[_OBS_IN_DEMAND_ZONE] = _b("in_demand_zone"); obs[_OBS_IN_SUPPLY_ZONE] = _b("in_supply_zone")
+    obs[_OBS_DEMAND_STRENGTH] = _g("demand_zone_strength") / 3.0
+    obs[_OBS_SUPPLY_STRENGTH] = _g("supply_zone_strength") / 3.0
+    obs[_OBS_DEMAND_DIST] = min(_g("demand_zone_dist", 10.0), 10.0)
+    obs[_OBS_SUPPLY_DIST] = min(_g("supply_zone_dist", 10.0), 10.0)
+    # Premium/Discount
+    obs[_OBS_IN_PREMIUM] = _b("in_premium"); obs[_OBS_IN_DISCOUNT] = _b("in_discount")
+    # Position state
+    obs[_OBS_POS_DIR] = float(pos_dir)
+    if pos_dir != 0 and pos_risk > 0:
+        r_dist = (price - pos_entry) if pos_dir == 1 else (pos_entry - price)
+        obs[_OBS_POS_R] = r_dist / pos_risk
+    obs[_OBS_POS_BARS] = pos_bars / max(time_stop_bars, 1)
+    obs[_OBS_POS_AGE] = pos_bars / max(time_stop_bars, 1)
+    grade_map = {"A+": 4, "A": 3, "B": 2, "C": 1}
+    obs[_OBS_POS_GRADE] = grade_map.get(pos_grade, 0) / 4.0
+    obs[_OBS_POS_TRAIL_ACTIVE] = 1.0 if pos_trail_active else 0.0
+    obs[_OBS_POS_PARTIAL_CLOSED] = 1.0 if pos_partial_closed else 0.0
+    # Account
+    obs[_OBS_EQUITY_CURVE] = equity / max(starting_equity, 1.0)
+    obs[_OBS_DRAWDOWN] = (peak_equity - equity) / max(peak_equity, 1.0)
+    if recent_wins:
+        obs[_OBS_WIN_RATE] = sum(recent_wins[-20:]) / len(recent_wins[-20:])
+    if equity_history and len(equity_history) > 100:
+        obs[_OBS_EQUITY_MOMENTUM] = (equity_history[-1] - equity_history[-100]) / max(equity_history[-100], 1.0)
+    # Killzone + time
+    try:
+        ts = pd.Timestamp(row["time"] if hasattr(row, '__getitem__') else row.time)
+        hour = ts.hour; dow = ts.dayofweek
+        obs[_OBS_KZ_ASIA] = 1.0 if 0 <= hour < 8 else 0.0
+        obs[_OBS_KZ_LONDON] = 1.0 if 7 <= hour < 16 else 0.0
+        obs[_OBS_KZ_NY] = 1.0 if 12 <= hour < 21 else 0.0
+        obs[_OBS_KZ_LONDON_NY_OVERLAP] = 1.0 if 12 <= hour < 16 else 0.0
+        obs[_OBS_HOUR_SIN] = np.sin(2 * np.pi * hour / 24.0)
+        obs[_OBS_HOUR_COS] = np.cos(2 * np.pi * hour / 24.0)
+        obs[_OBS_DOW_SIN] = np.sin(2 * np.pi * dow / 7.0)
+        obs[_OBS_DOW_COS] = np.cos(2 * np.pi * dow / 7.0)
+    except Exception:
+        pass
+    # ATR regime
+    obs[_OBS_ATR_PCT_RANK] = _g("atr_pct_rank", 0.5)
+    obs[_OBS_ATR_EXPANDING] = _b("atr_expanding")
+    obs[_OBS_ATR_CONTRACTING] = _b("atr_contracting")
+    # Tick microstructure
+    obs[_OBS_TICK_BUY_RATIO] = _g("tick_buy_ratio"); obs[_OBS_TICK_SELL_RATIO] = _g("tick_sell_ratio")
+    obs[_OBS_TICK_SPREAD_MEAN] = _g("tick_spread_mean"); obs[_OBS_TICK_SPREAD_MAX] = _g("tick_spread_max")
+    obs[_OBS_TICK_PRICE_VELOCITY] = _g("tick_price_velocity")
+    obs[_OBS_TICK_VOLUME_IMBALANCE] = _g("tick_volume_imbalance")
+    obs[_OBS_TICK_ABSORPTION] = _g("tick_absorption")
+    obs[_OBS_TICK_LARGE_TRADE] = _g("tick_large_trade_ratio")
+    obs[_OBS_TICK_COUNT] = min(_g("tick_count") / 1000.0, 1.0)
+    # News
+    obs[_OBS_NEWS_MINUTES_TO] = min(_g("minutes_to_next_high", 999.0), 999.0) / 999.0
+    obs[_OBS_NEWS_MINUTES_SINCE] = min(_g("minutes_since_last_high", 999.0), 999.0) / 999.0
+    obs[_OBS_NEWS_IN_WINDOW] = _b("in_news_window")
+    obs[_OBS_NEWS_IMPACT_SCORE] = _g("news_impact_score") / 3.0
+    # Volume
+    obs[_OBS_VOL_RATIO] = _g("tick_vol_ratio", 1.0)
+    obs[_OBS_VOL_SPIKE] = _b("vol_spike")
+    # Liquidity sweeps
+    obs[_OBS_BULL_SWEEP] = _b("bull_liq_sweep"); obs[_OBS_BEAR_SWEEP] = _b("bear_liq_sweep")
+
+    return obs
 
 
 class SlyTradeEnv(gym.Env):
@@ -150,31 +357,56 @@ class SlyTradeEnv(gym.Env):
 
         # Pre-extract columns as numpy arrays
         _COL_MAP = {
+            # Core price
             "close": "close", "atr_14": "atr_14", "time": "time",
+            # M1 structure
             "bull_disp": "bull_disp", "bear_disp": "bear_disp",
             "minor_bos_up": "minor_bos_up", "minor_bos_dn": "minor_bos_dn",
             "minor_choch_up": "minor_choch_up", "minor_choch_dn": "minor_choch_dn",
+            # M5 structure
             "M5_bull_disp": "M5_bull_disp", "M5_bear_disp": "M5_bear_disp",
             "M5_minor_bos_up": "M5_minor_bos_up", "M5_minor_bos_dn": "M5_minor_bos_dn",
             "M5_minor_choch_up": "M5_minor_choch_up", "M5_minor_choch_dn": "M5_minor_choch_dn",
+            # M15 structure
             "M15_bull_disp": "M15_bull_disp", "M15_bear_disp": "M15_bear_disp",
             "M15_minor_bos_up": "M15_minor_bos_up", "M15_minor_bos_dn": "M15_minor_bos_dn",
             "M15_minor_choch_up": "M15_minor_choch_up", "M15_minor_choch_dn": "M15_minor_choch_dn",
             "M15_major_choch_up": "M15_major_choch_up", "M15_major_choch_dn": "M15_major_choch_dn",
-            # Zone proximity (optional — from features.py)
-            "ob_proximity": "ob_proximity",
-            "fvg_proximity": "fvg_proximity",
+            # HTF structure (Gap 6)
+            "H1_minor_bos_up": "H1_minor_bos_up", "H1_minor_bos_dn": "H1_minor_bos_dn",
+            "H1_minor_choch_up": "H1_minor_choch_up", "H1_minor_choch_dn": "H1_minor_choch_dn",
+            "H4_minor_bos_up": "H4_minor_bos_up", "H4_minor_bos_dn": "H4_minor_bos_dn",
+            "H4_minor_choch_up": "H4_minor_choch_up", "H4_minor_choch_dn": "H4_minor_choch_dn",
+            # Zone proximity
+            "ob_proximity": "ob_proximity", "fvg_proximity": "fvg_proximity",
             "sweep_proximity": "sweep_proximity",
-            # Tick microstructure features
-            "tick_buy_ratio": "tick_buy_ratio",
-            "tick_sell_ratio": "tick_sell_ratio",
-            "tick_spread_mean": "tick_spread_mean",
-            "tick_spread_max": "tick_spread_max",
-            "tick_price_velocity": "tick_price_velocity",
-            "tick_volume_imbalance": "tick_volume_imbalance",
-            "tick_absorption": "tick_absorption",
-            "tick_large_trade_ratio": "tick_large_trade_ratio",
+            # S/R zones
+            "sr_support_dist": "sr_support_dist", "sr_resistance_dist": "sr_resistance_dist",
+            "sr_support_count": "sr_support_count", "sr_resistance_count": "sr_resistance_count",
+            "at_support": "at_support", "at_resistance": "at_resistance",
+            # Supply/Demand zones
+            "in_demand_zone": "in_demand_zone", "in_supply_zone": "in_supply_zone",
+            "demand_zone_strength": "demand_zone_strength", "supply_zone_strength": "supply_zone_strength",
+            "demand_zone_dist": "demand_zone_dist", "supply_zone_dist": "supply_zone_dist",
+            # Premium/Discount
+            "in_premium": "in_premium", "in_discount": "in_discount",
+            # ATR regime
+            "atr_pct_rank": "atr_pct_rank", "atr_expanding": "atr_expanding",
+            "atr_contracting": "atr_contracting",
+            # Volume
+            "tick_vol_ratio": "tick_vol_ratio", "vol_spike": "vol_spike",
+            # Liquidity sweeps
+            "bull_liq_sweep": "bull_liq_sweep", "bear_liq_sweep": "bear_liq_sweep",
+            # Tick microstructure
+            "tick_buy_ratio": "tick_buy_ratio", "tick_sell_ratio": "tick_sell_ratio",
+            "tick_spread_mean": "tick_spread_mean", "tick_spread_max": "tick_spread_max",
+            "tick_price_velocity": "tick_price_velocity", "tick_volume_imbalance": "tick_volume_imbalance",
+            "tick_absorption": "tick_absorption", "tick_large_trade_ratio": "tick_large_trade_ratio",
             "tick_count": "tick_count",
+            # News
+            "minutes_to_next_high": "minutes_to_next_high",
+            "minutes_since_last_high": "minutes_since_last_high",
+            "in_news_window": "in_news_window", "news_impact_score": "news_impact_score",
         }
         self._col_arrays = {}
         for key, col in _COL_MAP.items():
@@ -213,27 +445,53 @@ class SlyTradeEnv(gym.Env):
     def _reset_state(self):
         """Reset internal state for a new episode."""
         self._bar_idx = 0
-        self._state: dict = {}  # signal engine state
+        self._state: dict = {}
         self._equity = self.acct.starting_equity
         self._peak_equity = self._equity
         self._starting_equity = self._equity
 
-        # Position state
-        self._pos_dir = 0        # 0=flat, +1=long, -1=short
+        # Position state (Gap 7: expanded)
+        self._pos_dir = 0
         self._pos_entry = 0.0
         self._pos_sl = 0.0
         self._pos_tp = 0.0
         self._pos_lots = 0.0
         self._pos_bars = 0
         self._pos_risk_per_unit = 0.0
+        self._pos_grade = ""         # A+, A, B, C
+        self._pos_trail_active = False
+        self._pos_partial_closed = False
+        self._pos_original_lots = 0.0
+        self._pos_best_price = 0.0   # for trailing
+
+        # Hybrid ladder state (Gap 2: match live)
+        self._tp1_hit = False
+        self._tp2_hit = False
+        self._runner_active = False
 
         # Trade history
         self._trades: list[dict] = []
-        self._recent_wins: list[bool] = []  # last 20 trades
+        self._recent_wins: list[bool] = []
+        self._equity_history: list[float] = [self._equity]  # Gap 10
+
+    def _safe(self, key: str, i: int, default: float = 0.0) -> float:
+        """Safely read a value from _col_arrays."""
+        arr = self._col_arrays.get(key)
+        if arr is not None and i < len(arr):
+            v = arr[i]
+            return float(v) if np.isfinite(v) else default
+        return default
+
+    def _safe_bool(self, key: str, i: int) -> float:
+        """Safely read a bool value from _col_arrays."""
+        v = self._safe(key, i, 0.0)
+        return 1.0 if v else 0.0
 
     def _get_obs(self) -> np.ndarray:
-        """Build observation vector from current bar and position state.
-        Uses pre-extracted numpy arrays for O(1) access (~100x faster than pandas iloc).
+        """Build comprehensive observation vector from current bar and position state.
+        90 features covering: price, structure (M1-M15-M30-H1-H4), zones,
+        S/R, S/D, position state, account state, killzones, time, ATR regime,
+        tick microstructure, news, and volume.
         """
         obs = np.zeros(OBS_DIM, dtype=np.float32)
         i = self._bar_idx
@@ -241,94 +499,174 @@ class SlyTradeEnv(gym.Env):
             return obs
 
         ca = self._col_arrays
+        s = self._safe
+        sb = self._safe_bool
         price = ca["close"][i]
         atr = ca["atr_14"][i]
         if not np.isfinite(atr) or atr <= 0:
-            atr = 0.0
+            atr = 0.001
 
+        # === Core price ===
         price_norm = price / 1000.0 if price > 0 else 0.0
         obs[_OBS_BID] = price_norm
         obs[_OBS_ASK] = price_norm + 0.0002
         obs[_OBS_ATR] = atr / max(price, 1.0)
-        obs[_OBS_SPREAD] = 0.2 / max(atr, 0.001)
-
-        # Structure flags — direct numpy array indexing
-        obs[_OBS_BULL_DISP] = ca["bull_disp"][i]
-        obs[_OBS_BEAR_DISP] = ca["bear_disp"][i]
-        obs[_OBS_BOS_UP] = ca["minor_bos_up"][i]
-        obs[_OBS_BOS_DN] = ca["minor_bos_dn"][i]
-        obs[_OBS_CHOCH_UP] = ca["minor_choch_up"][i]
-        obs[_OBS_CHOCH_DN] = ca["minor_choch_dn"][i]
-        obs[_OBS_M5_BULL_DISP] = ca["M5_bull_disp"][i]
-        obs[_OBS_M5_BEAR_DISP] = ca["M5_bear_disp"][i]
-        obs[_OBS_M5_BOS_UP] = ca["M5_minor_bos_up"][i]
-        obs[_OBS_M5_BOS_DN] = ca["M5_minor_bos_dn"][i]
-        obs[_OBS_M5_CHOCH_UP] = ca["M5_minor_choch_up"][i]
-        obs[_OBS_M5_CHOCH_DN] = ca["M5_minor_choch_dn"][i]
-        obs[_OBS_M15_BULL_DISP] = ca["M15_bull_disp"][i]
-        obs[_OBS_M15_BEAR_DISP] = ca["M15_bear_disp"][i]
-        obs[_OBS_M15_BOS_UP] = ca["M15_minor_bos_up"][i]
-        obs[_OBS_M15_BOS_DN] = ca["M15_minor_bos_dn"][i]
-        obs[_OBS_M15_CHOCH_UP] = ca["M15_minor_choch_up"][i]
-        obs[_OBS_M15_CHOCH_DN] = ca["M15_minor_choch_dn"][i]
-        obs[_OBS_M15_MAJOR_CHOCH_UP] = ca["M15_major_choch_up"][i]
-        obs[_OBS_M15_MAJOR_CHOCH_DN] = ca["M15_major_choch_dn"][i]
-
-        # Zone proximity — try to get from aligned data, fallback to neutral
-        if "ob_proximity" in self._col_arrays:
-            obs[_OBS_OB_PROX] = ca["ob_proximity"][i]
+        # Gap 9: Real spread from tick data instead of hardcoded 0.2
+        actual_spread = s("tick_spread_mean", i)
+        if actual_spread > 0:
+            obs[_OBS_SPREAD] = actual_spread / atr
         else:
-            obs[_OBS_OB_PROX] = 0.5
-        if "fvg_proximity" in self._col_arrays:
-            obs[_OBS_FVG_PROX] = ca["fvg_proximity"][i]
-        else:
-            obs[_OBS_FVG_PROX] = 0.5
-        if "sweep_proximity" in self._col_arrays:
-            obs[_OBS_SWEEP_PROX] = ca["sweep_proximity"][i]
-        else:
-            obs[_OBS_SWEEP_PROX] = 0.5
+            obs[_OBS_SPREAD] = 0.2 / max(atr, 0.001)  # fallback
 
-        # Tick microstructure features
-        ca = self._col_arrays
-        obs[_OBS_TICK_BUY_RATIO] = ca.get("tick_buy_ratio", np.zeros(self.n_bars))[i] if "tick_buy_ratio" in ca else 0.0
-        obs[_OBS_TICK_SELL_RATIO] = ca.get("tick_sell_ratio", np.zeros(self.n_bars))[i] if "tick_sell_ratio" in ca else 0.0
-        obs[_OBS_TICK_SPREAD_MEAN] = ca.get("tick_spread_mean", np.zeros(self.n_bars))[i] if "tick_spread_mean" in ca else 0.0
-        obs[_OBS_TICK_SPREAD_MAX] = ca.get("tick_spread_max", np.zeros(self.n_bars))[i] if "tick_spread_max" in ca else 0.0
-        obs[_OBS_TICK_PRICE_VELOCITY] = ca.get("tick_price_velocity", np.zeros(self.n_bars))[i] if "tick_price_velocity" in ca else 0.0
-        obs[_OBS_TICK_VOLUME_IMBALANCE] = ca.get("tick_volume_imbalance", np.zeros(self.n_bars))[i] if "tick_volume_imbalance" in ca else 0.0
-        obs[_OBS_TICK_ABSORPTION] = ca.get("tick_absorption", np.zeros(self.n_bars))[i] if "tick_absorption" in ca else 0.0
-        obs[_OBS_TICK_LARGE_TRADE] = ca.get("tick_large_trade_ratio", np.zeros(self.n_bars))[i] if "tick_large_trade_ratio" in ca else 0.0
-        tick_ct = ca.get("tick_count", np.zeros(self.n_bars))[i] if "tick_count" in ca else 0.0
-        obs[_OBS_TICK_COUNT] = min(tick_ct / 1000.0, 1.0)  # normalize: 1000 ticks = 1.0
+        # === M1 Structure ===
+        obs[_OBS_BULL_DISP] = sb("bull_disp", i)
+        obs[_OBS_BEAR_DISP] = sb("bear_disp", i)
+        obs[_OBS_BOS_UP] = sb("minor_bos_up", i)
+        obs[_OBS_BOS_DN] = sb("minor_bos_dn", i)
+        obs[_OBS_CHOCH_UP] = sb("minor_choch_up", i)
+        obs[_OBS_CHOCH_DN] = sb("minor_choch_dn", i)
 
-        # Position state
+        # === M5 Structure ===
+        obs[_OBS_M5_BULL_DISP] = sb("M5_bull_disp", i)
+        obs[_OBS_M5_BEAR_DISP] = sb("M5_bear_disp", i)
+        obs[_OBS_M5_BOS_UP] = sb("M5_minor_bos_up", i)
+        obs[_OBS_M5_BOS_DN] = sb("M5_minor_bos_dn", i)
+        obs[_OBS_M5_CHOCH_UP] = sb("M5_minor_choch_up", i)
+        obs[_OBS_M5_CHOCH_DN] = sb("M5_minor_choch_dn", i)
+
+        # === M15 Structure ===
+        obs[_OBS_M15_BULL_DISP] = sb("M15_bull_disp", i)
+        obs[_OBS_M15_BEAR_DISP] = sb("M15_bear_disp", i)
+        obs[_OBS_M15_BOS_UP] = sb("M15_minor_bos_up", i)
+        obs[_OBS_M15_BOS_DN] = sb("M15_minor_bos_dn", i)
+        obs[_OBS_M15_CHOCH_UP] = sb("M15_minor_choch_up", i)
+        obs[_OBS_M15_CHOCH_DN] = sb("M15_minor_choch_dn", i)
+        obs[_OBS_M15_MAJOR_CHOCH_UP] = sb("M15_major_choch_up", i)
+        obs[_OBS_M15_MAJOR_CHOCH_DN] = sb("M15_major_choch_dn", i)
+
+        # === HTF Structure (Gap 6) ===
+        obs[_OBS_H1_BOS_UP] = sb("H1_minor_bos_up", i)
+        obs[_OBS_H1_BOS_DN] = sb("H1_minor_bos_dn", i)
+        obs[_OBS_H1_CHOCH_UP] = sb("H1_minor_choch_up", i)
+        obs[_OBS_H1_CHOCH_DN] = sb("H1_minor_choch_dn", i)
+        obs[_OBS_H4_BOS_UP] = sb("H4_minor_bos_up", i)
+        obs[_OBS_H4_BOS_DN] = sb("H4_minor_bos_dn", i)
+        obs[_OBS_H4_CHOCH_UP] = sb("H4_minor_choch_up", i)
+        obs[_OBS_H4_CHOCH_DN] = sb("H4_minor_choch_dn", i)
+
+        # === Zone proximity ===
+        obs[_OBS_OB_PROX] = min(s("ob_proximity", i, 10.0), 10.0)
+        obs[_OBS_FVG_PROX] = min(s("fvg_proximity", i, 10.0), 10.0)
+        obs[_OBS_SWEEP_PROX] = min(s("sweep_proximity", i, 10.0), 10.0)
+
+        # === S/R zones ===
+        obs[_OBS_SR_SUPPORT_DIST] = min(s("sr_support_dist", i, 10.0), 10.0)
+        obs[_OBS_SR_RESISTANCE_DIST] = min(s("sr_resistance_dist", i, 10.0), 10.0)
+        obs[_OBS_SR_SUPPORT_COUNT] = min(s("sr_support_count", i), 5.0) / 5.0
+        obs[_OBS_SR_RESISTANCE_COUNT] = min(s("sr_resistance_count", i), 5.0) / 5.0
+        obs[_OBS_AT_SUPPORT] = sb("at_support", i)
+        obs[_OBS_AT_RESISTANCE] = sb("at_resistance", i)
+
+        # === Supply/Demand zones ===
+        obs[_OBS_IN_DEMAND_ZONE] = sb("in_demand_zone", i)
+        obs[_OBS_IN_SUPPLY_ZONE] = sb("in_supply_zone", i)
+        obs[_OBS_DEMAND_STRENGTH] = s("demand_zone_strength", i) / 3.0
+        obs[_OBS_SUPPLY_STRENGTH] = s("supply_zone_strength", i) / 3.0
+        obs[_OBS_DEMAND_DIST] = min(s("demand_zone_dist", i, 10.0), 10.0)
+        obs[_OBS_SUPPLY_DIST] = min(s("supply_zone_dist", i, 10.0), 10.0)
+
+        # === Premium/Discount ===
+        obs[_OBS_IN_PREMIUM] = sb("in_premium", i)
+        obs[_OBS_IN_DISCOUNT] = sb("in_discount", i)
+
+        # === Position state (Gap 7: expanded) ===
         obs[_OBS_POS_DIR] = float(self._pos_dir)
         if self._pos_dir != 0 and self._pos_risk_per_unit > 0:
             r_dist = (price - self._pos_entry) if self._pos_dir == 1 else (self._pos_entry - price)
             obs[_OBS_POS_R] = r_dist / self._pos_risk_per_unit
         obs[_OBS_POS_BARS] = self._pos_bars / max(self.time_stop_bars, 1)
         obs[_OBS_POS_AGE] = self._pos_bars / max(self.time_stop_bars, 1)
+        # Grade encoding: A+=4, A=3, B=2, C=1, none=0
+        grade_map = {"A+": 4, "A": 3, "B": 2, "C": 1}
+        obs[_OBS_POS_GRADE] = grade_map.get(self._pos_grade, 0) / 4.0
+        obs[_OBS_POS_TRAIL_ACTIVE] = 1.0 if self._pos_trail_active else 0.0
+        obs[_OBS_POS_PARTIAL_CLOSED] = 1.0 if self._pos_partial_closed else 0.0
 
-        # Account state
+        # === Account state (Gap 10: expanded) ===
         obs[_OBS_EQUITY_CURVE] = self._equity / max(self._starting_equity, 1.0)
-        obs[_OBS_DRAWDOWN] = (self._peak_equity - self._equity) / max(self._peak_equity, 1.0)
+        dd = (self._peak_equity - self._equity) / max(self._peak_equity, 1.0)
+        obs[_OBS_DRAWDOWN] = dd
         if self._recent_wins:
             obs[_OBS_WIN_RATE] = sum(self._recent_wins[-20:]) / len(self._recent_wins[-20:])
+        # Equity momentum: change over last 100 bars
+        if len(self._equity_history) > 100:
+            eq_now = self._equity_history[-1]
+            eq_100 = self._equity_history[-100]
+            obs[_OBS_EQUITY_MOMENTUM] = (eq_now - eq_100) / max(eq_100, 1.0)
+        # Consecutive wins/losses
+        if self._recent_wins:
+            consec_w = 0
+            consec_l = 0
+            for w in reversed(self._recent_wins):
+                if w:
+                    consec_w += 1
+                else:
+                    break
+            for w in reversed(self._recent_wins):
+                if not w:
+                    consec_l += 1
+                else:
+                    break
+            obs[_OBS_CONSEC_WINS] = min(consec_w, 10) / 10.0
+            obs[_OBS_CONSEC_LOSSES] = min(consec_l, 10) / 10.0
 
-        # Killzone — extract hour from numpy datetime64
+        # === Killzone ===
         try:
             ts_val = ca["time"][i]
-            hour = pd.Timestamp(ts_val).hour
+            ts = pd.Timestamp(ts_val)
+            hour = ts.hour
+            dow = ts.dayofweek
             obs[_OBS_KZ_ASIA] = 1.0 if 0 <= hour < 8 else 0.0
             obs[_OBS_KZ_LONDON] = 1.0 if 7 <= hour < 16 else 0.0
             obs[_OBS_KZ_NY] = 1.0 if 12 <= hour < 21 else 0.0
+            obs[_OBS_KZ_LONDON_NY_OVERLAP] = 1.0 if 12 <= hour < 16 else 0.0
             obs[_OBS_HOUR_SIN] = np.sin(2 * np.pi * hour / 24.0)
             obs[_OBS_HOUR_COS] = np.cos(2 * np.pi * hour / 24.0)
+            obs[_OBS_DOW_SIN] = np.sin(2 * np.pi * dow / 7.0)
+            obs[_OBS_DOW_COS] = np.cos(2 * np.pi * dow / 7.0)
         except Exception:
             pass
 
-        return obs
+        # === ATR regime ===
+        obs[_OBS_ATR_PCT_RANK] = s("atr_pct_rank", i, 0.5)
+        obs[_OBS_ATR_EXPANDING] = sb("atr_expanding", i)
+        obs[_OBS_ATR_CONTRACTING] = sb("atr_contracting", i)
 
+        # === Tick microstructure ===
+        obs[_OBS_TICK_BUY_RATIO] = s("tick_buy_ratio", i)
+        obs[_OBS_TICK_SELL_RATIO] = s("tick_sell_ratio", i)
+        obs[_OBS_TICK_SPREAD_MEAN] = s("tick_spread_mean", i)
+        obs[_OBS_TICK_SPREAD_MAX] = s("tick_spread_max", i)
+        obs[_OBS_TICK_PRICE_VELOCITY] = s("tick_price_velocity", i)
+        obs[_OBS_TICK_VOLUME_IMBALANCE] = s("tick_volume_imbalance", i)
+        obs[_OBS_TICK_ABSORPTION] = s("tick_absorption", i)
+        obs[_OBS_TICK_LARGE_TRADE] = s("tick_large_trade_ratio", i)
+        tick_ct = s("tick_count", i)
+        obs[_OBS_TICK_COUNT] = min(tick_ct / 1000.0, 1.0)
+
+        # === News features (Gap 5) ===
+        obs[_OBS_NEWS_MINUTES_TO] = min(s("minutes_to_next_high", i, 999.0), 999.0) / 999.0
+        obs[_OBS_NEWS_MINUTES_SINCE] = min(s("minutes_since_last_high", i, 999.0), 999.0) / 999.0
+        obs[_OBS_NEWS_IN_WINDOW] = sb("in_news_window", i)
+        obs[_OBS_NEWS_IMPACT_SCORE] = s("news_impact_score", i) / 3.0
+
+        # === Volume ===
+        obs[_OBS_VOL_RATIO] = s("tick_vol_ratio", i, 1.0)
+        obs[_OBS_VOL_SPIKE] = sb("vol_spike", i)
+
+        # === Liquidity sweeps ===
+        obs[_OBS_BULL_SWEEP] = sb("bull_liq_sweep", i)
+        obs[_OBS_BEAR_SWEEP] = sb("bear_liq_sweep", i)
     def _get_info(self) -> dict:
         """Return info dict for debugging/logging."""
         return {
@@ -539,6 +877,9 @@ class SlyTradeEnv(gym.Env):
         # Equity wipeout — hard penalty
         if self._equity <= self._starting_equity * 0.5:
             reward -= 5.0
+
+        # Track equity history
+        self._equity_history.append(self._equity)
 
         # Advance to next bar
         self._bar_idx += 1
