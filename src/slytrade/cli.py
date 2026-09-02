@@ -364,6 +364,8 @@ def train(
         "M15_bull_disp", "M15_bear_disp",
         "M15_minor_bos_up", "M15_minor_bos_dn", "M15_minor_choch_up", "M15_minor_choch_dn",
         "M15_major_choch_up", "M15_major_choch_dn",
+        # Zone proximity (computed dynamically from OB/FVG/sweep data)
+        "ob_proximity", "fvg_proximity", "sweep_proximity",
     ]
 
     if partition_files:
@@ -484,9 +486,16 @@ def train(
         ensemble = MultiAgentEnsemble()
         console.print(f"  Parameters: {ensemble.total_parameters:,}")
 
+        # TensorBoard log dir for multi-agent
+        tb_dir = str(Path(tb_log) / f"multi_{symbol}")
+        os.makedirs(tb_dir, exist_ok=True)
+        console.print(f"  TensorBoard: {tb_dir}")
+        console.print(f"  View live: tensorboard --logdir {tb_log}")
+
         trainer = MultiAgentTrainer(
             env=SlyTradeEnv(train_df, max_bars=max_bars),
             lr=3e-4, gamma=0.99, n_steps=4096, batch_size=512, n_epochs=10,
+            tb_log_dir=tb_dir,
         )
 
         def progress(msg):
@@ -510,7 +519,17 @@ def train(
             console.print(f"  Sharpe:      {metrics.get('sharpe_ratio', 0):.2f}")
             console.print(f"  Max DD:      {metrics.get('max_drawdown', 0):.1%}")
         console.print(f"  Model: {output}/multi_{symbol}_best.pt")
+        console.print(f"  TensorBoard: {tb_dir}")
+
+        # Show explainability on a sample observation
+        console.print(f"\n[bold]Explainability Demo:[/bold]")
+        sample_obs, _ = eval_env.reset()
+        sample_tensor = torch.FloatTensor(sample_obs).unsqueeze(0)
+        explanation = trainer.ensemble.explain(sample_tensor)
+        console.print(f"  {explanation['reasoning']}")
+
         console.print(f"\nNext: [bold]slytrade backtest --symbol {symbol}[/bold]")
+        console.print(f"      [bold]tensorboard --logdir {tb_log}[/bold]")
         return
 
     algo_cls = {"ppo": PPO, "sac": SAC, "a2c": A2C}[algo.lower()]

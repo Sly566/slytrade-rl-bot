@@ -55,6 +55,10 @@ SETUP_DIM = 3       # grade_A, grade_B, grade_C
 TRADE_MGMT_DIM = 4  # hold, move_sl_be, partial_close, add_position
 ICT_DIM = 4         # in_killzone, liquidity_sweep, displacement, fvg_fill
 
+# Explainability agent — produces human-readable reasoning
+EXPLAIN_DIM = 8  # regime_label, structure_bias, entry_quality, exit_signal,
+                 # dd_status, risk_level, setup_grade, ict_context
+
 # Meta-agent input = sum of all sub-agent outputs
 META_INPUT_DIM = (REGIME_DIM + STRUCTURE_DIM + ENTRY_DIM + EXIT_DIM +
                   DRAWDOWN_DIM + RISK_DIM + SETUP_DIM + TRADE_MGMT_DIM + ICT_DIM)
@@ -206,6 +210,128 @@ class ICTPersona(SubAgent):
 
 
 # ---------------------------------------------------------------------------
+# Explainability Agent
+# ---------------------------------------------------------------------------
+class ExplainabilityAgent(nn.Module):
+    """Produces human-readable explanations of the bot's decision-making.
+
+    This agent doesn't make trading decisions — it OBSERVES the same state
+    as all other agents and produces a structured explanation of:
+    - What market regime we're in and why
+    - What structure signals are active
+    - Why an entry/exit decision was made
+    - Current risk/drawdown status
+    - ICT context (killzones, liquidity, etc.)
+
+    The explanation is stored with each trade for post-analysis.
+    """
+
+    # Label maps for human-readable output
+    REGIME_LABELS = ["trending_up", "trending_down", "ranging", "volatile"]
+    STRUCTURE_LABELS = ["bull_bias", "bear_bias", "neutral", "conflicting"]
+    ENTRY_LABELS = ["no_signal", "long_setup", "short_setup", "weak_signal"]
+    EXIT_LABELS = ["hold", "take_profit", "cut_loss"]
+    DD_LABELS = ["normal", "warning", "critical"]
+    RISK_LABELS = ["conservative", "moderate", "aggressive"]
+    SETUP_LABELS = ["grade_A", "grade_B", "grade_C"]
+    ICT_LABELS = ["outside_kz", "asia_kz", "london_kz", "ny_kz"]
+
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(OBS_DIM, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, EXPLAIN_DIM),
+        )
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        """Raw logits for each explanation dimension."""
+        return self.net(obs)
+
+    def explain(self, obs: torch.Tensor, sub_outputs: dict[str, torch.Tensor]) -> dict:
+        """Generate human-readable explanation from observation + sub-agent outputs.
+
+        Returns dict with:
+        - regime: current market regime label
+        - structure: directional bias label
+        - entry: entry signal quality label
+        - exit: exit signal label
+        - drawdown: drawdown status label
+        - risk: risk level label
+        - setup: setup grade label
+        - ict: ICT context label
+        - reasoning: combined natural language explanation
+        """
+        with torch.no_grad():
+            logits = self.forward(obs)
+            probs = torch.softmax(logits, dim=-1)
+
+            # Get sub-agent interpretations
+            regime_probs = F.softmax(sub_outputs.get("regime", torch.zeros(REGIME_DIM)), dim=-1)
+            structure_probs = F.softmax(sub_outputs.get("structure", torch.zeros(STRUCTURE_DIM)), dim=-1)
+            entry_probs = F.softmax(sub_outputs.get("entry", torch.zeros(ENTRY_DIM)), dim=-1)
+            exit_probs = F.softmax(sub_outputs.get("exit", torch.zeros(EXIT_DIM)), dim=-1)
+            dd_probs = F.softmax(sub_outputs.get("drawdown", torch.zeros(DRAWDOWN_DIM)), dim=-1)
+            risk_probs = F.softmax(sub_outputs.get("risk", torch.zeros(RISK_DIM)), dim=-1)
+            setup_probs = F.softmax(sub_outputs.get("setup", torch.zeros(SETUP_DIM)), dim=-1)
+            ict_probs = F.softmax(sub_outputs.get("ict", torch.zeros(ICT_DIM)), dim=-1)
+
+            # Extract labels from sub-agent outputs
+            regime_idx = int(regime_probs.argmax(-1).item())
+            structure_idx = int(structure_probs.argmax(-1).item())
+            entry_idx = int(entry_probs.argmax(-1).item())
+            exit_idx = int(exit_probs.argmax(-1).item())
+            dd_idx = int(dd_probs.argmax(-1).item())
+            risk_idx = int(risk_probs.argmax(-1).item())
+            setup_idx = int(setup_probs.argmax(-1).item())
+            ict_idx = int(ict_probs.argmax(-1).item())
+
+            # Confidence scores
+            regime_conf = float(regime_probs.max().item())
+            entry_conf = float(entry_probs.max().item())
+            setup_conf = float(setup_probs.max().item())
+
+            regime_label = self.REGIME_LABELS[regime_idx]
+            structure_label = self.STRUCTURE_LABELS[structure_idx]
+            entry_label = self.ENTRY_LABELS[entry_idx]
+            exit_label = self.EXIT_LABELS[exit_idx]
+            dd_label = self.DD_LABELS[dd_idx]
+            risk_label = self.RISK_LABELS[risk_idx]
+            setup_label = self.SETUP_LABELS[setup_idx]
+            ict_label = self.ICT_LABELS[ict_idx]
+
+            # Build natural language reasoning
+            parts = []
+            parts.append(f"Market: {regime_label} ({regime_conf:.0%} conf)")
+            parts.append(f"Structure: {structure_label}")
+            if entry_label != "no_signal":
+                parts.append(f"Entry: {entry_label} ({entry_conf:.0%})")
+            parts.append(f"Setup: {setup_label} ({setup_conf:.0%})")
+            if dd_label != "normal":
+                parts.append(f"DD: {dd_label}")
+            parts.append(f"Risk: {risk_label}")
+            parts.append(f"ICT: {ict_label}")
+            parts.append(f"Exit: {exit_label}")
+
+            return {
+                "regime": regime_label,
+                "regime_confidence": regime_conf,
+                "structure": structure_label,
+                "entry": entry_label,
+                "entry_confidence": entry_conf,
+                "exit": exit_label,
+                "drawdown": dd_label,
+                "risk": risk_label,
+                "setup": setup_label,
+                "setup_confidence": setup_conf,
+                "ict": ict_label,
+                "reasoning": " | ".join(parts),
+            }
+
+
+# ---------------------------------------------------------------------------
 # Meta-Agent (Orchestrator)
 # ---------------------------------------------------------------------------
 class MetaAgent(nn.Module):
@@ -321,6 +447,7 @@ class MultiAgentEnsemble(nn.Module):
         self.setup = SetupGrader()
         self.trade_mgmt = TradeManager()
         self.ict = ICTPersona()
+        self.explainer = ExplainabilityAgent()
         self.meta = MetaAgent()
 
     def forward(self, obs: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
@@ -359,6 +486,14 @@ class MultiAgentEnsemble(nn.Module):
         meta_features, sub_outputs = self.forward(obs)
         action, log_prob, value = self.meta.get_action(meta_features, deterministic)
         return action, log_prob, value, sub_outputs
+
+    def explain(self, obs: torch.Tensor) -> dict:
+        """Get human-readable explanation of the current decision.
+
+        Returns dict with labels, confidence scores, and natural language reasoning.
+        """
+        meta_features, sub_outputs = self.forward(obs)
+        return self.explainer.explain(obs, sub_outputs)
 
     def get_sub_agent_probs(self, obs: torch.Tensor) -> dict[str, np.ndarray]:
         """Get probability distributions from each sub-agent (for analysis)."""

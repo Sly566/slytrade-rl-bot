@@ -840,6 +840,81 @@ def _add_premium_discount(df: pd.DataFrame) -> None:
 # --------------------------------------------------------------------------- #
 # Top-level driver
 # --------------------------------------------------------------------------- #
+
+
+def _add_zone_proximity(df: pd.DataFrame) -> None:
+    """Compute dynamic proximity to nearest unmitigated OB, FVG, and sweep level.
+
+    All distances normalized by ATR so they are scale-invariant.
+    Lower values = closer to zone = higher probability setup.
+    """
+    close = df["close"].values
+    atr = df.get("atr_14", pd.Series(1.0, index=df.index)).values
+    atr = np.where(np.isnan(atr) | (atr <= 0), 1.0, atr)
+
+    # --- OB proximity ---
+    bull_ob_top = df.get("bull_ob_top", pd.Series(np.nan, index=df.index)).values
+    bull_ob_bot = df.get("bull_ob_bottom", pd.Series(np.nan, index=df.index)).values
+    bull_ob_mit = df.get("bull_ob_mitigated", pd.Series(True, index=df.index)).values
+    bear_ob_top = df.get("bear_ob_top", pd.Series(np.nan, index=df.index)).values
+    bear_ob_bot = df.get("bear_ob_bottom", pd.Series(np.nan, index=df.index)).values
+    bear_ob_mit = df.get("bear_ob_mitigated", pd.Series(True, index=df.index)).values
+
+    # Distance to nearest unmitigated OB center
+    bull_ob_mid = np.where(
+        ~np.isnan(bull_ob_top) & ~np.isnan(bull_ob_bot) & ~bull_ob_mit,
+        (bull_ob_top + bull_ob_bot) / 2.0,
+        np.nan,
+    )
+    bear_ob_mid = np.where(
+        ~np.isnan(bear_ob_top) & ~np.isnan(bear_ob_bot) & ~bear_ob_mit,
+        (bear_ob_top + bear_ob_bot) / 2.0,
+        np.nan,
+    )
+    dist_bull_ob = np.abs(close - bull_ob_mid) / atr
+    dist_bear_ob = np.abs(close - bear_ob_mid) / atr
+    # Nearest OB (either direction)
+    ob_proximity = np.nanmin(np.column_stack([dist_bull_ob, dist_bear_ob]), axis=1)
+    ob_proximity = np.where(np.isnan(ob_proximity), 10.0, ob_proximity)  # 10 = far away
+    ob_proximity = np.clip(ob_proximity, 0.0, 10.0)
+
+    # --- FVG proximity ---
+    bull_fvg_top = df.get("bull_fvg_top", pd.Series(np.nan, index=df.index)).values
+    bull_fvg_bot = df.get("bull_fvg_bottom", pd.Series(np.nan, index=df.index)).values
+    bull_fvg_mit = df.get("bull_fvg_mitigated", pd.Series(True, index=df.index)).values
+    bear_fvg_top = df.get("bear_fvg_top", pd.Series(np.nan, index=df.index)).values
+    bear_fvg_bot = df.get("bear_fvg_bottom", pd.Series(np.nan, index=df.index)).values
+    bear_fvg_mit = df.get("bear_fvg_mitigated", pd.Series(True, index=df.index)).values
+
+    bull_fvg_mid = np.where(
+        ~np.isnan(bull_fvg_top) & ~np.isnan(bull_fvg_bot) & ~bull_fvg_mit,
+        (bull_fvg_top + bull_fvg_bot) / 2.0,
+        np.nan,
+    )
+    bear_fvg_mid = np.where(
+        ~np.isnan(bear_fvg_top) & ~np.isnan(bear_fvg_bot) & ~bear_fvg_mit,
+        (bear_fvg_top + bear_fvg_bot) / 2.0,
+        np.nan,
+    )
+    dist_bull_fvg = np.abs(close - bull_fvg_mid) / atr
+    dist_bear_fvg = np.abs(close - bear_fvg_mid) / atr
+    fvg_proximity = np.nanmin(np.column_stack([dist_bull_fvg, dist_bear_fvg]), axis=1)
+    fvg_proximity = np.where(np.isnan(fvg_proximity), 10.0, fvg_proximity)
+    fvg_proximity = np.clip(fvg_proximity, 0.0, 10.0)
+
+    # --- Sweep proximity ---
+    bull_sweep_px = df.get("bull_sweep_px", pd.Series(np.nan, index=df.index)).values
+    bear_sweep_px = df.get("bear_sweep_px", pd.Series(np.nan, index=df.index)).values
+    dist_bull_sweep = np.abs(close - bull_sweep_px) / atr
+    dist_bear_sweep = np.abs(close - bear_sweep_px) / atr
+    sweep_proximity = np.nanmin(np.column_stack([dist_bull_sweep, dist_bear_sweep]), axis=1)
+    sweep_proximity = np.where(np.isnan(sweep_proximity), 10.0, sweep_proximity)
+    sweep_proximity = np.clip(sweep_proximity, 0.0, 10.0)
+
+    df["ob_proximity"] = ob_proximity
+    df["fvg_proximity"] = fvg_proximity
+    df["sweep_proximity"] = sweep_proximity
+
 def process_bars(
     df: pd.DataFrame,
     timeframe: str,
@@ -888,6 +963,9 @@ def process_bars(
     _add_judas_swing(out)
     ce_cols = _add_consequent_encroachment(out)
     out = pd.concat([out, ce_cols], axis=1)
+    if progress:
+        progress(f"    {timeframe}: zone proximity ...")
+    _add_zone_proximity(out)
     if progress:
         progress(f"    {timeframe}: done ({len(out):,} rows, {len(out.columns)} cols)")
     return out

@@ -18,6 +18,12 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    HAS_TENSORBOARD = True
+except ImportError:
+    HAS_TENSORBOARD = False
+
 from .multi_agent import (
     MultiAgentEnsemble,
     SubAgentRewards,
@@ -44,6 +50,7 @@ class MultiAgentTrainer:
         batch_size: int = 512,
         n_epochs: int = 10,
         device: str = "cpu",
+        tb_log_dir: str | None = None,
     ):
         self.env = env
         self.gamma = gamma
@@ -52,6 +59,13 @@ class MultiAgentTrainer:
         self.batch_size = batch_size
         self.n_epochs = n_epochs
         self.device = torch.device(device)
+
+        # TensorBoard
+        self.writer = None
+        if tb_log_dir and HAS_TENSORBOARD:
+            self.writer = SummaryWriter(log_dir=tb_log_dir)
+        elif tb_log_dir and not HAS_TENSORBOARD:
+            print("[yellow]tensorboard not installed, skipping TB logging[/yellow]")
 
         # Create ensemble
         self.ensemble = MultiAgentEnsemble().to(self.device)
@@ -300,6 +314,25 @@ class MultiAgentTrainer:
             fps = timesteps_done / max(elapsed, 1)
             stats = self._last_rollout_stats
 
+            # TensorBoard logging
+            if self.writer:
+                step = timesteps_done
+                self.writer.add_scalar("train/policy_loss", update_info["policy_loss"], step)
+                self.writer.add_scalar("train/value_loss", update_info["value_loss"], step)
+                self.writer.add_scalar("train/entropy", update_info["entropy"], step)
+                self.writer.add_scalar("train/fps", fps, step)
+                self.writer.add_scalar("train/n_trades", stats["n_trades"], step)
+                self.writer.add_scalar("train/win_rate", stats["win_rate"], step)
+                self.writer.add_scalar("train/total_pnl", stats["total_pnl"], step)
+                self.writer.add_scalar("train/mean_reward", stats["mean_reward"], step)
+                self.writer.add_scalar("train/std_reward", stats["std_reward"], step)
+                # Sub-agent output magnitudes
+                sub = stats["sub_agent_sums"]
+                for name, vals in sub.items():
+                    avg = vals / max(self.n_steps, 1)
+                    for j, v in enumerate(avg):
+                        self.writer.add_scalar(f"sub_agents/{name}_{j}", v, step)
+
             if progress_fn:
                 # Main metrics
                 progress_fn(
@@ -343,6 +376,15 @@ class MultiAgentTrainer:
             # Evaluation
             if eval_env and timesteps_done % eval_freq < self.n_steps:
                 metrics = self._evaluate(eval_env)
+                # Log eval to TensorBoard
+                if self.writer:
+                    self.writer.add_scalar("eval/win_rate", metrics.get("win_rate", 0), timesteps_done)
+                    self.writer.add_scalar("eval/sharpe", metrics.get("sharpe_ratio", 0), timesteps_done)
+                    self.writer.add_scalar("eval/max_drawdown", metrics.get("max_drawdown", 0), timesteps_done)
+                    self.writer.add_scalar("eval/total_pnl", metrics.get("total_pnl", 0), timesteps_done)
+                    self.writer.add_scalar("eval/n_trades", metrics.get("n_trades", 0), timesteps_done)
+                    self.writer.add_scalar("eval/profit_factor", metrics.get("profit_factor", 0), timesteps_done)
+
                 if progress_fn:
                     progress_fn(f"    EVAL: trades={metrics['n_trades']} wr={metrics['win_rate']:.0%} "
                                f"pnl={metrics['total_pnl']:+.0f} sharpe={metrics['sharpe_ratio']:.2f} "
@@ -356,6 +398,10 @@ class MultiAgentTrainer:
 
         # Save final
         self.ensemble.save(str(output_path / f"multi_{symbol}_final.pt"))
+
+        # Close TensorBoard
+        if self.writer:
+            self.writer.close()
 
         # Final eval
         if eval_env:
