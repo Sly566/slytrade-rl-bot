@@ -42,7 +42,7 @@ import torch.nn.functional as F
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-OBS_DIM = 39  # from env.py
+OBS_DIM = 90  # from env.py (comprehensive market state)
 
 # Sub-agent output dimensions
 REGIME_DIM = 4      # trending_up, trending_down, ranging, volatile
