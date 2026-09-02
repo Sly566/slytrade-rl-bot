@@ -35,15 +35,16 @@ from ..strategy.signals import _evaluate_row
 # ---------------------------------------------------------------------------
 
 # ============================================================
-# Observation vector layout — comprehensive market state
+# Observation vector layout — comprehensive market state (98 features)
 # ============================================================
-# Market features (normalized)
-_OBS_BID = 0          # current bid price (normalized)
-_OBS_ASK = 1          # current ask price (normalized)
-_OBS_ATR = 2          # ATR(14) normalized by price
-_OBS_SPREAD = 3       # ACTUAL spread from tick data (normalized by ATR)
 
-# M1 Structure flags (0/1)
+# 0-3: Core price
+_OBS_BID = 0
+_OBS_ASK = 1
+_OBS_ATR = 2
+_OBS_SPREAD = 3
+
+# 4-9: M1 Structure
 _OBS_BULL_DISP = 4
 _OBS_BEAR_DISP = 5
 _OBS_BOS_UP = 6
@@ -51,7 +52,7 @@ _OBS_BOS_DN = 7
 _OBS_CHOCH_UP = 8
 _OBS_CHOCH_DN = 9
 
-# M5 Structure
+# 10-15: M5 Structure
 _OBS_M5_BULL_DISP = 10
 _OBS_M5_BEAR_DISP = 11
 _OBS_M5_BOS_UP = 12
@@ -59,7 +60,7 @@ _OBS_M5_BOS_DN = 13
 _OBS_M5_CHOCH_UP = 14
 _OBS_M5_CHOCH_DN = 15
 
-# M15 Structure
+# 16-23: M15 Structure
 _OBS_M15_BULL_DISP = 16
 _OBS_M15_BEAR_DISP = 17
 _OBS_M15_BOS_UP = 18
@@ -69,101 +70,113 @@ _OBS_M15_CHOCH_DN = 21
 _OBS_M15_MAJOR_CHOCH_UP = 22
 _OBS_M15_MAJOR_CHOCH_DN = 23
 
-# HTF Structure (Gap 6: broader market context)
+# 24-27: H1 Structure
 _OBS_H1_BOS_UP = 24
 _OBS_H1_BOS_DN = 25
 _OBS_H1_CHOCH_UP = 26
 _OBS_H1_CHOCH_DN = 27
+
+# 28-31: H4 Structure
 _OBS_H4_BOS_UP = 28
 _OBS_H4_BOS_DN = 29
 _OBS_H4_CHOCH_UP = 30
 _OBS_H4_CHOCH_DN = 31
 
-# Zone proximity
-_OBS_OB_PROX = 32
-_OBS_FVG_PROX = 33
-_OBS_SWEEP_PROX = 34
+# 32-35: D1 Structure (daily trend)
+_OBS_D1_BOS_UP = 32
+_OBS_D1_BOS_DN = 33
+_OBS_D1_CHOCH_UP = 34
+_OBS_D1_CHOCH_DN = 35
 
-# Support/Resistance zones (Gap 14)
-_OBS_SR_SUPPORT_DIST = 35
-_OBS_SR_RESISTANCE_DIST = 36
-_OBS_SR_SUPPORT_COUNT = 37    # confluence count
-_OBS_SR_RESISTANCE_COUNT = 38
-_OBS_AT_SUPPORT = 39
-_OBS_AT_RESISTANCE = 40
+# 36-39: W1 Structure (weekly trend)
+_OBS_W1_BOS_UP = 36
+_OBS_W1_BOS_DN = 37
+_OBS_W1_CHOCH_UP = 38
+_OBS_W1_CHOCH_DN = 39
 
-# Supply/Demand zones
-_OBS_IN_DEMAND_ZONE = 41
-_OBS_IN_SUPPLY_ZONE = 42
-_OBS_DEMAND_STRENGTH = 43
-_OBS_SUPPLY_STRENGTH = 44
-_OBS_DEMAND_DIST = 45
-_OBS_SUPPLY_DIST = 46
+# 40-42: Zone proximity
+_OBS_OB_PROX = 40
+_OBS_FVG_PROX = 41
+_OBS_SWEEP_PROX = 42
 
-# Premium/Discount
-_OBS_IN_PREMIUM = 47
-_OBS_IN_DISCOUNT = 48
+# 43-48: Support/Resistance
+_OBS_SR_SUPPORT_DIST = 43
+_OBS_SR_RESISTANCE_DIST = 44
+_OBS_SR_SUPPORT_COUNT = 45
+_OBS_SR_RESISTANCE_COUNT = 46
+_OBS_AT_SUPPORT = 47
+_OBS_AT_RESISTANCE = 48
 
-# Position state (Gap 7: expanded)
-_OBS_POS_DIR = 49
-_OBS_POS_R = 50
-_OBS_POS_BARS = 51
-_OBS_POS_AGE = 52
-_OBS_POS_GRADE = 53        # setup grade encoded: A+=4, A=3, B=2, C=1, none=0
-_OBS_POS_TRAIL_ACTIVE = 54 # trailing stop active (0/1)
-_OBS_POS_PARTIAL_CLOSED = 55 # partial close taken (0/1)
+# 49-56: Supply/Demand + Premium/Discount
+_OBS_IN_DEMAND_ZONE = 49
+_OBS_IN_SUPPLY_ZONE = 50
+_OBS_DEMAND_STRENGTH = 51
+_OBS_SUPPLY_STRENGTH = 52
+_OBS_DEMAND_DIST = 53
+_OBS_SUPPLY_DIST = 54
+_OBS_IN_PREMIUM = 55
+_OBS_IN_DISCOUNT = 56
 
-# Account state (Gap 10: expanded)
-_OBS_EQUITY_CURVE = 56
-_OBS_DRAWDOWN = 57
-_OBS_WIN_RATE = 58
-_OBS_EQUITY_MOMENTUM = 59  # equity change last 100 bars (rising/falling)
-_OBS_CONSEC_WINS = 60      # consecutive wins (normalized)
-_OBS_CONSEC_LOSSES = 61    # consecutive losses (normalized)
+# 57-63: Position state
+_OBS_POS_DIR = 57
+_OBS_POS_R = 58
+_OBS_POS_BARS = 59
+_OBS_POS_AGE = 60
+_OBS_POS_GRADE = 61
+_OBS_POS_TRAIL_ACTIVE = 62
+_OBS_POS_PARTIAL_CLOSED = 63
 
-# Killzone
-_OBS_KZ_ASIA = 62
-_OBS_KZ_LONDON = 63
-_OBS_KZ_NY = 64
-_OBS_KZ_LONDON_NY_OVERLAP = 65  # power hour overlap
+# 64-71: Account state
+_OBS_EQUITY_CURVE = 64
+_OBS_DRAWDOWN = 65
+_OBS_WIN_RATE = 66
+_OBS_EQUITY_MOMENTUM = 67
+_OBS_CONSEC_WINS = 68
+_OBS_CONSEC_LOSSES = 69
 
-# Time features (Gap 12)
-_OBS_HOUR_SIN = 66
-_OBS_HOUR_COS = 67
-_OBS_DOW_SIN = 68          # day of week encoded
-_OBS_DOW_COS = 69
+# 70-75: Killzone + Time
+_OBS_KZ_ASIA = 70
+_OBS_KZ_LONDON = 71
+_OBS_KZ_NY = 72
+_OBS_KZ_LONDON_NY_OVERLAP = 73
+_OBS_HOUR_SIN = 74
+_OBS_HOUR_COS = 75
 
-# ATR regime (Gap 11)
-_OBS_ATR_PCT_RANK = 70     # 0-1 percentile rank of current ATR
-_OBS_ATR_EXPANDING = 71    # bool: ATR > 1.2x SMA20
-_OBS_ATR_CONTRACTING = 72  # bool: ATR < 0.8x SMA20
+# 76-77: Day of week
+_OBS_DOW_SIN = 76
+_OBS_DOW_COS = 77
 
-# Tick microstructure
-_OBS_TICK_BUY_RATIO = 73
-_OBS_TICK_SELL_RATIO = 74
-_OBS_TICK_SPREAD_MEAN = 75
-_OBS_TICK_SPREAD_MAX = 76
-_OBS_TICK_PRICE_VELOCITY = 77
-_OBS_TICK_VOLUME_IMBALANCE = 78
-_OBS_TICK_ABSORPTION = 79
-_OBS_TICK_LARGE_TRADE = 80
-_OBS_TICK_COUNT = 81
+# 78-80: ATR regime
+_OBS_ATR_PCT_RANK = 78
+_OBS_ATR_EXPANDING = 79
+_OBS_ATR_CONTRACTING = 80
 
-# News features (Gap 5)
-_OBS_NEWS_MINUTES_TO = 82     # minutes to next high-impact event
-_OBS_NEWS_MINUTES_SINCE = 83  # minutes since last high-impact event
-_OBS_NEWS_IN_WINDOW = 84      # bool: within 15min of high-impact
-_OBS_NEWS_IMPACT_SCORE = 85   # 0-3 impact score
+# 81-89: Tick microstructure
+_OBS_TICK_BUY_RATIO = 81
+_OBS_TICK_SELL_RATIO = 82
+_OBS_TICK_SPREAD_MEAN = 83
+_OBS_TICK_SPREAD_MAX = 84
+_OBS_TICK_PRICE_VELOCITY = 85
+_OBS_TICK_VOLUME_IMBALANCE = 86
+_OBS_TICK_ABSORPTION = 87
+_OBS_TICK_LARGE_TRADE = 88
+_OBS_TICK_COUNT = 89
 
-# Volume features
-_OBS_VOL_RATIO = 86        # tick_volume / SMA20
-_OBS_VOL_SPIKE = 87        # bool: volume > 2x SMA
+# 90-93: News
+_OBS_NEWS_MINUTES_TO = 90
+_OBS_NEWS_MINUTES_SINCE = 91
+_OBS_NEWS_IN_WINDOW = 92
+_OBS_NEWS_IMPACT_SCORE = 93
 
-# Premium/Discount already at 47-48, but let's add liquidity sweep signal
-_OBS_BULL_SWEEP = 88
-_OBS_BEAR_SWEEP = 89
+# 94-95: Volume
+_OBS_VOL_RATIO = 94
+_OBS_VOL_SPIKE = 95
 
-OBS_DIM = 90
+# 96-97: Liquidity sweeps
+_OBS_BULL_SWEEP = 96
+_OBS_BEAR_SWEEP = 97
+
+OBS_DIM = 98
 
 # Action space
 ACT_HOLD = 0
@@ -243,6 +256,12 @@ def _safe_from_row(
     obs[_OBS_H1_CHOCH_UP] = _b("H1_minor_choch_up"); obs[_OBS_H1_CHOCH_DN] = _b("H1_minor_choch_dn")
     obs[_OBS_H4_BOS_UP] = _b("H4_minor_bos_up"); obs[_OBS_H4_BOS_DN] = _b("H4_minor_bos_dn")
     obs[_OBS_H4_CHOCH_UP] = _b("H4_minor_choch_up"); obs[_OBS_H4_CHOCH_DN] = _b("H4_minor_choch_dn")
+    # D1
+    obs[_OBS_D1_BOS_UP] = _b("D1_minor_bos_up"); obs[_OBS_D1_BOS_DN] = _b("D1_minor_bos_dn")
+    obs[_OBS_D1_CHOCH_UP] = _b("D1_minor_choch_up"); obs[_OBS_D1_CHOCH_DN] = _b("D1_minor_choch_dn")
+    # W1
+    obs[_OBS_W1_BOS_UP] = _b("W1_minor_bos_up"); obs[_OBS_W1_BOS_DN] = _b("W1_minor_bos_dn")
+    obs[_OBS_W1_CHOCH_UP] = _b("W1_minor_choch_up"); obs[_OBS_W1_CHOCH_DN] = _b("W1_minor_choch_dn")
     # Zone proximity
     obs[_OBS_OB_PROX] = min(_g("ob_proximity", 10.0), 10.0)
     obs[_OBS_FVG_PROX] = min(_g("fvg_proximity", 10.0), 10.0)
@@ -377,6 +396,12 @@ class SlyTradeEnv(gym.Env):
             "H1_minor_choch_up": "H1_minor_choch_up", "H1_minor_choch_dn": "H1_minor_choch_dn",
             "H4_minor_bos_up": "H4_minor_bos_up", "H4_minor_bos_dn": "H4_minor_bos_dn",
             "H4_minor_choch_up": "H4_minor_choch_up", "H4_minor_choch_dn": "H4_minor_choch_dn",
+            # D1 structure
+            "D1_minor_bos_up": "D1_minor_bos_up", "D1_minor_bos_dn": "D1_minor_bos_dn",
+            "D1_minor_choch_up": "D1_minor_choch_up", "D1_minor_choch_dn": "D1_minor_choch_dn",
+            # W1 structure
+            "W1_minor_bos_up": "W1_minor_bos_up", "W1_minor_bos_dn": "W1_minor_bos_dn",
+            "W1_minor_choch_up": "W1_minor_choch_up", "W1_minor_choch_dn": "W1_minor_choch_dn",
             # Zone proximity
             "ob_proximity": "ob_proximity", "fvg_proximity": "fvg_proximity",
             "sweep_proximity": "sweep_proximity",
@@ -553,6 +578,18 @@ class SlyTradeEnv(gym.Env):
         obs[_OBS_H4_BOS_DN] = sb("H4_minor_bos_dn", i)
         obs[_OBS_H4_CHOCH_UP] = sb("H4_minor_choch_up", i)
         obs[_OBS_H4_CHOCH_DN] = sb("H4_minor_choch_dn", i)
+
+        # === D1 Structure (daily trend) ===
+        obs[_OBS_D1_BOS_UP] = sb("D1_minor_bos_up", i)
+        obs[_OBS_D1_BOS_DN] = sb("D1_minor_bos_dn", i)
+        obs[_OBS_D1_CHOCH_UP] = sb("D1_minor_choch_up", i)
+        obs[_OBS_D1_CHOCH_DN] = sb("D1_minor_choch_dn", i)
+
+        # === W1 Structure (weekly trend) ===
+        obs[_OBS_W1_BOS_UP] = sb("W1_minor_bos_up", i)
+        obs[_OBS_W1_BOS_DN] = sb("W1_minor_bos_dn", i)
+        obs[_OBS_W1_CHOCH_UP] = sb("W1_minor_choch_up", i)
+        obs[_OBS_W1_CHOCH_DN] = sb("W1_minor_choch_dn", i)
 
         # === Zone proximity ===
         obs[_OBS_OB_PROX] = min(s("ob_proximity", i, 10.0), 10.0)

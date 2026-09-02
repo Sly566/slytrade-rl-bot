@@ -391,6 +391,10 @@ def train(
         # HTF structure (Gap 6)
         "H1_minor_bos_up", "H1_minor_bos_dn", "H1_minor_choch_up", "H1_minor_choch_dn",
         "H4_minor_bos_up", "H4_minor_bos_dn", "H4_minor_choch_up", "H4_minor_choch_dn",
+        # D1 structure
+        "D1_minor_bos_up", "D1_minor_bos_dn", "D1_minor_choch_up", "D1_minor_choch_dn",
+        # W1 structure
+        "W1_minor_bos_up", "W1_minor_bos_dn", "W1_minor_choch_up", "W1_minor_choch_dn",
         # Zone proximity
         "ob_proximity", "fvg_proximity", "sweep_proximity",
         # S/R zones
