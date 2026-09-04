@@ -1082,7 +1082,7 @@ def process_bars(
     import warnings
     warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*All-NaN.*")
     cfg = cfg or DEFAULT_CONFIG
-    out = df.reset_index(drop=True)  # no .copy() — work in place to save memory
+    out = df.copy().reset_index(drop=True)
     for col in ("open", "high", "low", "close"):
         out[col] = out[col].astype(np.float64)
     out["tick_volume"] = pd.to_numeric(out["tick_volume"], errors="coerce").fillna(0).astype(np.float64)
