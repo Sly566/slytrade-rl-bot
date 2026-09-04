@@ -251,14 +251,38 @@ def process(
 
         console.print(f"    {len(df):,} raw {tf} bars ({df['time'].min()} to {df['time'].max()})")
 
-        # Compute features (with tick data for M1)
-        console.print(f"    Computing features...")
         import gc
         tick_dir = Path(raw_root) / "mt5_ticks" / f"symbol={symbol}" if tf == "M1" else None
-        gc.collect()  # free memory before heavy computation
-        processed = process_bars(df, tf, DEFAULT_CONFIG, tick_dir=tick_dir)
-        del df
-        gc.collect()  # free original df memory
+
+        # M1: process in monthly chunks to avoid OOM (1.77M × 150 cols ≈ 2GB)
+        if tf == "M1" and len(df) > 200_000:
+            console.print(f"    Processing in monthly chunks...")
+            df["_ym"] = df["time"].dt.to_period("M")
+            groups = list(df.groupby("_ym"))
+            n_groups = len(groups)
+            del df; gc.collect()
+            chunk_frames = []
+            for idx, (ym, chunk_df) in enumerate(groups):
+                chunk_df = chunk_df.drop(columns=["_ym"]).reset_index(drop=True)
+                console.print(f"    [{idx+1}/{n_groups}] {ym}: {len(chunk_df):,} bars...")
+                try:
+                    processed_chunk = process_bars(chunk_df, tf, DEFAULT_CONFIG, tick_dir=tick_dir)
+                    chunk_frames.append(processed_chunk)
+                    del processed_chunk
+                except Exception as e:
+                    console.print(f"      [yellow]Error: {e}[/yellow]")
+                del chunk_df; gc.collect()
+            if chunk_frames:
+                processed = pd.concat(chunk_frames, ignore_index=True)
+                del chunk_frames; gc.collect()
+                processed = processed.sort_values("time").reset_index(drop=True)
+            else:
+                console.print(f"    [red]No chunks processed[/red]")
+                continue
+        else:
+            console.print(f"    Computing features...")
+            processed = process_bars(df, tf, DEFAULT_CONFIG, tick_dir=tick_dir)
+            del df; gc.collect()
 
         elapsed = time.time() - t0
 
