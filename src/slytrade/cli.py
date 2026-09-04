@@ -260,7 +260,7 @@ def process(
             console.print(f"    Processing in monthly chunks (disk-backed)...")
             # Extract month labels, then sort df by month and split by index ranges
             months = df["time"].dt.to_period("M")
-            unique_months = months.unique().sort_values()
+            unique_months = sorted(months.unique())
             n_groups = len(unique_months)
             tmp_dir = Path(tempfile.mkdtemp(prefix="slytrade_proc_"))
             n_written = 0
