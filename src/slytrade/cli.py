@@ -255,45 +255,66 @@ def process(
         tick_dir = Path(raw_root) / "mt5_ticks" / f"symbol={symbol}" if tf == "M1" else None
 
         # M1: process in monthly chunks to avoid OOM
+        # Strategy: write RAW chunks to disk, free df, THEN process from disk.
+        # This ensures the 1.77M-row DataFrame is never held during processing.
         if tf == "M1" and len(df) > 200_000:
-            import tempfile, pyarrow.parquet as pq
-            console.print(f"    Processing in monthly chunks (disk-backed)...")
-            # Extract month labels, then sort df by month and split by index ranges
+            import tempfile
+            import warnings; warnings.filterwarnings("ignore", message=".*Period.*timezone.*")
+            console.print(f"    Splitting into monthly chunks on disk...")
             months = df["time"].dt.to_period("M")
             unique_months = sorted(months.unique())
             n_groups = len(unique_months)
-            tmp_dir = Path(tempfile.mkdtemp(prefix="slytrade_proc_"))
-            n_written = 0
+            raw_tmp = Path(tempfile.mkdtemp(prefix="slytrade_raw_"))
+
+            # Phase 1: write raw monthly chunks to disk, then FREE df
+            n_raw = 0
             for idx, ym in enumerate(unique_months):
                 mask = months == ym
-                chunk_df = df.loc[mask].drop(columns=[], errors="ignore").copy()
-                console.print(f"    [{idx+1}/{n_groups}] {ym}: {len(chunk_df):,} bars...")
+                chunk_df = df.loc[mask].drop(columns=[], errors="ignore")
+                raw_path = raw_tmp / f"raw_{idx:04d}.parquet"
+                chunk_df.to_parquet(raw_path, index=False)
+                n_raw += 1
+                del chunk_df
+            del df, months; gc.collect()
+            console.print(f"    {n_raw} raw chunks written, df freed. Processing...")
+
+            # Phase 2: read each raw chunk from disk, process, write result
+            proc_tmp = Path(tempfile.mkdtemp(prefix="slytrade_proc_"))
+            n_written = 0
+            for idx in range(n_raw):
+                raw_path = raw_tmp / f"raw_{idx:04d}.parquet"
+                chunk_df = pd.read_parquet(raw_path)
+                ym = unique_months[idx]
+                console.print(f"    [{idx+1}/{n_raw}] {ym}: {len(chunk_df):,} bars...")
                 try:
                     processed_chunk = process_bars(chunk_df, tf, DEFAULT_CONFIG, tick_dir=tick_dir)
-                    # Write to temp parquet immediately — don't accumulate in memory
-                    tmp_path = tmp_dir / f"chunk_{idx:04d}.parquet"
-                    processed_chunk.to_parquet(tmp_path, index=False)
+                    proc_path = proc_tmp / f"proc_{idx:04d}.parquet"
+                    processed_chunk.to_parquet(proc_path, index=False)
                     n_written += 1
                     del processed_chunk
                 except Exception as e:
                     console.print(f"      [yellow]Error: {e}[/yellow]")
                 del chunk_df; gc.collect()
-            del df, months; gc.collect()
+
+            # Clean up raw temp files
+            import shutil
+            shutil.rmtree(raw_tmp, ignore_errors=True)
 
             if n_written == 0:
                 console.print(f"    [red]No chunks processed[/red]")
                 continue
-            # Read temp files and concat — pyarrow is memory-efficient
+            # Phase 3: combine processed chunks
             console.print(f"    Combining {n_written} chunks...")
-            chunk_paths = sorted(tmp_dir.glob("chunk_*.parquet"))
-            frames = [pd.read_parquet(p) for p in chunk_paths]
-            processed = pd.concat(frames, ignore_index=True)
-            del frames; gc.collect()
+            proc_paths = sorted(proc_tmp.glob("proc_*.parquet"))
+            processed = pd.read_parquet(proc_paths[0])
+            for p in proc_paths[1:]:
+                chunk = pd.read_parquet(p)
+                processed = pd.concat([processed, chunk], ignore_index=True)
+                del chunk
+                if len(processed) > 500_000:
+                    gc.collect()
             processed = processed.sort_values("time").reset_index(drop=True)
-            # Clean up temp files
-            for p in chunk_paths:
-                p.unlink()
-            tmp_dir.rmdir()
+            shutil.rmtree(proc_tmp, ignore_errors=True)
         else:
             console.print(f"    Computing features...")
             processed = process_bars(df, tf, DEFAULT_CONFIG, tick_dir=tick_dir)
