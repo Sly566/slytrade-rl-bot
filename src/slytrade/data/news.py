@@ -89,6 +89,90 @@ KNOWN_HIGH_IMPACT = {
 }
 
 
+# ---------------------------------------------------------------------------
+# MT5 Economic Calendar (primary source — already connected)
+# ---------------------------------------------------------------------------
+def collect_news_from_mt5(mt5, start, end) -> list[dict]:
+    """Collect economic calendar events from MT5 broker.
+
+    Uses MT5's built-in economic calendar API. This is the most reliable
+    source since it comes directly from the broker and requires no scraping.
+
+    Args:
+        mt5: connected MetaTrader5 instance
+        start: datetime start
+        end: datetime end
+
+    Returns:
+        List of event dicts compatible with NewsEvent
+    """
+    events = []
+
+    # Get all calendar events in the range
+    try:
+        calendar = mt5.calendar_get(start, end)
+    except Exception:
+        # calendar_get may not be available on all MT5 builds
+        return []
+
+    if calendar is None or len(calendar) == 0:
+        return []
+
+    for item in calendar:
+        # MT5 calendar item has: id, time, country, currency, event, impact,
+        # actual, forecast, previous, etc.
+        impact_map = {3: "High", 2: "Medium", 1: "Low", 0: "None"}
+        try:
+            evt = {
+                "time": item.time.isoformat() if hasattr(item.time, 'isoformat') else str(item.time),
+                "currency": getattr(item, 'currency', ''),
+                "event": getattr(item, 'event', getattr(item, 'name', '')),
+                "impact": impact_map.get(getattr(item, 'impact', 0), "Low"),
+                "actual": str(getattr(item, 'actual', '')),
+                "forecast": str(getattr(item, 'forecast', '')),
+                "previous": str(getattr(item, 'previous', '')),
+                "source": "mt5",
+            }
+            events.append(evt)
+        except Exception:
+            continue
+
+    return events
+
+
+def collect_news_from_mt5_rpyc(mt5_rpyc, start, end) -> list[dict]:
+    """Collect economic calendar events via RPyC bridge (for live trading).
+
+    The RPyC bridge returns proxy objects, so we handle them differently.
+    """
+    events = []
+    try:
+        # Try calendar_get with date range
+        calendar = mt5_rpyc.calendar_get(start, end)
+        if calendar is None:
+            return []
+        for item in calendar:
+            impact_map = {3: "High", 2: "Medium", 1: "Low", 0: "None"}
+            try:
+                # RPyC proxy — access attributes via getattr
+                evt = {
+                    "time": str(getattr(item, 'time', '')),
+                    "currency": str(getattr(item, 'currency', '')),
+                    "event": str(getattr(item, 'event', getattr(item, 'name', ''))),
+                    "impact": impact_map.get(int(getattr(item, 'impact', 0)), "Low"),
+                    "actual": str(getattr(item, 'actual', '')),
+                    "forecast": str(getattr(item, 'forecast', '')),
+                    "previous": str(getattr(item, 'previous', '')),
+                    "source": "mt5",
+                }
+                events.append(evt)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return events
+
+
 class ForexFactoryCalendar:
     """Forex Factory economic calendar scraper.
 

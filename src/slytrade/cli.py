@@ -122,25 +122,51 @@ def collect(
 
     mt5.shutdown()
 
-    # Phase 3: News calendar (Forex Factory)
-    console.print(f"\n  [bold]Phase 3: News Calendar (Forex Factory)[/bold]")
+    # Phase 3: News calendar
+    console.print(f"\n  [bold]Phase 3: News Calendar[/bold]")
+    news_collected = False
     try:
-        from .data.news import ForexFactoryCalendar
-        ff = ForexFactoryCalendar()
-        news_start = start.strftime("%Y-%m-%d")
-        news_end = end.strftime("%Y-%m-%d")
-        console.print(f"    Scraping Forex Factory calendar ({news_start} to {news_end})...")
-        events = ff.get_events(news_start, news_end, currencies=["USD", "EUR", "GBP"])
-        high_impact = [e for e in events if e.is_high_impact]
-        console.print(f"    News: {len(events):,} events total, {len(high_impact):,} high-impact")
-        if high_impact:
-            for evt in high_impact[:5]:
-                console.print(f"      {evt.time.strftime('%Y-%m-%d %H:%M')} {evt.currency} {evt.event}")
-            if len(high_impact) > 5:
-                console.print(f"      ... and {len(high_impact) - 5} more")
+        from .data.news import collect_news_from_mt5
+        console.print(f"    MT5 economic calendar ({start.strftime('%Y-%m-%d')} to {end.strftime('%Y-%m-%d')})...")
+        mt5_events = collect_news_from_mt5(mt5, start, end)
+        if mt5_events:
+            import json as _json
+            news_dir = Path(output) / "news"
+            news_dir.mkdir(parents=True, exist_ok=True)
+            cache_file = news_dir / f"mt5_calendar_{start.strftime('%Y%m')}_{end.strftime('%Y%m')}.json"
+            with open(cache_file, "w") as f:
+                _json.dump(mt5_events, f, indent=2, default=str)
+            high_impact = [e for e in mt5_events if e.get("impact", "").lower() in ("high", "red")]
+            console.print(f"    MT5 News: {len(mt5_events):,} events, {len(high_impact):,} high-impact")
+            if high_impact:
+                for evt in high_impact[:5]:
+                    console.print(f"      {evt.get('time', '')} {evt.get('currency', '')} {evt.get('event', '')}")
+                if len(high_impact) > 5:
+                    console.print(f"      ... and {len(high_impact) - 5} more")
+            news_collected = True
+        else:
+            console.print(f"    MT5 calendar: no events returned")
     except Exception as e:
-        console.print(f"    [yellow]News scraping failed: {e}[/yellow]")
-        console.print(f"    [yellow]News features will use defaults (no news awareness)[/yellow]")
+        console.print(f"    [yellow]MT5 calendar not available: {e}[/yellow]")
+
+    # Fallback: Forex Factory scraping
+    if not news_collected:
+        try:
+            from .data.news import ForexFactoryCalendar
+            ff = ForexFactoryCalendar()
+            console.print(f"    Trying Forex Factory scraping...")
+            events = ff.get_events(start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"), currencies=["USD", "EUR", "GBP"])
+            if events:
+                console.print(f"    Forex Factory: {len(events)} events")
+                news_collected = True
+            else:
+                console.print(f"    [yellow]Forex Factory: 0 events (JS-rendered page)[/yellow]")
+        except Exception as e:
+            console.print(f"    [yellow]Forex Factory failed: {e}[/yellow]")
+
+    if not news_collected:
+        console.print(f"    [yellow]No news data collected. News features will default to zeros.[/yellow]")
+        console.print(f"    [yellow]The bot will trade without news awareness.[/yellow]")
 
     # Summary
     console.print(f"\n[green]Collection complete: {total_rows:,} total rows[/green]")
@@ -226,23 +252,27 @@ def process(
 
         # Wire news features for M1 (Gap 5)
         if tf == "M1":
-            news_dir = Path("data/news")
-            news_cache_files = sorted(news_dir.glob("ff_calendar_*.json")) if news_dir.exists() else []
-            if news_cache_files:
-                console.print(f"    Merging news features...")
-                from .data.news import create_news_features
-                import json as _json
-                all_events = []
-                for nf in news_cache_files:
-                    try:
-                        with open(nf) as jf:
-                            all_events.extend(_json.load(jf))
-                    except Exception:
-                        continue
-                if all_events:
-                    news_df = pd.DataFrame(all_events)
-                    processed = create_news_features(processed, news_df)
-                    console.print(f"    News: {len(news_df)} events merged")
+            news_dir = Path(output).parent / "news"
+            alt_news_dir = Path("data/news")
+            for nd in [news_dir, alt_news_dir]:
+                if nd.exists():
+                    news_cache_files = sorted(nd.glob("*.json"))
+                    if news_cache_files:
+                        console.print(f"    Merging news features from {nd}...")
+                        from .data.news import create_news_features
+                        import json as _json
+                        all_events = []
+                        for nf in news_cache_files:
+                            try:
+                                with open(nf) as jf:
+                                    all_events.extend(_json.load(jf))
+                            except Exception:
+                                continue
+                        if all_events:
+                            news_df = pd.DataFrame(all_events)
+                            processed = create_news_features(processed, news_df)
+                            console.print(f"    News: {len(news_df)} events merged")
+                        break
 
         # Save
         tf_dir = out_dir / f"timeframe={tf}"
@@ -1080,6 +1110,76 @@ def live(
 # ---------------------------------------------------------------------------
 # doctor — Health check
 # ---------------------------------------------------------------------------
+@app.command()
+def news(
+    symbol: str = typer.Option("XAUUSDm", "--symbol", "-s"),
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(18812, "--port"),
+    years: float = typer.Option(5.0, "--years", "-y"),
+    output: str = typer.Option("data/news", "--output", "-o"),
+):
+    """Fetch economic calendar news data.
+
+    Tries MT5 broker calendar first (requires MT5 bridge),
+    then falls back to Forex Factory scraping.
+
+    Example:
+        slytrade news --symbol XAUUSDm --years 5
+    """
+    import json as _json
+    from datetime import UTC, datetime, timedelta
+
+    console.print(f"[bold]SlyTrade NEWS v{VERSION}[/bold]")
+    end = datetime.now(UTC)
+    start = end - timedelta(days=int(years * 365.25))
+    console.print(f"  Period: {start.strftime('%Y-%m-%d')} to {end.strftime('%Y-%m-%d')}")
+
+    out_dir = Path(output)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Method 1: MT5 calendar
+    console.print(f"\n  [bold]MT5 Economic Calendar[/bold]")
+    try:
+        from .live.trader import connect_mt5
+        from .data.news import collect_news_from_mt5
+        mt5 = connect_mt5(host, port)
+        console.print(f"  MT5 bridge connected")
+        events = collect_news_from_mt5(mt5, start, end)
+        mt5.shutdown()
+        if events:
+            cache_file = out_dir / f"mt5_calendar_{start.strftime('%Y%m')}_{end.strftime('%Y%m')}.json"
+            with open(cache_file, "w") as f:
+                _json.dump(events, f, indent=2, default=str)
+            high_impact = [e for e in events if e.get("impact", "").lower() in ("high", "red")]
+            console.print(f"  MT5: {len(events):,} events, {len(high_impact):,} high-impact")
+            console.print(f"  Saved: {cache_file}")
+            if high_impact:
+                for evt in high_impact[:10]:
+                    console.print(f"    {evt.get('time', '')} {evt.get('currency', '')} {evt.get('event', '')} [{evt.get('impact', '')}]")
+            return
+        else:
+            console.print(f"  MT5 calendar: 0 events (may not be supported on this broker)")
+    except Exception as e:
+        console.print(f"  [yellow]MT5 calendar: {e}[/yellow]")
+
+    # Method 2: Forex Factory
+    console.print(f"\n  [bold]Forex Factory (fallback)[/bold]")
+    try:
+        from .data.news import ForexFactoryCalendar
+        ff = ForexFactoryCalendar()
+        events = ff.get_events(start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"), currencies=["USD", "EUR", "GBP"])
+        if events:
+            console.print(f"  Forex Factory: {len(events)} events")
+            return
+        else:
+            console.print(f"  [yellow]Forex Factory: 0 events (page is JS-rendered)[/yellow]")
+    except Exception as e:
+        console.print(f"  [yellow]Forex Factory: {e}[/yellow]")
+
+    console.print(f"\n[yellow]No news data available from either source.[/yellow]")
+    console.print(f"[yellow]The bot will trade without news awareness.[/yellow]")
+
+
 @app.command()
 def doctor():
     """Check dependencies and environment."""
