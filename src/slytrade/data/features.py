@@ -1041,36 +1041,17 @@ def _add_supply_demand_zones(df: pd.DataFrame) -> None:
 
 
 def _add_atr_regime(df: pd.DataFrame, cfg: FeatureConfig) -> None:
-    """ATR percentile rank — is current volatility high or low relative to history?
+    """ATR percentile rank — fully vectorized, no per-row loops.
 
-    Features:
-    - atr_pct_rank: 0-1 percentile rank of current ATR vs rolling 252-bar window
-    - atr_expanding: bool — ATR > 1.2x its 20-bar SMA (volatility expanding)
-    - atr_contracting: bool — ATR < 0.8x its 20-bar SMA (volatility contracting)
-
-    Uses vectorized numpy — no rolling().apply(lambda) which OOMs on 1.77M rows.
+    Uses pandas rolling min/max which is implemented in C — fast and memory-efficient.
     """
     atr = df.get("atr_14", pd.Series(1.0, index=df.index)).values.astype(np.float64)
     atr = np.where(np.isnan(atr) | (atr <= 0), 1.0, atr)
-    n = len(atr)
 
-    # SMA20 via cumsum trick (O(n), no rolling)
-    cs = np.cumsum(np.insert(atr, 0, 0))
-    sma20 = np.ones(n)
-    for i in range(n):
-        start = max(0, i - 19)
-        sma20[i] = (cs[i + 1] - cs[start]) / (i - start + 1)
-
-    # Percentile rank: approximate using rolling min/max
-    # rank ≈ (current - rolling_min) / (rolling_max - rolling_min)
-    window = 252
-    rmin = np.ones(n)
-    rmax = np.ones(n)
-    for i in range(n):
-        start = max(0, i - window + 1)
-        chunk = atr[start:i + 1]
-        rmin[i] = np.min(chunk)
-        rmax[i] = np.max(chunk)
+    atr_s = pd.Series(atr)
+    sma20 = atr_s.rolling(20, min_periods=1).mean().values
+    rmin = atr_s.rolling(252, min_periods=1).min().values
+    rmax = atr_s.rolling(252, min_periods=1).max().values
     spread = rmax - rmin
     spread[spread <= 0] = 1.0
     pct_rank = (atr - rmin) / spread
@@ -1098,8 +1079,10 @@ def process_bars(
     """
     if progress:
         progress(f"    {timeframe}: preparing ...")
+    import warnings
+    warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*All-NaN.*")
     cfg = cfg or DEFAULT_CONFIG
-    out = df.copy().reset_index(drop=True)
+    out = df.reset_index(drop=True)  # no .copy() — work in place to save memory
     for col in ("open", "high", "low", "close"):
         out[col] = out[col].astype(np.float64)
     out["tick_volume"] = pd.to_numeric(out["tick_volume"], errors="coerce").fillna(0).astype(np.float64)

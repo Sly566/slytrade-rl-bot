@@ -253,9 +253,12 @@ def process(
 
         # Compute features (with tick data for M1)
         console.print(f"    Computing features...")
+        import gc
         tick_dir = Path(raw_root) / "mt5_ticks" / f"symbol={symbol}" if tf == "M1" else None
+        gc.collect()  # free memory before heavy computation
         processed = process_bars(df, tf, DEFAULT_CONFIG, tick_dir=tick_dir)
-        del df  # free memory
+        del df
+        gc.collect()  # free original df memory
 
         elapsed = time.time() - t0
 
