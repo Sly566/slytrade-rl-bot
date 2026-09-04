@@ -348,6 +348,38 @@ class LiveTrader:
         self._last_broker_pos: dict[int, dict] = {}  # snapshot for P&L diffing
         self._wins_count: int = 0
         self._last_atr: float = 0.0  # cached ATR for intra-bar trailing stop
+        self._rl_filter = None  # Optional RL model filter
+
+    def _build_rl_obs(self, sig=None) -> "np.ndarray":
+        """Build RL observation vector from current live state."""
+        import numpy as np
+        from ..rl.env import _safe_from_row
+        # Get latest M1 bar from trader state
+        row = {}
+        if hasattr(self, '_last_m1_row'):
+            row = self._last_m1_row
+        elif sig:
+            row = {"close": getattr(sig, 'entry', 0), "atr_14": getattr(sig, 'atr_at_entry', 0),
+                   "time": getattr(sig, 'time', None)}
+        # Get position state
+        our = self._our_open_positions()
+        pos_dir = 0
+        pos_entry = 0.0
+        pos_risk = 0.0
+        pos_bars = 0
+        if our:
+            for tkt, pos in list(our.items())[:1]:
+                pos_dir = 1 if int(pos.get("type", 0)) == 0 else -1
+                pos_entry = float(pos.get("price_open", 0))
+                pos_risk = abs(float(pos.get("sl", 0)) - pos_entry) if pos.get("sl") else 0
+                break
+        acct = self.account()
+        return _safe_from_row(
+            row, pos_dir=pos_dir, pos_entry=pos_entry, pos_risk=pos_risk,
+            pos_bars=pos_bars, equity=float(acct.get("equity", 2000)),
+            peak_equity=float(acct.get("equity", 2000)),
+            starting_equity=self._starting_balance or 2000.0,
+        )
 
     # ------------------------------------------------------------------ #
     # Account info
@@ -922,6 +954,29 @@ class LiveTrader:
             self._vlog(f"{side} {setup} blocked by accept_shorts=False"); self._signals_fired.add(key); return
         if sig.direction == 1 and not self.cfg.confluence.accept_longs:
             self._vlog(f"{side} {setup} blocked by accept_longs=False"); self._signals_fired.add(key); return
+
+        # --- RL filter (if model loaded) ---
+        if self._rl_filter is not None:
+            try:
+                obs = self._build_rl_obs(sig)
+                if hasattr(self._rl_filter, 'should_skip') and hasattr(self._rl_filter, 'explain'):
+                    # MultiAgentFilter returns (skip, explanation)
+                    skip, explanation = self._rl_filter.should_skip(obs, sig.direction)
+                    if skip:
+                        self._vlog(f"RL filter: SKIP {side} {setup} — {explanation.get('reasoning', '')}")
+                        self._signals_fired.add(key)
+                        return
+                    else:
+                        self._vlog(f"RL filter: TAKE {side} {setup} — {explanation.get('reasoning', '')}")
+                else:
+                    # SB3 RLFilter
+                    skip = self._rl_filter.should_skip(obs, sig.direction)
+                    if skip:
+                        self._vlog(f"RL filter: SKIP {side} {setup}")
+                        self._signals_fired.add(key)
+                        return
+            except Exception as e:
+                self._vlog(f"RL filter error: {e} — proceeding with signal")
 
         # --- Netting mode: flip on direction change, scale into winners ---
         # Close opposite-direction positions before opening new one.

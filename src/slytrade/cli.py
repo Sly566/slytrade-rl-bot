@@ -785,6 +785,8 @@ def backtest(
     usd_zar: float = typer.Option(18.5, "--usd-zar"),
     output: str = typer.Option("data/backtest", "--output", "-o"),
     unrestricted: bool = typer.Option(False, "--all", help="All signals (unrestricted persona)"),
+    model: str = typer.Option("", "--model", "-m", help="Path to trained RL model (multi-agent .pt or SB3 .zip)"),
+    algo: str = typer.Option("multi", "--algo", help="Algorithm: multi, ppo, sac, a2c"),
 ):
     """Run backtest using the same engine as live trading.
 
@@ -842,6 +844,19 @@ def backtest(
         starting_equity=equity, currency="ZAR", leverage=2000,
         fx_to_account={"USD": usd_zar},
     )
+
+    # Load RL model if specified
+    rl_filter = None
+    if model:
+        console.print(f"  Loading RL model: {model}")
+        if algo == "multi":
+            from .rl.serve import MultiAgentFilter
+            rl_filter = MultiAgentFilter(model)
+            console.print(f"  Multi-agent model loaded ({rl_filter.ensemble.total_parameters:,} params)")
+        else:
+            from .rl.serve import RLFilter
+            rl_filter = RLFilter(model, algo=algo)
+            console.print(f"  SB3 model loaded ({algo.upper()})")
 
     # Walk bars exactly like live
     console.print(f"\n  Walking {len(df):,} bars...")
@@ -1067,6 +1082,8 @@ def live(
     leverage: int = typer.Option(2000, "--leverage"),
     verbose: bool = typer.Option(False, "--verbose"),
     unrestricted: bool = typer.Option(False, "--all"),
+    model: str = typer.Option("", "--model", "-m", help="Path to trained RL model"),
+    algo: str = typer.Option("multi", "--algo", help="Algorithm: multi, ppo, sac, a2c"),
 ):
     """Run live trading loop (dry-run or real money).
 
@@ -1108,6 +1125,18 @@ def live(
         live=live_mode, risk_cap=risk_cap, working_lot=working_lot,
         max_open=max_open, verbose=verbose, stop_level_pts=stop_level_pts,
     )
+
+    # Load RL model if specified
+    if model:
+        console.print(f"  Loading RL model: {model}")
+        if algo == "multi":
+            from .rl.serve import MultiAgentFilter
+            trader._rl_filter = MultiAgentFilter(model)
+            console.print(f"  Multi-agent RL filter active ({trader._rl_filter.ensemble.total_parameters:,} params)")
+        else:
+            from .rl.serve import RLFilter
+            trader._rl_filter = RLFilter(model, algo=algo)
+            console.print(f"  SB3 RL filter active ({algo.upper()})")
     try:
         trader.run()
     finally:
@@ -1144,17 +1173,14 @@ def news(
     out_dir = Path(output)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Method 1: MT5 calendar
-    console.print(f"\n  [bold]MT5 Economic Calendar[/bold]")
+    # Method 1: faireconomy.media
+    console.print(f"\n  [bold]News Sources[/bold]")
     try:
-        from .live.trader import connect_mt5
-        from .data.news import collect_news_from_mt5
-        mt5 = connect_mt5(host, port)
-        console.print(f"  MT5 bridge connected")
-        events = collect_news_from_mt5(mt5, start, end)
-        mt5.shutdown()
+        from .data.news import collect_news_from_faireconomy
+        console.print(f"  faireconomy.media ({news_start} to {news_end})...")
+        events = collect_news_from_faireconomy(start, end, currencies=["USD", "EUR", "GBP", "XAU"])
         if events:
-            cache_file = out_dir / f"mt5_calendar_{start.strftime('%Y%m')}_{end.strftime('%Y%m')}.json"
+            cache_file = out_dir / f"news_{start.strftime('%Y%m')}_{end.strftime('%Y%m')}.json"
             with open(cache_file, "w") as f:
                 _json.dump(events, f, indent=2, default=str)
             high_impact = [e for e in events if e.get("impact", "").lower() in ("high", "red")]
