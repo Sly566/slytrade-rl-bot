@@ -90,6 +90,73 @@ KNOWN_HIGH_IMPACT = {
 
 
 # ---------------------------------------------------------------------------
+# faireconomy.media JSON API (free, mirrors ForexFactory)
+# ---------------------------------------------------------------------------
+
+def collect_news_from_faireconomy(start, end, currencies=None) -> list[dict]:
+    """Collect economic events from faireconomy.media JSON API.
+
+    Free, public JSON feed mirroring ForexFactory data. No API key.
+    Fetches week by week.
+    """
+    import json as _json
+    import ssl
+    import urllib.request
+    from datetime import timedelta
+
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    opener = urllib.request.build_opener()
+    opener.addheaders = [("User-agent", "Mozilla/5.0")]
+
+    events = []
+    current = start - timedelta(days=start.weekday())
+
+    while current <= end:
+        week_str = current.strftime("%b%d.%Y").lower()
+        url = f"https://nfs.faireconomy.media/ff_calendar_{week_str}.json"
+        try:
+            response = opener.open(url, timeout=15)
+            data = _json.loads(response.read().decode("utf-8"))
+            if data and isinstance(data, list):
+                for item in data:
+                    evt = {
+                        "time": item.get("date", ""),
+                        "currency": item.get("country", ""),
+                        "event": item.get("title", ""),
+                        "impact": item.get("impact", "Low"),
+                        "actual": str(item.get("actual", "")),
+                        "forecast": str(item.get("forecast", "")),
+                        "previous": str(item.get("previous", "")),
+                        "source": "faireconomy",
+                    }
+                    events.append(evt)
+        except Exception:
+            pass
+        current += timedelta(days=7)
+
+    if currencies:
+        currencies_upper = [c.upper() for c in currencies]
+        events = [e for e in events if e.get("currency", "").upper() in currencies_upper + ["ALL"]]
+
+    filtered = []
+    for e in events:
+        try:
+            evt_time = pd.Timestamp(e["time"])
+            if evt_time.tzinfo is None:
+                evt_time = evt_time.tz_localize("UTC")
+            _start = start.tz_localize("UTC") if start.tzinfo is None else start
+            _end = end.tz_localize("UTC") if end.tzinfo is None else end
+            if _start <= evt_time <= _end:
+                filtered.append(e)
+        except Exception:
+            filtered.append(e)
+
+    return filtered
+
+
+# ---------------------------------------------------------------------------
 # MT5 Economic Calendar (primary source — already connected)
 # ---------------------------------------------------------------------------
 def collect_news_from_mt5(mt5, start, end) -> list[dict]:

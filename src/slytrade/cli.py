@@ -125,19 +125,21 @@ def collect(
     # Phase 3: News calendar
     console.print(f"\n  [bold]Phase 3: News Calendar[/bold]")
     news_collected = False
+
+    # Method 1: faireconomy.media (free JSON, mirrors ForexFactory)
     try:
-        from .data.news import collect_news_from_mt5
-        console.print(f"    MT5 economic calendar ({start.strftime('%Y-%m-%d')} to {end.strftime('%Y-%m-%d')})...")
-        mt5_events = collect_news_from_mt5(mt5, start, end)
-        if mt5_events:
+        from .data.news import collect_news_from_faireconomy
+        console.print(f"    faireconomy.media ({start.strftime('%Y-%m-%d')} to {end.strftime('%Y-%m-%d')})...")
+        fe_events = collect_news_from_faireconomy(start, end, currencies=["USD", "EUR", "GBP", "XAU"])
+        if fe_events:
             import json as _json
             news_dir = Path(output) / "news"
             news_dir.mkdir(parents=True, exist_ok=True)
-            cache_file = news_dir / f"mt5_calendar_{start.strftime('%Y%m')}_{end.strftime('%Y%m')}.json"
+            cache_file = news_dir / f"news_{start.strftime('%Y%m')}_{end.strftime('%Y%m')}.json"
             with open(cache_file, "w") as f:
-                _json.dump(mt5_events, f, indent=2, default=str)
-            high_impact = [e for e in mt5_events if e.get("impact", "").lower() in ("high", "red")]
-            console.print(f"    MT5 News: {len(mt5_events):,} events, {len(high_impact):,} high-impact")
+                _json.dump(fe_events, f, indent=2, default=str)
+            high_impact = [e for e in fe_events if e.get("impact", "").lower() in ("high", "red")]
+            console.print(f"    News: {len(fe_events):,} events, {len(high_impact):,} high-impact")
             if high_impact:
                 for evt in high_impact[:5]:
                     console.print(f"      {evt.get('time', '')} {evt.get('currency', '')} {evt.get('event', '')}")
@@ -145,28 +147,33 @@ def collect(
                     console.print(f"      ... and {len(high_impact) - 5} more")
             news_collected = True
         else:
-            console.print(f"    MT5 calendar: no events returned")
+            console.print(f"    faireconomy.media: 0 events for this period")
     except Exception as e:
-        console.print(f"    [yellow]MT5 calendar not available: {e}[/yellow]")
+        console.print(f"    [yellow]faireconomy.media: {e}[/yellow]")
 
-    # Fallback: Forex Factory scraping
+    # Method 2: MT5 calendar fallback
     if not news_collected:
         try:
-            from .data.news import ForexFactoryCalendar
-            ff = ForexFactoryCalendar()
-            console.print(f"    Trying Forex Factory scraping...")
-            events = ff.get_events(start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"), currencies=["USD", "EUR", "GBP"])
-            if events:
-                console.print(f"    Forex Factory: {len(events)} events")
+            from .data.news import collect_news_from_mt5
+            console.print(f"    MT5 economic calendar...")
+            mt5_events = collect_news_from_mt5(mt5, start, end)
+            if mt5_events:
+                import json as _json
+                news_dir = Path(output) / "news"
+                news_dir.mkdir(parents=True, exist_ok=True)
+                cache_file = news_dir / f"mt5_calendar_{start.strftime('%Y%m')}_{end.strftime('%Y%m')}.json"
+                with open(cache_file, "w") as f:
+                    _json.dump(mt5_events, f, indent=2, default=str)
+                high_impact = [e for e in mt5_events if e.get("impact", "").lower() in ("high", "red")]
+                console.print(f"    MT5 News: {len(mt5_events):,} events, {len(high_impact):,} high-impact")
                 news_collected = True
             else:
-                console.print(f"    [yellow]Forex Factory: 0 events (JS-rendered page)[/yellow]")
+                console.print(f"    MT5 calendar: no events")
         except Exception as e:
-            console.print(f"    [yellow]Forex Factory failed: {e}[/yellow]")
+            console.print(f"    [yellow]MT5 calendar: {e}[/yellow]")
 
     if not news_collected:
-        console.print(f"    [yellow]No news data collected. News features will default to zeros.[/yellow]")
-        console.print(f"    [yellow]The bot will trade without news awareness.[/yellow]")
+        console.print(f"    [yellow]No news data. News features will be zeros.[/yellow]")
 
     # Summary
     console.print(f"\n[green]Collection complete: {total_rows:,} total rows[/green]")
