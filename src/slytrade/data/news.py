@@ -113,9 +113,14 @@ def collect_news_from_faireconomy(start, end, currencies=None) -> list[dict]:
     events = []
     current = start - timedelta(days=start.weekday())
 
-    while current <= end:
-        week_str = current.strftime("%b%d.%Y").lower()
-        url = f"https://nfs.faireconomy.media/ff_calendar_{week_str}.json"
+    # faireconomy.media only has current/next/last week — no historical data.
+    # Fetch what's available and cache it. Historical bars will have zeros.
+    urls_to_try = [
+        "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+        "https://nfs.faireconomy.media/ff_calendar_nextweek.json",
+        "https://nfs.faireconomy.media/ff_calendar_lastweek.json",
+    ]
+    for url in urls_to_try:
         try:
             response = opener.open(url, timeout=15)
             data = _json.loads(response.read().decode("utf-8"))
@@ -134,7 +139,6 @@ def collect_news_from_faireconomy(start, end, currencies=None) -> list[dict]:
                     events.append(evt)
         except Exception:
             pass
-        current += timedelta(days=7)
 
     if currencies:
         currencies_upper = [c.upper() for c in currencies]

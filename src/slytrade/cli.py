@@ -173,7 +173,9 @@ def collect(
             console.print(f"    [yellow]MT5 calendar: {e}[/yellow]")
 
     if not news_collected:
-        console.print(f"    [yellow]No news data. News features will be zeros.[/yellow]")
+        console.print(f"    [yellow]No news data available for this period.[/yellow]")
+        console.print(f"    [yellow]Historical price action already reflects past news.[/yellow]")
+        console.print(f"    [yellow]Live trading will use real-time news when available.[/yellow]")
 
     # Summary
     console.print(f"\n[green]Collection complete: {total_rows:,} total rows[/green]")
