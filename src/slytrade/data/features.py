@@ -874,7 +874,7 @@ def _add_zone_proximity(df: pd.DataFrame) -> None:
     dist_bull_ob = np.abs(close - bull_ob_mid) / atr
     dist_bear_ob = np.abs(close - bear_ob_mid) / atr
     # Nearest OB (either direction)
-    ob_proximity = np.nanmin(np.column_stack([dist_bull_ob, dist_bear_ob]), axis=1)
+    with np.errstate(all="ignore"): ob_proximity = np.nanmin(np.column_stack([dist_bull_ob, dist_bear_ob]), axis=1)
     ob_proximity = np.where(np.isnan(ob_proximity), 10.0, ob_proximity)  # 10 = far away
     ob_proximity = np.clip(ob_proximity, 0.0, 10.0)
 
@@ -898,7 +898,7 @@ def _add_zone_proximity(df: pd.DataFrame) -> None:
     )
     dist_bull_fvg = np.abs(close - bull_fvg_mid) / atr
     dist_bear_fvg = np.abs(close - bear_fvg_mid) / atr
-    fvg_proximity = np.nanmin(np.column_stack([dist_bull_fvg, dist_bear_fvg]), axis=1)
+    with np.errstate(all="ignore"): fvg_proximity = np.nanmin(np.column_stack([dist_bull_fvg, dist_bear_fvg]), axis=1)
     fvg_proximity = np.where(np.isnan(fvg_proximity), 10.0, fvg_proximity)
     fvg_proximity = np.clip(fvg_proximity, 0.0, 10.0)
 
@@ -907,7 +907,7 @@ def _add_zone_proximity(df: pd.DataFrame) -> None:
     bear_sweep_px = df.get("bear_sweep_px", pd.Series(np.nan, index=df.index)).values
     dist_bull_sweep = np.abs(close - bull_sweep_px) / atr
     dist_bear_sweep = np.abs(close - bear_sweep_px) / atr
-    sweep_proximity = np.nanmin(np.column_stack([dist_bull_sweep, dist_bear_sweep]), axis=1)
+    with np.errstate(all="ignore"): sweep_proximity = np.nanmin(np.column_stack([dist_bull_sweep, dist_bear_sweep]), axis=1)
     sweep_proximity = np.where(np.isnan(sweep_proximity), 10.0, sweep_proximity)
     sweep_proximity = np.clip(sweep_proximity, 0.0, 10.0)
 
@@ -918,82 +918,72 @@ def _add_zone_proximity(df: pd.DataFrame) -> None:
 
 
 def _add_sr_zones(df: pd.DataFrame, cfg: FeatureConfig) -> None:
-    """Compute Support/Resistance zones from swing pivots.
+    """Compute Support/Resistance zones — fully vectorized numpy.
 
-    Uses the minor and major swing highs/lows to identify key S/R levels.
-    - sr_support: nearest support level below current price (from swing lows)
-    - sr_resistance: nearest resistance level above current price (from swing highs)
-    - sr_support_dist: distance to support / ATR
-    - sr_resistance_dist: distance to resistance / ATR
-    - sr_count_support: number of support levels within 3 ATR (confluence)
-    - sr_count_resistance: number of resistance levels within 3 ATR
-    - at_support: bool — price is within 0.3 ATR of support
-    - at_resistance: bool — price is within 0.3 ATR of resistance
+    Uses swing lows as support, swing highs as resistance,
+    plus OB edges as additional S/R levels.
     """
     close = df["close"].values
     n = len(df)
     atr = df.get("atr_14", pd.Series(1.0, index=df.index)).values
     atr = np.where(np.isnan(atr) | (atr <= 0), 1.0, atr)
 
-    # Collect swing low/high prices as support/resistance
-    sl_cols = [c for c in df.columns if "swing_low" in c and "idx" not in c and c.endswith("_price") or c == "swing_low"]
-    sh_cols = [c for c in df.columns if "swing_high" in c and "idx" not in c and c.endswith("_price") or c == "swing_high"]
+    # Gather all support levels (swing lows + OB bottoms) as 2D array
+    support_candidates = []
+    for col in df.columns:
+        if ("swing_low" in col and "idx" not in col) or col in ("bull_ob_bottom", "bear_ob_bottom"):
+            vals = df[col].values if col in df.columns else np.full(n, np.nan)
+            support_candidates.append(vals)
+    # Also add FVG bottoms as support
+    for col in ("bull_fvg_bottom", "bear_fvg_bottom"):
+        if col in df.columns:
+            support_candidates.append(df[col].values)
 
-    # Also use generic swing columns if specific ones don't exist
-    if not sl_cols:
-        sl_cols = [c for c in df.columns if c in ("swing_low", "minor_swing_low", "major_swing_low")]
-    if not sh_cols:
-        sh_cols = [c for c in df.columns if c in ("swing_high", "minor_swing_high", "major_swing_high")]
+    resistance_candidates = []
+    for col in df.columns:
+        if ("swing_high" in col and "idx" not in col) or col in ("bull_ob_top", "bear_ob_top"):
+            vals = df[col].values if col in df.columns else np.full(n, np.nan)
+            resistance_candidates.append(vals)
+    for col in ("bull_fvg_top", "bear_fvg_top"):
+        if col in df.columns:
+            resistance_candidates.append(df[col].values)
 
-    # Fallback: use OB/FVG edges as S/R levels too
-    sr_support = np.full(n, np.nan)
-    sr_resistance = np.full(n, np.nan)
-    sr_support_dist = np.full(n, 10.0)
-    sr_resistance_dist = np.full(n, 10.0)
-    sr_count_support = np.zeros(n)
-    sr_count_resistance = np.zeros(n)
+    if not support_candidates:
+        df["sr_support"] = np.nan
+        df["sr_resistance"] = np.nan
+        df["sr_support_dist"] = 10.0
+        df["sr_resistance_dist"] = 10.0
+        df["sr_support_count"] = 0.0
+        df["sr_resistance_count"] = 0.0
+        df["at_support"] = False
+        df["at_resistance"] = False
+        return
 
-    for i in range(n):
-        supports = []
-        resistances = []
+    sup_arr = np.column_stack(support_candidates) if len(support_candidates) > 1 else support_candidates[0].reshape(-1, 1)
+    res_arr = np.column_stack(resistance_candidates) if len(resistance_candidates) > 1 else resistance_candidates[0].reshape(-1, 1)
 
-        # Swing lows = support
-        for col in sl_cols:
-            if col in df.columns:
-                val = df[col].iloc[i]
-                if not np.isnan(val) and val > 0:
-                    supports.append(val)
+    # For each bar, find nearest support below price and nearest resistance above
+    close_2d = close.reshape(-1, 1)
 
-        # Swing highs = resistance
-        for col in sh_cols:
-            if col in df.columns:
-                val = df[col].iloc[i]
-                if not np.isnan(val) and val > 0:
-                    resistances.append(val)
+    # Support: values < close, pick the max (nearest below)
+    below_mask = (sup_arr < close_2d) & np.isfinite(sup_arr)
+    sup_below = np.where(below_mask, sup_arr, -np.inf)
+    sr_support = np.max(sup_below, axis=1)
+    sr_support[~np.isfinite(sr_support)] = np.nan
 
-        # OB edges as S/R
-        for col in ("bull_ob_bottom", "bear_ob_bottom"):
-            val = df.get(col, pd.Series(np.nan, index=df.index)).iloc[i]
-            if not np.isnan(val) and val > 0:
-                supports.append(val)
-        for col in ("bull_ob_top", "bear_ob_top"):
-            val = df.get(col, pd.Series(np.nan, index=df.index)).iloc[i]
-            if not np.isnan(val) and val > 0:
-                resistances.append(val)
+    # Resistance: values > close, pick the min (nearest above)
+    above_mask = (res_arr > close_2d) & np.isfinite(res_arr)
+    res_above = np.where(above_mask, res_arr, np.inf)
+    sr_resistance = np.min(res_above, axis=1)
+    sr_resistance[~np.isfinite(sr_resistance)] = np.nan
 
-        # Nearest support below price
-        below = [s for s in supports if s < close[i]]
-        above = [r for r in resistances if r > close[i]]
+    # Distances normalized by ATR
+    sr_support_dist = np.where(np.isfinite(sr_support), (close - sr_support) / atr, 10.0)
+    sr_resistance_dist = np.where(np.isfinite(sr_resistance), (sr_resistance - close) / atr, 10.0)
 
-        if below:
-            sr_support[i] = max(below)  # nearest = highest below
-            sr_support_dist[i] = (close[i] - sr_support[i]) / atr[i]
-            sr_count_support[i] = sum(1 for s in below if (close[i] - s) / atr[i] < 3.0)
-
-        if above:
-            sr_resistance[i] = min(above)  # nearest = lowest above
-            sr_resistance_dist[i] = (sr_resistance[i] - close[i]) / atr[i]
-            sr_count_resistance[i] = sum(1 for r in above if (r - close[i]) / atr[i] < 3.0)
+    # Confluence count: how many levels within 3 ATR
+    sr_count_support = np.sum(below_mask & ((close_2d - sup_arr) / atr.reshape(-1, 1) < 3.0), axis=1).astype(float)
+    sr_count_resistance = np.sum(above_mask & ((res_arr - close_2d) / atr.reshape(-1, 1) < 3.0), axis=1).astype(float)
 
     df["sr_support"] = sr_support
     df["sr_resistance"] = sr_resistance
@@ -1006,94 +996,69 @@ def _add_sr_zones(df: pd.DataFrame, cfg: FeatureConfig) -> None:
 
 
 def _add_supply_demand_zones(df: pd.DataFrame) -> None:
-    """Identify Supply/Demand zones from OB + FVG + sweep confluence.
+    """Identify Supply/Demand zones — fully vectorized numpy.
 
-    A Demand zone = area where buyers stepped in strongly (bull OB + bull FVG + sweep)
-    A Supply zone = area where sellers stepped in strongly (bear OB + bear FVG + sweep)
-
-    Features:
-    - in_demand_zone: bool — price is in an active demand zone
-    - in_supply_zone: bool — price is in an active supply zone
-    - demand_zone_strength: 0-3 score (how many confirmations: OB+FVG+sweep)
-    - supply_zone_strength: 0-3 score
-    - demand_zone_dist: distance to nearest demand zone center / ATR
-    - supply_zone_dist: distance to nearest supply zone center / ATR
+    A Demand zone = bull OB + bull FVG + sweep confluence (buyers)
+    A Supply zone = bear OB + bear FVG + sweep confluence (sellers)
     """
     close = df["close"].values
     n = len(df)
     atr = df.get("atr_14", pd.Series(1.0, index=df.index)).values
     atr = np.where(np.isnan(atr) | (atr <= 0), 1.0, atr)
 
-    # Demand zone: bull OB + bull FVG overlap + bull sweep nearby
-    bull_ob_top = df.get("bull_ob_top", pd.Series(np.nan, index=df.index)).values
-    bull_ob_bot = df.get("bull_ob_bottom", pd.Series(np.nan, index=df.index)).values
-    bull_ob_mit = df.get("bull_ob_mitigated", pd.Series(True, index=df.index)).values
-    bull_fvg_top = df.get("bull_fvg_top", pd.Series(np.nan, index=df.index)).values
-    bull_fvg_bot = df.get("bull_fvg_bottom", pd.Series(np.nan, index=df.index)).values
-    bull_fvg_mit = df.get("bull_fvg_mitigated", pd.Series(True, index=df.index)).values
-    bull_sweep = df.get("bull_liq_sweep", pd.Series(False, index=df.index)).values
+    def _col(key, default=np.nan):
+        return df.get(key, pd.Series(default, index=df.index)).values
 
-    bear_ob_top = df.get("bear_ob_top", pd.Series(np.nan, index=df.index)).values
-    bear_ob_bot = df.get("bear_ob_bottom", pd.Series(np.nan, index=df.index)).values
-    bear_ob_mit = df.get("bear_ob_mitigated", pd.Series(True, index=df.index)).values
-    bear_fvg_top = df.get("bear_fvg_top", pd.Series(np.nan, index=df.index)).values
-    bear_fvg_bot = df.get("bear_fvg_bottom", pd.Series(np.nan, index=df.index)).values
-    bear_fvg_mit = df.get("bear_fvg_mitigated", pd.Series(True, index=df.index)).values
-    bear_sweep = df.get("bear_liq_sweep", pd.Series(False, index=df.index)).values
+    # Demand strength: count of active bull confirmations
+    bull_ob_active = (~_col("bull_ob_mitigated", True).astype(bool) &
+                      np.isfinite(_col("bull_ob_top"))).astype(float)
+    bull_fvg_active = (~_col("bull_fvg_mitigated", True).astype(bool) &
+                       np.isfinite(_col("bull_fvg_top"))).astype(float)
+    bull_sweep = _col("bull_liq_sweep", False).astype(float)
+    demand_strength = bull_ob_active + bull_fvg_active + bull_sweep
 
-    in_demand = np.zeros(n, dtype=bool)
-    in_supply = np.zeros(n, dtype=bool)
-    demand_strength = np.zeros(n, dtype=np.float64)
-    supply_strength = np.zeros(n, dtype=np.float64)
-    demand_dist = np.full(n, 10.0)
-    supply_dist = np.full(n, 10.0)
+    # Demand zone boundaries: union of bull OB and bull FVG
+    d_top = np.nanmax(np.column_stack([
+        np.where(bull_ob_active, _col("bull_ob_top"), np.nan),
+        np.where(bull_fvg_active, _col("bull_fvg_top"), np.nan),
+    ]), axis=1)
+    d_bot = np.nanmin(np.column_stack([
+        np.where(bull_ob_active, _col("bull_ob_bottom"), np.nan),
+        np.where(bull_fvg_active, _col("bull_fvg_bottom"), np.nan),
+    ]), axis=1)
 
-    for i in range(n):
-        price = close[i]
+    in_demand = ((demand_strength > 0) & np.isfinite(d_top) & np.isfinite(d_bot) &
+                 (d_bot <= close) & (close <= d_top))
+    demand_dist = np.where(
+        np.isfinite(d_top) & np.isfinite(d_bot),
+        np.abs(close - (d_top + d_bot) / 2.0) / atr,
+        10.0
+    )
 
-        # Demand zone check
-        d_strength = 0
-        d_top, d_bot = np.nan, np.nan
-        if not bull_ob_mit[i] and not np.isnan(bull_ob_top[i]):
-            d_strength += 1
-            d_top, d_bot = bull_ob_top[i], bull_ob_bot[i]
-        if not bull_fvg_mit[i] and not np.isnan(bull_fvg_top[i]):
-            d_strength += 1
-            if np.isnan(d_top):
-                d_top, d_bot = bull_fvg_top[i], bull_fvg_bot[i]
-            else:
-                d_top = max(d_top, bull_fvg_top[i])
-                d_bot = min(d_bot, bull_fvg_bot[i])
-        if bull_sweep[i]:
-            d_strength += 1
+    # Supply strength
+    bear_ob_active = (~_col("bear_ob_mitigated", True).astype(bool) &
+                      np.isfinite(_col("bear_ob_top"))).astype(float)
+    bear_fvg_active = (~_col("bear_fvg_mitigated", True).astype(bool) &
+                       np.isfinite(_col("bear_fvg_top"))).astype(float)
+    bear_sweep = _col("bear_liq_sweep", False).astype(float)
+    supply_strength = bear_ob_active + bear_fvg_active + bear_sweep
 
-        demand_strength[i] = d_strength
-        if d_strength > 0 and not np.isnan(d_top):
-            if d_bot <= price <= d_top:
-                in_demand[i] = True
-            demand_dist[i] = abs(price - (d_top + d_bot) / 2.0) / atr[i]
+    s_top = np.nanmax(np.column_stack([
+        np.where(bear_ob_active, _col("bear_ob_top"), np.nan),
+        np.where(bear_fvg_active, _col("bear_fvg_top"), np.nan),
+    ]), axis=1)
+    s_bot = np.nanmin(np.column_stack([
+        np.where(bear_ob_active, _col("bear_ob_bottom"), np.nan),
+        np.where(bear_fvg_active, _col("bear_fvg_bottom"), np.nan),
+    ]), axis=1)
 
-        # Supply zone check
-        s_strength = 0
-        s_top, s_bot = np.nan, np.nan
-        if not bear_ob_mit[i] and not np.isnan(bear_ob_top[i]):
-            s_strength += 1
-            s_top, s_bot = bear_ob_top[i], bear_ob_bot[i]
-        if not bear_fvg_mit[i] and not np.isnan(bear_fvg_top[i]):
-            s_strength += 1
-            if np.isnan(s_top):
-                s_top, s_bot = bear_fvg_top[i], bear_fvg_bot[i]
-            else:
-                s_top = max(s_top, bear_fvg_top[i])
-                s_bot = min(s_bot, bear_fvg_bot[i])
-        if bear_sweep[i]:
-            s_strength += 1
-
-        supply_strength[i] = s_strength
-        if s_strength > 0 and not np.isnan(s_top):
-            if s_bot <= price <= s_top:
-                in_supply[i] = True
-            supply_dist[i] = abs(price - (s_top + s_bot) / 2.0) / atr[i]
+    in_supply = ((supply_strength > 0) & np.isfinite(s_top) & np.isfinite(s_bot) &
+                 (s_bot <= close) & (close <= s_top))
+    supply_dist = np.where(
+        np.isfinite(s_top) & np.isfinite(s_bot),
+        np.abs(close - (s_top + s_bot) / 2.0) / atr,
+        10.0
+    )
 
     df["in_demand_zone"] = in_demand
     df["in_supply_zone"] = in_supply

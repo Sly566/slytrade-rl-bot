@@ -51,7 +51,12 @@ def load_tick_data(tick_dir: Path, start: pd.Timestamp, end: pd.Timestamp) -> pd
             year = int(gparent.name.replace("year=", ""))
             month = int(parent.name.replace("month=", ""))
             day = int(parts.replace("day=", ""))
-            file_date = pd.Timestamp(year=year, month=month, day=day)
+            file_date = pd.Timestamp(year=year, month=month, day=day, tz="UTC")
+            # Ensure start/end are tz-aware for comparison
+            if start.tzinfo is None:
+                start = start.tz_localize("UTC")
+            if end.tzinfo is None:
+                end = end.tz_localize("UTC")
             # Include files within range + 1 day buffer on each side
             if (start - pd.Timedelta(days=1)) <= file_date <= (end + pd.Timedelta(days=1)):
                 relevant_files.append(f)
@@ -108,7 +113,10 @@ def compute_tick_features(
     start = m1_bars["time"].min()
     end = m1_bars["time"].max()
 
-    ticks = load_tick_data(tick_dir, start, end)
+    try:
+        ticks = load_tick_data(tick_dir, start, end)
+    except Exception:
+        return _empty_tick_features(m1_bars)
     if ticks.empty:
         return _empty_tick_features(m1_bars)
 

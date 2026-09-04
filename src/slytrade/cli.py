@@ -122,6 +122,26 @@ def collect(
 
     mt5.shutdown()
 
+    # Phase 3: News calendar (Forex Factory)
+    console.print(f"\n  [bold]Phase 3: News Calendar (Forex Factory)[/bold]")
+    try:
+        from .data.news import ForexFactoryCalendar
+        ff = ForexFactoryCalendar()
+        news_start = start.strftime("%Y-%m-%d")
+        news_end = end.strftime("%Y-%m-%d")
+        console.print(f"    Scraping Forex Factory calendar ({news_start} to {news_end})...")
+        events = ff.get_events(news_start, news_end, currencies=["USD", "EUR", "GBP"])
+        high_impact = [e for e in events if e.is_high_impact]
+        console.print(f"    News: {len(events):,} events total, {len(high_impact):,} high-impact")
+        if high_impact:
+            for evt in high_impact[:5]:
+                console.print(f"      {evt.time.strftime('%Y-%m-%d %H:%M')} {evt.currency} {evt.event}")
+            if len(high_impact) > 5:
+                console.print(f"      ... and {len(high_impact) - 5} more")
+    except Exception as e:
+        console.print(f"    [yellow]News scraping failed: {e}[/yellow]")
+        console.print(f"    [yellow]News features will use defaults (no news awareness)[/yellow]")
+
     # Summary
     console.print(f"\n[green]Collection complete: {total_rows:,} total rows[/green]")
     console.print(f"Next: [bold]slytrade process --symbol {symbol}[/bold]")
