@@ -403,6 +403,46 @@ def process(
 # ---------------------------------------------------------------------------
 # align — Causal MTF alignment onto M1
 # ---------------------------------------------------------------------------
+def _align_chunk_subprocess(raw_path: str, proc_path: str, htf_tfs: list, proc_dir: str) -> str:
+    """Align one M1 chunk with HTFs in a subprocess."""
+    import subprocess as _sp
+    import sys as _sys
+    htf_list = repr(htf_tfs)
+    script_path = Path(proc_path).with_suffix(".py")
+    script_path.write_text(
+        "import pandas as pd\n"
+        "from slytrade.data.mtf_align import _asof_merge, _prep_htf_frame\n"
+        "from slytrade.data.time import timeframe_timedelta\n"
+        "from pathlib import Path\n"
+        f"proc_dir = Path({proc_dir!r})\n"
+        f"htf_tfs = {htf_list}\n"
+        f"m1 = pd.read_parquet({raw_path!r})\n"
+        "m1['time'] = pd.to_datetime(m1['time'], utc=True, errors='coerce')\n"
+        "m1 = m1.dropna(subset=['time']).sort_values('time').reset_index(drop=True)\n"
+        "aligned = m1\n"
+        "for tf in htf_tfs:\n"
+        "    htf_path = proc_dir / f'timeframe={tf}' / 'data.parquet'\n"
+        "    if not htf_path.exists(): continue\n"
+        "    htf = pd.read_parquet(htf_path)\n"
+        "    dur = timeframe_timedelta(tf)\n"
+        "    htf['decision_time'] = htf['time'] + dur\n"
+        "    prepped = _prep_htf_frame(htf, tf)\n"
+        "    aligned = _asof_merge(aligned, prepped, tf)\n"
+        "    del htf, prepped\n"
+        "drop_cols = [c for c in aligned.columns if c == 'decision_time' or c.startswith('decision_time_')]\n"
+        "if drop_cols: aligned = aligned.drop(columns=drop_cols)\n"
+        f"aligned.to_parquet({proc_path!r}, index=False)\n"
+    )
+    env = dict(__import__("os").environ)
+    src_dir = str(Path(__file__).resolve().parent.parent)
+    env["PYTHONPATH"] = src_dir + ":" + env.get("PYTHONPATH", "")
+    result = _sp.run([_sys.executable, str(script_path)], capture_output=True, text=True, timeout=600, env=env)
+    script_path.unlink(missing_ok=True)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "align subprocess failed")
+    return proc_path
+
+
 @app.command()
 def align(
     symbol: str = typer.Option("XAUUSDm", "--symbol", "-s"),
@@ -413,11 +453,12 @@ def align(
     """Causally align HTF features onto M1 execution TF.
 
     M1 bar at time T sees only HTF information from bars that closed BEFORE T.
-    This is the same alignment used by the live trader.
+    Memory-safe: processes M1 in monthly chunks via subprocess.
 
     Example:
         slytrade align --symbol XAUUSDm
     """
+    import gc, tempfile, shutil
     from .data.mtf_align import _asof_merge, _prep_htf_frame
     from .data.time import timeframe_timedelta
 
@@ -428,53 +469,105 @@ def align(
         console.print(f"[red]No processed data at {proc_dir}. Run 'slytrade process' first.[/red]")
         raise typer.Exit(1)
 
-    # Load M1
     m1_path = proc_dir / "timeframe=M1" / "data.parquet"
     if not m1_path.exists():
         console.print(f"[red]M1 data not found at {m1_path}[/red]")
         raise typer.Exit(1)
 
-    m1 = pd.read_parquet(m1_path)
-    console.print(f"  M1: {len(m1):,} bars, {len(m1.columns)} columns")
+    out_dir = Path(output) / f"symbol={symbol}"
+    if clean:
+        shutil.rmtree(out_dir, ignore_errors=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load and align HTFs
+    # Load HTFs (small — total ~50MB) and prep for asof join
     htf_tfs = ["M5", "M15", "M30", "H1", "H4", "D1", "W1"]
-    df = m1.copy().sort_values("time").reset_index(drop=True)
-
+    htf_frames = {}
     for tf in htf_tfs:
         htf_path = proc_dir / f"timeframe={tf}" / "data.parquet"
         if not htf_path.exists():
             console.print(f"  [yellow]{tf}: not found, skipping[/yellow]")
             continue
-
         htf = pd.read_parquet(htf_path)
-        console.print(f"  {tf}: {len(htf):,} bars → aligning...")
-
+        console.print(f"  {tf}: {len(htf):,} bars loaded")
         dur = timeframe_timedelta(tf)
-        htf = htf.copy()
         htf["decision_time"] = htf["time"] + dur
-        prepped = _prep_htf_frame(htf, tf)
-        df = _asof_merge(df, prepped, tf)
-        console.print(f"    → {len(df):,} rows, {len(df.columns)} columns")
+        htf_frames[tf] = _prep_htf_frame(htf, tf)
+        del htf
+    gc.collect()
 
-    # Save
-    out_dir = Path(output) / f"symbol={symbol}"
-    if clean:
-        import shutil
-        shutil.rmtree(out_dir, ignore_errors=True)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "aligned.parquet"
-    df.to_parquet(out_path, index=False)
+    # Split M1 into monthly chunks on disk, free M1, then align each chunk
+    console.print(f"  M1: splitting into monthly chunks...")
+    m1 = pd.read_parquet(m1_path)
+    m1["time"] = pd.to_datetime(m1["time"], utc=True, errors="coerce")
+    m1 = m1.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
+    console.print(f"  M1: {len(m1):,} bars, {len(m1.columns)} columns")
 
-    # Summary
-    structure_cols = [c for c in df.columns if any(x in c for x in ['disp', 'bos', 'choch', 'sweep', 'ob_', 'fvg_'])]
-    console.print(f"\n[green]Aligned: {len(df):,} M1 bars × {len(df.columns)} columns[/green]")
+    warnings = __import__("warnings")
+    warnings.filterwarnings("ignore", message=".*Period.*timezone.*")
+    months = m1["time"].dt.to_period("M")
+    unique_months = sorted(months.unique())
+    raw_tmp = Path(tempfile.mkdtemp(prefix="slytrade_align_"))
+
+    n_raw = 0
+    for idx, ym in enumerate(unique_months):
+        mask = months == ym
+        chunk = m1.loc[mask]
+        chunk.to_parquet(raw_tmp / f"raw_{idx:04d}.parquet", index=False)
+        n_raw += 1
+        del chunk
+    del m1, months; gc.collect()
+    console.print(f"  {n_raw} raw M1 chunks written. Aligning...")
+
+    # Process each chunk in subprocess
+    n_written = 0
+    total_rows = 0
+    out_col_count = 0
+    for idx in range(n_raw):
+        ym = unique_months[idx]
+        raw_path = raw_tmp / f"raw_{idx:04d}.parquet"
+        proc_path = out_dir / f"aligned_{idx:04d}.parquet"
+        console.print(f"  [{idx+1}/{n_raw}] {ym}...")
+        try:
+            _align_chunk_subprocess(
+                str(raw_path), str(proc_path), htf_tfs,
+                str(proc_dir),
+            )
+            n = pd.read_parquet(str(proc_path), columns=["time"]).shape[0]
+            total_rows += n
+            n_written += 1
+            out_col_count = max(out_col_count, len(pd.read_parquet(str(proc_path)).columns))
+        except Exception as e:
+            console.print(f"    [yellow]Error: {e}[/yellow]")
+
+    shutil.rmtree(raw_tmp, ignore_errors=True)
+
+    if n_written == 0:
+        console.print(f"[red]No chunks aligned[/red]")
+        return
+
+    # Combine all aligned chunks into single file
+    console.print(f"  Combining {n_written} aligned chunks...")
+    aligned_paths = sorted(out_dir.glob("aligned_*.parquet"))
+    result = pd.read_parquet(aligned_paths[0])
+    for p in aligned_paths[1:]:
+        chunk = pd.read_parquet(p)
+        result = pd.concat([result, chunk], ignore_index=True)
+        del chunk
+    result = result.sort_values("time").reset_index(drop=True)
+    final_path = out_dir / "aligned.parquet"
+    result.to_parquet(final_path, index=False)
+    # Remove partial files
+    for p in aligned_paths:
+        p.unlink()
+
+    structure_cols = [c for c in result.columns if any(x in c for x in ['disp', 'bos', 'choch', 'sweep', 'ob_', 'fvg_'])]
+    console.print(f"\n[green]Aligned: {len(result):,} M1 bars × {len(result.columns)} columns[/green]")
     console.print(f"  Structure features: {len(structure_cols)}")
-    for prefix in ["M1_", "M5_", "M15_", "M30_", "H1_", "H4_", "D1_", "W1_"]:
+    for prefix in ["M5_", "M15_", "M30_", "H1_", "H4_", "D1_", "W1_"]:
         n = len([c for c in structure_cols if c.startswith(prefix)])
         if n > 0:
             console.print(f"    {prefix.rstrip('_')}: {n}")
-    console.print(f"  Saved: {out_path} ({out_path.stat().st_size / 1e6:.1f} MB)")
+    console.print(f"  Saved: {final_path} ({final_path.stat().st_size / 1e6:.1f} MB)")
     console.print(f"\nNext: [bold]slytrade train --symbol {symbol}[/bold] or [bold]slytrade backtest --symbol {symbol}[/bold]")
 
 
