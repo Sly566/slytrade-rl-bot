@@ -335,6 +335,7 @@ def _safe_from_row(
     # Liquidity sweeps
     obs[_OBS_BULL_SWEEP] = _b("bull_liq_sweep"); obs[_OBS_BEAR_SWEEP] = _b("bear_liq_sweep")
 
+    np.nan_to_num(obs, copy=False, nan=0.0, posinf=1.0, neginf=-1.0)
     return obs
 
 
@@ -704,6 +705,10 @@ class SlyTradeEnv(gym.Env):
         # === Liquidity sweeps ===
         obs[_OBS_BULL_SWEEP] = sb("bull_liq_sweep", i)
         obs[_OBS_BEAR_SWEEP] = sb("bear_liq_sweep", i)
+
+        np.nan_to_num(obs, copy=False, nan=0.0, posinf=1.0, neginf=-1.0)
+        return obs
+
     def _get_info(self) -> dict:
         """Return info dict for debugging/logging."""
         return {
