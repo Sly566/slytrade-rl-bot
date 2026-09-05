@@ -783,15 +783,19 @@ def train(
                 df = df.rename(columns={time_col: "time"})
     else:
         console.print(f"  Data: {aligned_path}")
-        df = pd.read_parquet(aligned_path)
+        import pyarrow.parquet as _pq
+        # Read schema only to discover columns — avoids loading 875 cols into memory
+        schema = _pq.read_schema(aligned_path)
+        schema_names = [f.name for f in schema]
         time_col = None
         for candidate in ["time", "time_msc", "datetime", "timestamp"]:
-            if candidate in df.columns:
+            if candidate in schema_names:
                 time_col = candidate
                 break
-        available = [c for c in RL_COLS if c in df.columns]
+        available = [c for c in RL_COLS if c in schema_names]
         keep_cols = ([time_col] if time_col else []) + available
-        df = df[keep_cols].copy()
+        # Only read the ~70 needed columns instead of all 875
+        df = pd.read_parquet(aligned_path, columns=keep_cols)
         if time_col:
             df = df.sort_values(time_col).reset_index(drop=True)
             if time_col != "time":
