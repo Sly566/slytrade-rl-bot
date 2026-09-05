@@ -345,18 +345,28 @@ def process(
             if n_written == 0:
                 console.print(f"    [red]No chunks processed[/red]")
                 continue
-            # Phase 3: combine processed chunks
+            # Phase 3: combine processed chunks (pyarrow streaming — no pandas, no OOM)
             console.print(f"    Combining {n_written} chunks...")
             proc_paths = sorted(proc_tmp.glob("proc_*.parquet"))
-            processed = pd.read_parquet(proc_paths[0])
+            import pyarrow.parquet as pq
+            # Chunks are already chronologically ordered (by month). Stream directly.
+            out_path = out_dir / f"timeframe={tf}" / "data.parquet"
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            first = pq.read_table(str(proc_paths[0]))
+            writer = pq.ParquetWriter(str(out_path), first.schema)
+            total_rows = first.num_rows
+            total_cols = first.num_columns
+            writer.write_table(first)
+            del first
             for p in proc_paths[1:]:
-                chunk = pd.read_parquet(p)
-                processed = pd.concat([processed, chunk], ignore_index=True)
-                del chunk
-                if len(processed) > 500_000:
-                    gc.collect()
-            processed = processed.sort_values("time").reset_index(drop=True)
+                t = pq.read_table(str(p))
+                writer.write_table(t)
+                total_rows += t.num_rows
+                del t
+            writer.close()
             shutil.rmtree(proc_tmp, ignore_errors=True)
+            # Set processed = None to skip downstream save (already saved above)
+            processed = None
         else:
             console.print(f"    Computing features...")
             processed = process_bars(df, tf, DEFAULT_CONFIG, tick_dir=tick_dir)
@@ -365,7 +375,7 @@ def process(
         elapsed = time.time() - t0
 
         # Wire news features for M1 (Gap 5)
-        if tf == "M1":
+        if tf == "M1" and processed is not None:
             news_dir = Path(output).parent / "news"
             alt_news_dir = Path("data/news")
             for nd in [news_dir, alt_news_dir]:
@@ -388,14 +398,20 @@ def process(
                             console.print(f"    News: {len(news_df)} events merged")
                         break
 
-        # Save
-        tf_dir = out_dir / f"timeframe={tf}"
-        tf_dir.mkdir(parents=True, exist_ok=True)
-        out_path = tf_dir / "data.parquet"
-        processed.to_parquet(out_path, index=False)
-        console.print(f"    {tf}: {len(processed):,} bars, {len(processed.columns)} cols, "
+        # Save (if not already saved by streaming combine)
+        if processed is not None:
+            tf_dir = out_dir / f"timeframe={tf}"
+            tf_dir.mkdir(parents=True, exist_ok=True)
+            out_path = tf_dir / "data.parquet"
+            processed.to_parquet(out_path, index=False)
+            total_rows = len(processed)
+            total_cols = len(processed.columns)
+            del processed
+        else:
+            total_rows = locals().get("total_rows", 0)
+            total_cols = locals().get("total_cols", 0)
+        console.print(f"    {tf}: {total_rows:,} bars, {total_cols} cols, "
                       f"{elapsed:.1f}s → {out_path}")
-        del processed  # free memory
 
     console.print(f"\n[green]Processing complete![/green]")
     console.print(f"Next: [bold]slytrade align --symbol {symbol}[/bold]")
@@ -545,23 +561,33 @@ def align(
         console.print(f"[red]No chunks aligned[/red]")
         return
 
-    # Combine all aligned chunks into single file
+    # Combine all aligned chunks into single file (pyarrow streaming — no OOM)
     console.print(f"  Combining {n_written} aligned chunks...")
     aligned_paths = sorted(out_dir.glob("aligned_*.parquet"))
-    result = pd.read_parquet(aligned_paths[0])
-    for p in aligned_paths[1:]:
-        chunk = pd.read_parquet(p)
-        result = pd.concat([result, chunk], ignore_index=True)
-        del chunk
-    result = result.sort_values("time").reset_index(drop=True)
     final_path = out_dir / "aligned.parquet"
-    result.to_parquet(final_path, index=False)
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    first = pq.read_table(str(aligned_paths[0]))
+    writer = pq.ParquetWriter(str(final_path), first.schema)
+    writer.write_table(first)
+    n_rows = first.num_rows
+    out_col_count = first.num_columns
+    del first
+    for p in aligned_paths[1:]:
+        t = pq.read_table(str(p))
+        writer.write_table(t)
+        n_rows += t.num_rows
+        del t
+    writer.close()
     # Remove partial files
     for p in aligned_paths:
         p.unlink()
 
-    structure_cols = [c for c in result.columns if any(x in c for x in ['disp', 'bos', 'choch', 'sweep', 'ob_', 'fvg_'])]
-    console.print(f"\n[green]Aligned: {len(result):,} M1 bars × {len(result.columns)} columns[/green]")
+    # Read a small sample for summary stats (just column names + structure count)
+    sample = pq.read_schema(str(final_path))
+    col_names = [field.name for field in sample]
+    structure_cols = [c for c in col_names if any(x in c for x in ['disp', 'bos', 'choch', 'sweep', 'ob_', 'fvg_'])]
+    console.print(f"\n[green]Aligned: {n_rows:,} M1 bars × {out_col_count} columns[/green]")
     console.print(f"  Structure features: {len(structure_cols)}")
     for prefix in ["M5_", "M15_", "M30_", "H1_", "H4_", "D1_", "W1_"]:
         n = len([c for c in structure_cols if c.startswith(prefix)])
