@@ -23,6 +23,80 @@ app = typer.Typer(help="SlyTrade v1.0 — ICT/SMC scalping pipeline")
 console = Console()
 
 VERSION = "1.0.0"
+def _pyarrow_streaming_combine(chunk_paths: list, output_path: str, sort_col: str = "time") -> tuple:
+    """Combine parquet chunks into a single file using pyarrow streaming.
+    
+    Handles schema mismatches (null vs real types across chunks) by
+    building a unified schema from all chunks before writing.
+    
+    Returns (total_rows, total_cols).
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    
+    # Phase 1: read all schemas, build unified schema
+    schemas = []
+    for p in chunk_paths:
+        try:
+            s = pq.read_schema(str(p))
+            schemas.append(s)
+        except Exception:
+            continue
+    
+    if not schemas:
+        return (0, 0)
+    
+    # Build unified field set: for each column name, use the first non-null type
+    unified_fields = {}
+    for s in schemas:
+        for field in s:
+            if field.name not in unified_fields:
+                unified_fields[field.name] = field
+            elif unified_fields[field.name].type == pa.null() and field.type != pa.null():
+                # Replace null type with actual type
+                unified_fields[field.name] = field
+    
+    # Collect all column names in order (from longest schema)
+    all_names = []
+    seen = set()
+    for s in schemas:
+        for field in s:
+            if field.name not in seen:
+                all_names.append(field.name)
+                seen.add(field.name)
+    
+    unified_schema = pa.schema([unified_fields[n] for n in all_names])
+    
+    # Phase 2: write with unified schema, casting each chunk
+    total_rows = 0
+    writer = pq.ParquetWriter(output_path, unified_schema)
+    for p in chunk_paths:
+        try:
+            t = pq.read_table(str(p))
+        except Exception:
+            continue
+        # Cast columns to match unified schema
+        arrays = []
+        for field in unified_schema:
+            if field.name in t.column_names:
+                col = t.column(field.name)
+                if col.type != field.type:
+                    try:
+                        col = col.cast(field.type, safe=False)
+                    except Exception:
+                        col = pa.nulls(len(col)).cast(field.type)
+            else:
+                col = pa.nulls(len(t)).cast(field.type)
+            arrays.append(col)
+        t_unified = pa.table(arrays, schema=unified_schema)
+        writer.write_table(t_unified)
+        total_rows += len(t)
+        del t, t_unified
+    writer.close()
+    
+    return (total_rows, len(unified_schema))
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -345,27 +419,13 @@ def process(
             if n_written == 0:
                 console.print(f"    [red]No chunks processed[/red]")
                 continue
-            # Phase 3: combine processed chunks (pyarrow streaming — no pandas, no OOM)
+            # Phase 3: combine with unified schema (handles null vs real type mismatches)
             console.print(f"    Combining {n_written} chunks...")
             proc_paths = sorted(proc_tmp.glob("proc_*.parquet"))
-            import pyarrow.parquet as pq
-            # Chunks are already chronologically ordered (by month). Stream directly.
             out_path = out_dir / f"timeframe={tf}" / "data.parquet"
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            first = pq.read_table(str(proc_paths[0]))
-            writer = pq.ParquetWriter(str(out_path), first.schema)
-            total_rows = first.num_rows
-            total_cols = first.num_columns
-            writer.write_table(first)
-            del first
-            for p in proc_paths[1:]:
-                t = pq.read_table(str(p))
-                writer.write_table(t)
-                total_rows += t.num_rows
-                del t
-            writer.close()
+            total_rows, total_cols = _pyarrow_streaming_combine(proc_paths, str(out_path))
             shutil.rmtree(proc_tmp, ignore_errors=True)
-            # Set processed = None to skip downstream save (already saved above)
             processed = None
         else:
             console.print(f"    Computing features...")
@@ -561,29 +621,16 @@ def align(
         console.print(f"[red]No chunks aligned[/red]")
         return
 
-    # Combine all aligned chunks into single file (pyarrow streaming — no OOM)
+    # Combine with unified schema (handles null vs real types across months)
     console.print(f"  Combining {n_written} aligned chunks...")
     aligned_paths = sorted(out_dir.glob("aligned_*.parquet"))
     final_path = out_dir / "aligned.parquet"
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-    first = pq.read_table(str(aligned_paths[0]))
-    writer = pq.ParquetWriter(str(final_path), first.schema)
-    writer.write_table(first)
-    n_rows = first.num_rows
-    out_col_count = first.num_columns
-    del first
-    for p in aligned_paths[1:]:
-        t = pq.read_table(str(p))
-        writer.write_table(t)
-        n_rows += t.num_rows
-        del t
-    writer.close()
+    n_rows, out_col_count = _pyarrow_streaming_combine(aligned_paths, str(final_path))
     # Remove partial files
     for p in aligned_paths:
         p.unlink()
 
-    # Read a small sample for summary stats (just column names + structure count)
+    import pyarrow.parquet as pq
     sample = pq.read_schema(str(final_path))
     col_names = [field.name for field in sample]
     structure_cols = [c for c in col_names if any(x in c for x in ['disp', 'bos', 'choch', 'sweep', 'ob_', 'fvg_'])]
