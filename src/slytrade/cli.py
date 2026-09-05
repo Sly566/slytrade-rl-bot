@@ -1102,14 +1102,53 @@ def backtest(
             console.print(f"[red]No aligned data found. Run 'slytrade align' first.[/red]")
             raise typer.Exit(1)
 
+    # Columns needed by backtest signal pipeline + RL filter
+    BT_COLS = [
+        "time", "close", "atr_14", "spread",
+        "tick_volume", "real_volume",
+        "session", "hour", "minute", "dow",
+        "body", "range_", "upper_wick", "lower_wick", "body_pct", "direction",
+        "bull_disp", "bear_disp",
+        "minor_bos_up", "minor_bos_dn", "minor_choch_up", "minor_choch_dn",
+        "major_bos_up", "major_bos_dn", "major_choch_up", "major_choch_dn",
+        "minor_swing_high", "minor_swing_low", "major_swing_high", "major_swing_low",
+        "bull_ob_top", "bull_ob_bottom", "bull_ob_mitigated",
+        "bear_ob_top", "bear_ob_bottom", "bear_ob_mitigated",
+        "bull_fvg_top", "bull_fvg_bottom", "bull_fvg_mitigated",
+        "bear_fvg_top", "bear_fvg_bottom", "bear_fvg_mitigated",
+        "bull_liq_sweep", "bear_liq_sweep",
+        "is_premium", "is_discount", "is_equilibrium",
+        "ob_proximity", "fvg_proximity", "sweep_proximity",
+        "sr_support_dist", "sr_resistance_dist", "at_support", "at_resistance",
+        "in_demand_zone", "in_supply_zone",
+        "demand_zone_dist", "supply_zone_dist",
+        "tick_vol_ratio", "vol_spike",
+        "kz_london", "kz_ny", "london_open_30", "ny_open_30",
+        "ema_20", "ema_50", "ema_200",
+        "in_silver_bullet", "in_pow3_manipulation", "in_judas_swing",
+        "bull_ce", "bear_ce", "at_bull_ce", "at_bear_ce",
+    ]
+    # Add HTF columns (all prefixed columns from each timeframe)
+    for _tf in ["M5", "M15", "M30", "H1", "H4", "D1", "W1"]:
+        BT_COLS.extend([f"{_tf}_close", f"{_tf}_bull_disp", f"{_tf}_bear_disp",
+                        f"{_tf}_minor_bos_up", f"{_tf}_minor_bos_dn",
+                        f"{_tf}_minor_choch_up", f"{_tf}_minor_choch_dn",
+                        f"{_tf}_major_bos_up", f"{_tf}_major_bos_dn",
+                        f"{_tf}_major_choch_up", f"{_tf}_major_choch_dn",
+                        f"{_tf}_ob_proximity", f"{_tf}_fvg_proximity", f"{_tf}_sweep_proximity"])
+
     if partition_files:
         console.print(f"  Data: {len(partition_files)} monthly partitions")
-        frames = [pd.read_parquet(f) for f in partition_files]
+        frames = [pd.read_parquet(f, columns=[c for c in BT_COLS if True]) for f in partition_files]
         df = pd.concat(frames, ignore_index=True).sort_values("time").reset_index(drop=True)
         del frames
     else:
         console.print(f"  Data: {aligned_path}")
-        df = pd.read_parquet(aligned_path)
+        import pyarrow.parquet as _pq
+        schema = _pq.read_schema(aligned_path)
+        schema_names = [f.name for f in schema]
+        avail_cols = [c for c in BT_COLS if c in schema_names]
+        df = pd.read_parquet(aligned_path, columns=avail_cols)
 
     console.print(f"  {len(df):,} bars, {len(df.columns)} columns")
     console.print(f"  Date: {df['time'].min()} to {df['time'].max()}")
