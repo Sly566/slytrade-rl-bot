@@ -185,6 +185,40 @@ def collect(
 # ---------------------------------------------------------------------------
 # process — Compute per-TF features
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Subprocess worker for memory-safe chunk processing
+# ---------------------------------------------------------------------------
+def _process_chunk_subprocess(raw_path: str, proc_path: str, tf: str, tick_dir_str: str | None) -> str:
+    """Process one raw parquet chunk in a SUBPROCESS. Returns proc_path on success."""
+    import subprocess as _sp
+    import sys as _sys
+    # Write a small script to disk so subprocess doesn't inherit parent memory
+    script_path = Path(proc_path).with_suffix(".py")
+    script_path.write_text(
+        "import pandas as pd\n"
+        "from slytrade.data.features import DEFAULT_CONFIG, process_bars\n"
+        "from pathlib import Path\n"
+        f"df = pd.read_parquet({raw_path!r})\n"
+        f"processed = process_bars(df, {tf!r}, DEFAULT_CONFIG, "
+        f"tick_dir=Path({tick_dir_str!r}) if {tick_dir_str!r} else None)\n"
+        f"processed.to_parquet({proc_path!r}, index=False)\n"
+    )
+    env = dict(__import__("os").environ)
+    # Ensure slytrade is importable — add src/ to PYTHONPATH
+    src_dir = str(Path(__file__).resolve().parent.parent)
+    env["PYTHONPATH"] = src_dir + ":" + env.get("PYTHONPATH", "")
+    result = _sp.run(
+        [_sys.executable, str(script_path)],
+        capture_output=True, text=True, timeout=300,
+        env=env,
+    )
+    script_path.unlink(missing_ok=True)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "chunk subprocess failed")
+    return proc_path
+
+
+@app.command()
 @app.command()
 def process(
     symbol: str = typer.Option("XAUUSDm", "--symbol", "-s"),
@@ -278,23 +312,31 @@ def process(
             del df, months; gc.collect()
             console.print(f"    {n_raw} raw chunks written, df freed. Processing...")
 
-            # Phase 2: read each raw chunk from disk, process, write result
+            # Phase 2: process each chunk in a SEPARATE SUBPROCESS
+            # Python's allocator never returns memory to the OS, so even with
+            # del+gc.collect(), RSS grows monotonically. Subprocess exit = OS reclaims.
+            from multiprocessing import Process as _Proc
             proc_tmp = Path(tempfile.mkdtemp(prefix="slytrade_proc_"))
             n_written = 0
             for idx in range(n_raw):
-                raw_path = raw_tmp / f"raw_{idx:04d}.parquet"
-                chunk_df = pd.read_parquet(raw_path)
                 ym = unique_months[idx]
-                console.print(f"    [{idx+1}/{n_raw}] {ym}: {len(chunk_df):,} bars...")
+                raw_path = raw_tmp / f"raw_{idx:04d}.parquet"
+                proc_path = proc_tmp / f"proc_{idx:04d}.parquet"
+                # Count bars from raw file size (cheap, no read)
                 try:
-                    processed_chunk = process_bars(chunk_df, tf, DEFAULT_CONFIG, tick_dir=tick_dir)
-                    proc_path = proc_tmp / f"proc_{idx:04d}.parquet"
-                    processed_chunk.to_parquet(proc_path, index=False)
-                    n_written += 1
-                    del processed_chunk
+                    import pyarrow.parquet as _pq; n_bars = _pq.read_metadata(str(raw_path)).num_rows
+                except Exception:
+                    n_bars = 0
+                console.print(f"    [{idx+1}/{n_raw}] {ym}: {n_bars:,} bars...")
+                try:
+                    result_path = _process_chunk_subprocess(
+                        str(raw_path), str(proc_path), tf,
+                        str(tick_dir) if tick_dir else None,
+                    )
+                    if result_path:
+                        n_written += 1
                 except Exception as e:
                     console.print(f"      [yellow]Error: {e}[/yellow]")
-                del chunk_df; gc.collect()
 
             # Clean up raw temp files
             import shutil
