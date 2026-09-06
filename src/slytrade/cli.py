@@ -654,7 +654,7 @@ def train(
     algo: str = typer.Option("ppo", "--algo", "-a", help="Algorithm: ppo, sac, a2c"),
     timesteps: int = typer.Option(500_000, "--timesteps", "-n"),
     output: str = typer.Option("models", "--output", "-o"),
-    max_bars: int = typer.Option(5000, "--max-bars", help="Max bars per episode"),
+    max_bars: int = typer.Option(20000, "--max-bars", help="Max bars per episode"),
     tune: bool = typer.Option(False, "--tune", help="Run Optuna hyperparameter search first"),
     log_interval: int = typer.Option(10, "--log-interval", help="Log every N rollouts"),
     tb_log: str = typer.Option("logs/tb", "--tb-log", help="TensorBoard log directory"),

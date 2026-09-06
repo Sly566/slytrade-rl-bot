@@ -706,7 +706,10 @@ class SlyTradeEnv(gym.Env):
         obs[_OBS_BULL_SWEEP] = sb("bull_liq_sweep", i)
         obs[_OBS_BEAR_SWEEP] = sb("bear_liq_sweep", i)
 
-        np.nan_to_num(obs, copy=False, nan=0.0, posinf=1.0, neginf=-1.0)
+        # Normalize: clip outliers and squash to [-1, 1] range
+        np.nan_to_num(obs, copy=False, nan=0.0, posinf=5.0, neginf=-5.0)
+        np.clip(obs, -5.0, 5.0, out=obs)
+        obs = np.tanh(obs / 3.0)  # squash to ~[-1, 1] with soft saturation
         return obs
 
     def _get_info(self) -> dict:
@@ -877,8 +880,7 @@ class SlyTradeEnv(gym.Env):
                 self._pos_dir = 0; self._pos_bars = 0; trade_closed = True
 
         # --- Compute reward ---
-        # Balanced reward: encourage trading while controlling risk
-        # Key insight: if penalties are too harsh, agent learns to never trade (hold = 0 reward)
+        # Multi-objective: P&L + risk-adjusted + drawdown control + anti-churn
         equity_frac = self._equity / max(self._starting_equity, 1.0)
         drawdown = (self._peak_equity - self._equity) / max(self._peak_equity, 1.0)
 
@@ -886,41 +888,47 @@ class SlyTradeEnv(gym.Env):
 
         if len(self._trades) > 0 and trade_closed:
             last_pnl = self._trades[-1]["pnl"]
-            # Risk-adjusted PnL: normalize by equity
             pnl_frac = last_pnl / max(self._equity, 1.0)
-            reward = pnl_frac * 5.0  # moderate scale
+            reward = pnl_frac * 5.0
 
-            # Symmetric win/loss signal — let agent learn from outcomes
             if last_pnl > 0:
-                reward += 0.3  # win bonus
+                reward += 0.3
             else:
-                reward -= 0.3  # loss penalty (symmetric)
+                reward -= 0.3
 
-            # Reward for good R-multiple (TP hits are better than time-stops)
             reason = self._trades[-1].get("reason", "")
             if reason == "TP":
-                reward += 0.2  # bonus for hitting TP
+                reward += 0.2
             elif reason == "TIME_STOP":
-                reward -= 0.1  # small penalty for time-stop (indecisive)
+                reward -= 0.1
+
+            # Rolling Sharpe bonus — rewards consistent risk-adjusted returns
+            if len(self._trades) >= 5:
+                recent = [t["pnl"] for t in self._trades[-20:]]
+                r_mean = np.mean(recent)
+                r_std = np.std(recent) if np.std(recent) > 1e-9 else 1.0
+                rolling_sharpe = r_mean / r_std
+                reward += rolling_sharpe * 0.05
+
         else:
-            # Small holding reward for being in profit (R-multiple based)
             if self._pos_dir != 0 and self._pos_risk_per_unit > 0:
                 r_dist = (price - self._pos_entry) if self._pos_dir == 1 else (self._pos_entry - price)
                 cur_r = r_dist / self._pos_risk_per_unit
-                reward = cur_r * 0.01  # per-step signal for being in profit
+                reward = cur_r * 0.01
 
-        # Drawdown penalty — LINEAR, kicks in at 5%, capped
-        # Old exponential was too harsh: 85% DD → 361 penalty per step
-        # New: gentle linear penalty that increases with DD
+        # Idle penalty — encourages the agent to trade (not sit flat forever)
+        if self._pos_dir == 0:
+            reward -= 0.002  # gentle nudge per bar while flat
+
+        # Drawdown penalty — linear, kicks in at 5%
         if drawdown > 0.05:
-            dd_penalty = min((drawdown - 0.05) * 5.0, 3.0)  # 5%→0, 10%→0.25, 20%→0.75, 50%→2.25, capped at 3.0
+            dd_penalty = min((drawdown - 0.05) * 5.0, 3.0)
             reward -= dd_penalty
 
-        # Equity wipeout — hard penalty
+        # Equity wipeout
         if self._equity <= self._starting_equity * 0.5:
             reward -= 5.0
 
-        # Track equity history
         self._equity_history.append(self._equity)
 
         # Advance to next bar
