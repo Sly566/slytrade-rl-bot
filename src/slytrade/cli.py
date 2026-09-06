@@ -1109,18 +1109,11 @@ def backtest(
         del frames
     else:
         console.print(f"  Data: {aligned_path}")
-        # Memory-map the parquet file — pages loaded on demand, low RSS
         import pyarrow.parquet as _pq
-        mmapped = _pq.memory_map(aligned_path)
-        pf = _pq.ParquetFile(mmapped)
+        pf = _pq.ParquetFile(str(aligned_path))
         n_total = pf.metadata.num_rows
         n_cols = pf.metadata.num_columns
-        # Read first and last time from metadata
-        first_time = pf.read_row_group(0, columns=["time"]).to_pandas()["time"].iloc[0]
-        last_rg = pf.metadata.num_row_groups - 1
-        last_time = pf.read_row_group(last_rg, columns=["time"]).to_pandas()["time"].iloc[-1]
         console.print(f"  {n_total:,} bars, {n_cols} columns")
-        console.print(f"  Date: {first_time} to {last_time}")
         df = None  # will stream below
 
     if df is not None:
@@ -1177,8 +1170,6 @@ def backtest(
         n = len(df_chunk)
         for i in range(n):
             row = df_chunk.iloc[i]
-            price = float(row.get("close", 0.0))
-            atr = float(row.get("atr_14", 0.0)) if pd.notna(row.get("atr_14")) else 0.0
             price = float(row.get("close", 0.0))
             atr = float(row.get("atr_14", 0.0)) if pd.notna(row.get("atr_14")) else 0.0
 
@@ -1294,18 +1285,11 @@ def backtest(
         del df
     else:
         import pyarrow.parquet as _pq
-        if partition_files:
-            pf = _pq.ParquetFile(str(partition_files[0]))
-        else:
-            mmapped = _pq.memory_map(aligned_path)
-            pf = _pq.ParquetFile(mmapped)
         n_total = pf.metadata.num_rows
         console.print(f"\n  Walking {n_total:,} bars (streaming)...")
-        batch_n = 0
         for batch in pf.iter_batches(batch_size=50_000):
             chunk = batch.to_pandas()
-            _walk_rows(chunk, start_i=batch_n)
-            batch_n += len(chunk)
+            _walk_rows(chunk)
             del chunk
 
     # Close any remaining position
