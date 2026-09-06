@@ -1102,56 +1102,30 @@ def backtest(
             console.print(f"[red]No aligned data found. Run 'slytrade align' first.[/red]")
             raise typer.Exit(1)
 
-    # Columns needed by backtest signal pipeline + RL filter
-    BT_COLS = [
-        "time", "close", "atr_14", "spread",
-        "tick_volume", "real_volume",
-        "session", "hour", "minute", "dow",
-        "body", "range_", "upper_wick", "lower_wick", "body_pct", "direction",
-        "bull_disp", "bear_disp",
-        "minor_bos_up", "minor_bos_dn", "minor_choch_up", "minor_choch_dn",
-        "major_bos_up", "major_bos_dn", "major_choch_up", "major_choch_dn",
-        "minor_swing_high", "minor_swing_low", "major_swing_high", "major_swing_low",
-        "bull_ob_top", "bull_ob_bottom", "bull_ob_mitigated",
-        "bear_ob_top", "bear_ob_bottom", "bear_ob_mitigated",
-        "bull_fvg_top", "bull_fvg_bottom", "bull_fvg_mitigated",
-        "bear_fvg_top", "bear_fvg_bottom", "bear_fvg_mitigated",
-        "bull_liq_sweep", "bear_liq_sweep",
-        "is_premium", "is_discount", "is_equilibrium",
-        "ob_proximity", "fvg_proximity", "sweep_proximity",
-        "sr_support_dist", "sr_resistance_dist", "at_support", "at_resistance",
-        "in_demand_zone", "in_supply_zone",
-        "demand_zone_dist", "supply_zone_dist",
-        "tick_vol_ratio", "vol_spike",
-        "kz_london", "kz_ny", "london_open_30", "ny_open_30",
-        "ema_20", "ema_50", "ema_200",
-        "in_silver_bullet", "in_pow3_manipulation", "in_judas_swing",
-        "bull_ce", "bear_ce", "at_bull_ce", "at_bear_ce",
-    ]
-    # Add HTF columns (all prefixed columns from each timeframe)
-    for _tf in ["M5", "M15", "M30", "H1", "H4", "D1", "W1"]:
-        BT_COLS.extend([f"{_tf}_close", f"{_tf}_bull_disp", f"{_tf}_bear_disp",
-                        f"{_tf}_minor_bos_up", f"{_tf}_minor_bos_dn",
-                        f"{_tf}_minor_choch_up", f"{_tf}_minor_choch_dn",
-                        f"{_tf}_major_bos_up", f"{_tf}_major_bos_dn",
-                        f"{_tf}_major_choch_up", f"{_tf}_major_choch_dn",
-                        f"{_tf}_ob_proximity", f"{_tf}_fvg_proximity", f"{_tf}_sweep_proximity"])
-
     if partition_files:
         console.print(f"  Data: {len(partition_files)} monthly partitions")
-        frames = [pd.read_parquet(f, columns=[c for c in BT_COLS if True]) for f in partition_files]
+        frames = [pd.read_parquet(f) for f in partition_files]
         df = pd.concat(frames, ignore_index=True).sort_values("time").reset_index(drop=True)
         del frames
     else:
         console.print(f"  Data: {aligned_path}")
+        # Memory-map the parquet file — pages loaded on demand, low RSS
         import pyarrow.parquet as _pq
-        schema = _pq.read_schema(aligned_path)
-        schema_names = [f.name for f in schema]
-        avail_cols = [c for c in BT_COLS if c in schema_names]
-        df = pd.read_parquet(aligned_path, columns=avail_cols)
+        mmapped = _pq.memory_map(aligned_path)
+        pf = _pq.ParquetFile(mmapped)
+        n_total = pf.metadata.num_rows
+        n_cols = pf.metadata.num_columns
+        # Read first and last time from metadata
+        first_time = pf.read_row_group(0, columns=["time"]).to_pandas()["time"].iloc[0]
+        last_rg = pf.metadata.num_row_groups - 1
+        last_time = pf.read_row_group(last_rg, columns=["time"]).to_pandas()["time"].iloc[-1]
+        console.print(f"  {n_total:,} bars, {n_cols} columns")
+        console.print(f"  Date: {first_time} to {last_time}")
+        df = None  # will stream below
 
-    console.print(f"  {len(df):,} bars, {len(df.columns)} columns")
-    console.print(f"  Date: {df['time'].min()} to {df['time'].max()}")
+    if df is not None:
+        console.print(f"  {len(df):,} bars, {len(df.columns)} columns")
+        console.print(f"  Date: {df['time'].min()} to {df['time'].max()}")
 
     # Config (same as live)
     cfg = rl_training_persona() if unrestricted else champion_persona()
@@ -1175,7 +1149,8 @@ def backtest(
             console.print(f"  SB3 model loaded ({algo.upper()})")
 
     # Walk bars exactly like live
-    console.print(f"\n  Walking {len(df):,} bars...")
+    # If df was loaded into memory (partitions), walk it directly.
+    # If streaming (aligned_path), walk batch-by-batch from pyarrow.
     state: dict = {}
     equity_curve = [equity]
     trades: list[dict] = []
@@ -1194,78 +1169,40 @@ def backtest(
     n_signals = 0
     t0 = time.time()
 
-    for i in range(len(df)):
-        row = df.iloc[i]
-        price = float(row.get("close", 0.0))
-        atr = float(row.get("atr_14", 0.0)) if pd.notna(row.get("atr_14")) else 0.0
+    def _walk_rows(df_chunk, start_i=0):
+        """Walk rows from a DataFrame chunk, updating backtest state."""
+        nonlocal pos_dir, pos_entry, pos_sl, pos_tp, pos_lots, pos_bars
+        nonlocal pos_grade, pos_risk_per_unit, pos_best_price, pos_trail_active
+        nonlocal equity, n_signals, price
+        n = len(df_chunk)
+        for i in range(n):
+            row = df_chunk.iloc[i]
+            price = float(row.get("close", 0.0))
+            atr = float(row.get("atr_14", 0.0)) if pd.notna(row.get("atr_14")) else 0.0
+            price = float(row.get("close", 0.0))
+            atr = float(row.get("atr_14", 0.0)) if pd.notna(row.get("atr_14")) else 0.0
 
-        # Check SL/TP/time-stop on open position
-        if pos_dir != 0:
-            pos_bars += 1
-            r_unit = pos_risk_per_unit if pos_risk_per_unit > 0 else abs(pos_tp - pos_entry)
-            cur_r = (price - pos_entry) / r_unit if pos_dir == 1 else (pos_entry - price) / r_unit
+            # Check SL/TP/time-stop on open position
+            if pos_dir != 0:
+                pos_bars += 1
+                r_unit = pos_risk_per_unit if pos_risk_per_unit > 0 else abs(pos_tp - pos_entry)
+                cur_r = (price - pos_entry) / r_unit if pos_dir == 1 else (pos_entry - price) / r_unit
 
-            # Track best price for trailing
-            if pos_dir == 1:
-                pos_best_price = max(pos_best_price, price)
-            else:
-                pos_best_price = min(pos_best_price, price) if pos_best_price > 0 else price
-
-            # SL hit
-            hit_sl = (pos_dir == 1 and price <= pos_sl) or (pos_dir == -1 and price >= pos_sl)
-            # TP hit
-            hit_tp = (pos_dir == 1 and price >= pos_tp) or (pos_dir == -1 and price <= pos_tp)
-            # Time stop
-            hit_time = pos_bars >= time_stop_bars
-
-            if hit_sl or hit_tp or hit_time:
-                reason = "SL" if hit_sl else ("TP" if hit_tp else "TIME_STOP")
-                pnl_pts = (price - pos_entry) * pos_dir
-                pnl_quote = pnl_pts * pos_lots * spec.contract_size
-                pnl_acct = acct.to_account_ccy(pnl_quote, spec.currency_profit)
-                equity += pnl_acct
-                equity_curve.append(equity)
-                trades.append({
-                    "entry": pos_entry, "exit": price, "dir": pos_dir,
-                    "lots": pos_lots, "pnl": pnl_acct, "bars": pos_bars,
-                    "grade": pos_grade, "reason": reason, "r": cur_r,
-                })
-                pos_dir = 0
-                continue
-
-            # C-grade trailing (same as live)
-            if pos_grade == 'C' and pos_trail_active and atr > 0:
-                trail_dist = max(0.5 * atr, 0.3 * r_unit)
+                # Track best price for trailing
                 if pos_dir == 1:
-                    new_trail = pos_best_price - trail_dist
-                    if new_trail > pos_sl:
-                        pos_sl = new_trail
+                    pos_best_price = max(pos_best_price, price)
                 else:
-                    new_trail = pos_best_price + trail_dist
-                    if new_trail < pos_sl:
-                        pos_sl = new_trail
+                    pos_best_price = min(pos_best_price, price) if pos_best_price > 0 else price
 
-            # Activate C-grade trailing at 0.3R
-            if pos_grade == 'C' and not pos_trail_active and cur_r >= 0.3:
-                pos_trail_active = True
-                pos_sl = pos_entry + pos_dir * 0.1 * r_unit
+                # SL hit
+                hit_sl = (pos_dir == 1 and price <= pos_sl) or (pos_dir == -1 and price >= pos_sl)
+                # TP hit
+                hit_tp = (pos_dir == 1 and price >= pos_tp) or (pos_dir == -1 and price <= pos_tp)
+                # Time stop
+                hit_time = pos_bars >= time_stop_bars
 
-        # Evaluate signal (same as live)
-        try:
-            sig = _evaluate_row(i, row, cfg, state)
-        except Exception:
-            sig = None
-
-        if sig is not None:
-            n_signals += 1
-            side = "LONG" if sig.direction == 1 else "SHORT"
-            setup = getattr(sig, 'setup_kind', 'RETEST_OB')
-            zone_id = sig.ob_tf or (f"fvg{sig.fvg_top:.0f}" if sig.fvg_top else "-")
-            key = f"{sig.time.isoformat()}|{sig.direction}|{sig.grade}|{setup}|{zone_id}"
-
-            if key not in signals_fired:
-                # Netting: close opposite
-                if pos_dir != 0 and pos_dir == -sig.direction:
+                if hit_sl or hit_tp or hit_time:
+                    reason = "SL" if hit_sl else ("TP" if hit_tp else "TIME_STOP")
                     pnl_pts = (price - pos_entry) * pos_dir
                     pnl_quote = pnl_pts * pos_lots * spec.contract_size
                     pnl_acct = acct.to_account_ccy(pnl_quote, spec.currency_profit)
@@ -1274,39 +1211,106 @@ def backtest(
                     trades.append({
                         "entry": pos_entry, "exit": price, "dir": pos_dir,
                         "lots": pos_lots, "pnl": pnl_acct, "bars": pos_bars,
-                        "grade": pos_grade, "reason": "NETTING_FLIP", "r": 0,
+                        "grade": pos_grade, "reason": reason, "r": cur_r,
                     })
                     pos_dir = 0
+                    continue
 
-                # Enter if flat
-                if pos_dir == 0:
-                    risk_per_unit = abs(price - float(sig.stop))
-                    if risk_per_unit > 0:
-                        lots = 0.01 if sig.grade == 'C' else working_lot
-                        sl = float(sig.stop)
-                        # Enforce min SL distance
-                        min_dist = max(spec.point * 500, 0.75 * atr) if atr > 0 else spec.point * 500
-                        sl_dist = abs(price - sl)
-                        if sl_dist < min_dist:
-                            sl = price - sig.direction * min_dist
-                            risk_per_unit = abs(price - sl)
+                # C-grade trailing (same as live)
+                if pos_grade == 'C' and pos_trail_active and atr > 0:
+                    trail_dist = max(0.5 * atr, 0.3 * r_unit)
+                    if pos_dir == 1:
+                        new_trail = pos_best_price - trail_dist
+                        if new_trail > pos_sl:
+                            pos_sl = new_trail
+                    else:
+                        new_trail = pos_best_price + trail_dist
+                        if new_trail < pos_sl:
+                            pos_sl = new_trail
 
-                        tp = price + sig.direction * cfg.exits.tp1_r * risk_per_unit
-                        pos_dir = sig.direction
-                        pos_entry = price
-                        pos_sl = sl
-                        pos_tp = tp
-                        pos_lots = lots
-                        pos_bars = 0
-                        pos_grade = sig.grade
-                        pos_risk_per_unit = risk_per_unit
-                        pos_best_price = price
-                        pos_trail_active = False
-                        signals_fired.add(key)
+                # Activate C-grade trailing at 0.3R
+                if pos_grade == 'C' and not pos_trail_active and cur_r >= 0.3:
+                    pos_trail_active = True
+                    pos_sl = pos_entry + pos_dir * 0.1 * r_unit
+
+            # Evaluate signal (same as live)
+            try:
+                sig = _evaluate_row(i, row, cfg, state)
+            except Exception:
+                sig = None
+
+            if sig is not None:
+                n_signals += 1
+                side = "LONG" if sig.direction == 1 else "SHORT"
+                setup = getattr(sig, 'setup_kind', 'RETEST_OB')
+                zone_id = sig.ob_tf or (f"fvg{sig.fvg_top:.0f}" if sig.fvg_top else "-")
+                key = f"{sig.time.isoformat()}|{sig.direction}|{sig.grade}|{setup}|{zone_id}"
+
+                if key not in signals_fired:
+                    # Netting: close opposite
+                    if pos_dir != 0 and pos_dir == -sig.direction:
+                        pnl_pts = (price - pos_entry) * pos_dir
+                        pnl_quote = pnl_pts * pos_lots * spec.contract_size
+                        pnl_acct = acct.to_account_ccy(pnl_quote, spec.currency_profit)
+                        equity += pnl_acct
+                        equity_curve.append(equity)
+                        trades.append({
+                            "entry": pos_entry, "exit": price, "dir": pos_dir,
+                            "lots": pos_lots, "pnl": pnl_acct, "bars": pos_bars,
+                            "grade": pos_grade, "reason": "NETTING_FLIP", "r": 0,
+                        })
+                        pos_dir = 0
+
+                    # Enter if flat
+                    if pos_dir == 0:
+                        risk_per_unit = abs(price - float(sig.stop))
+                        if risk_per_unit > 0:
+                            lots = 0.01 if sig.grade == 'C' else working_lot
+                            sl = float(sig.stop)
+                            # Enforce min SL distance
+                            min_dist = max(spec.point * 500, 0.75 * atr) if atr > 0 else spec.point * 500
+                            sl_dist = abs(price - sl)
+                            if sl_dist < min_dist:
+                                sl = price - sig.direction * min_dist
+                                risk_per_unit = abs(price - sl)
+
+                            tp = price + sig.direction * cfg.exits.tp1_r * risk_per_unit
+                            pos_dir = sig.direction
+                            pos_entry = price
+                            pos_sl = sl
+                            pos_tp = tp
+                            pos_lots = lots
+                            pos_bars = 0
+                            pos_grade = sig.grade
+                            pos_risk_per_unit = risk_per_unit
+                            pos_best_price = price
+                            pos_trail_active = False
+                            signals_fired.add(key)
+
+    # Dispatch: walk df directly or stream from parquet
+    if df is not None:
+        console.print(f"\n  Walking {len(df):,} bars...")
+        _walk_rows(df)
+        del df
+    else:
+        import pyarrow.parquet as _pq
+        if partition_files:
+            pf = _pq.ParquetFile(str(partition_files[0]))
+        else:
+            mmapped = _pq.memory_map(aligned_path)
+            pf = _pq.ParquetFile(mmapped)
+        n_total = pf.metadata.num_rows
+        console.print(f"\n  Walking {n_total:,} bars (streaming)...")
+        batch_n = 0
+        for batch in pf.iter_batches(batch_size=50_000):
+            chunk = batch.to_pandas()
+            _walk_rows(chunk, start_i=batch_n)
+            batch_n += len(chunk)
+            del chunk
 
     # Close any remaining position
     if pos_dir != 0:
-        price = float(df.iloc[-1].get("close", 0.0))
+        price = float(price)  # use last price from final batch
         pnl_pts = (price - pos_entry) * pos_dir
         pnl_quote = pnl_pts * pos_lots * spec.contract_size
         pnl_acct = acct.to_account_ccy(pnl_quote, spec.currency_profit)
